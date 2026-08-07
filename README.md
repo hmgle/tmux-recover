@@ -115,6 +115,10 @@ daemon 用一个独立的 `process-current.json` 补上这个缺口：它与
 `autosave.process_checkpoint_interval`（默认 300 秒）刷新一次，且仅在
 `process_hash` 真正变化时才写；结构提交则立即刷新。
 
+手工执行 `save` 总会立即刷新 sidecar，不受该 interval 限制：这次捕获记录的
+就是此刻运行的进程，而且是用户显式要求的。结构未变时 sidecar 锚定在现有
+`current` 上，写入新快照时锚定到新 ID。
+
 sidecar 描述的是"现在"，所以只有全部条件成立时恢复才会使用它：传入了
 `--restore-processes`、恢复目标是本 socket store 的 `current`（历史 ID 和
 `--from-imports` 都不行）、sidecar 自身 schema 与 hash 校验通过、

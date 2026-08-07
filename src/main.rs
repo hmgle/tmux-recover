@@ -8,7 +8,7 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
-    model::{RestoreStatus, Snapshot, SnapshotSource},
+    model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient, resolve_socket},
@@ -344,6 +344,12 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     } else {
         store.commit(&snapshot, true)?
     };
+    // The base id a restore will check the sidecar against: this snapshot when
+    // one was written, otherwise whatever `current` still points at.
+    let base_snapshot_id = match outcome {
+        CommitOutcome::Written => Some(snapshot.id.clone()),
+        CommitOutcome::Unchanged => store.current_snapshot_id(),
+    };
     match outcome {
         CommitOutcome::Written => {
             if args.pin {
@@ -358,13 +364,34 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         CommitOutcome::Unchanged => {
             println!("unchanged {}", snapshot.semantic_hash);
             if args.pin {
-                let current = store
-                    .current_snapshot_id()
+                let current = base_snapshot_id
+                    .clone()
                     .context("--pin found no current snapshot to pin")?;
                 store.pin(&current)?;
                 println!("pinned {current}");
             }
         }
+    }
+    // Refresh the sidecar unconditionally. This capture holds the processes
+    // running right now, and the user asked for them explicitly, so the
+    // daemon's `process_checkpoint_interval` -- which exists to throttle
+    // background polling -- must not decide whether they are recorded. Without
+    // this, saving while a program is running left no sidecar at all, and a
+    // later `--restore-processes` recovered whatever the last structural change
+    // happened to catch.
+    if let Some(base_snapshot_id) = base_snapshot_id {
+        let checkpoint = ProcessCheckpoint::capture(
+            base_snapshot_id,
+            snapshot.state.structural_hash()?,
+            ProcessCheckpointOrigin {
+                socket_key: key,
+                server_started_at: snapshot.origin.server_started_at,
+            },
+            &snapshot.state,
+        )?;
+        store
+            .write_process_checkpoint(&checkpoint)
+            .context("failed to refresh the process checkpoint")?;
     }
     Ok(())
 }

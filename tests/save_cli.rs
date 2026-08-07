@@ -22,10 +22,21 @@ impl Server {
         }
         let directory = tempfile::tempdir().ok()?;
         let socket = directory.path().join("tmux.sock");
+        // An interactive shell's own startup is real structural change: a
+        // framework like oh-my-zsh cd's into its plugin directory while
+        // sourcing, which moves the pane's cwd and so its structural hash.
+        // These tests assert on exactly that hash, so pin the pane to a bare
+        // `sh` with no rc file. `default-shell` has to be set at server start,
+        // since naming the shell on the `new-session` command line would record
+        // a `pane_start_command` instead.
+        let config = directory.path().join("tmux.conf");
+        std::fs::write(&config, "set -g default-shell /bin/sh\n").ok()?;
         let status = Command::new("tmux")
             .args(["-S"])
             .arg(&socket)
-            .args(["-f", "/dev/null", "new-session", "-d", "-s", "work"])
+            .arg("-f")
+            .arg(&config)
+            .args(["new-session", "-d", "-s", "work"])
             .status()
             .ok()?;
         // A renaming window would change the structure between saves and mask
@@ -45,6 +56,25 @@ impl Server {
             _directory: directory,
             socket,
         })
+    }
+}
+
+/// Saves until two consecutive captures agree, so the shell has finished
+/// settling before a test asserts on structural dedup. Under load the first
+/// save can land mid-startup, and the next one then legitimately reports a
+/// change.
+fn save_until_settled(data: &std::path::Path, socket: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        save(data, socket, &[]);
+        if save(data, socket, &[]).starts_with("unchanged ") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tmux structure never settled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 }
 
@@ -112,6 +142,107 @@ fn pins(data: &std::path::Path) -> Vec<String> {
     found
 }
 
+fn checkpoint(data: &std::path::Path) -> Option<tmux_recover::model::ProcessCheckpoint> {
+    let sockets = data.join("sockets");
+    let key = std::fs::read_dir(&sockets)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let path = sockets.join(key).join("process-current.json");
+    let bytes = std::fs::read(path).ok()?;
+    Some(serde_json::from_slice(&bytes).unwrap())
+}
+
+fn current_id(data: &std::path::Path) -> String {
+    let sockets = data.join("sockets");
+    let key = std::fs::read_dir(&sockets)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let bytes = std::fs::read(sockets.join(key).join("current.json")).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    pointer["snapshot_id"].as_str().unwrap().to_owned()
+}
+
+/// An explicit `save` must record the processes running at that moment. The
+/// daemon's `process_checkpoint_interval` throttles background polling and must
+/// not decide whether a user's own save is written.
+#[test]
+fn save_refreshes_the_process_checkpoint_even_when_unchanged() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+
+    save_until_settled(data.path(), &server.socket);
+    let first = current_id(data.path());
+
+    // Start a program, so the live process state now differs from the snapshot
+    // without any structural change.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pane_command(&server) != "sleep" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shell never ran sleep"
+        );
+        let _ = Command::new("tmux")
+            .args(["-S"])
+            .arg(&server.socket)
+            .args(["send-keys", "-t", "work:0.0", "sleep 300", "Enter"])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    let output = save(data.path(), &server.socket, &[]);
+    assert!(output.starts_with("unchanged "), "{output}");
+    let sidecar = checkpoint(data.path()).expect("an explicit save must write a sidecar");
+    assert_eq!(
+        sidecar.base_snapshot_id, first,
+        "an unchanged save must anchor the sidecar to the existing current"
+    );
+    assert_eq!(current_id(data.path()), first);
+    assert!(
+        sidecar
+            .panes
+            .iter()
+            .any(|pane| pane.current_command.as_deref() == Some("sleep")),
+        "the running program is missing from the sidecar: {:?}",
+        sidecar.panes
+    );
+
+    // A save that does write a snapshot must anchor the sidecar to the new id.
+    let output = save(data.path(), &server.socket, &["--label", "next"]);
+    assert!(output.starts_with("saved "), "{output}");
+    let second = current_id(data.path());
+    assert_ne!(second, first);
+    assert_eq!(
+        checkpoint(data.path()).unwrap().base_snapshot_id,
+        second,
+        "a written save must re-anchor the sidecar to the new snapshot"
+    );
+}
+
+fn pane_command(server: &Server) -> String {
+    let output = Command::new("tmux")
+        .args(["-S"])
+        .arg(&server.socket)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            "work:0.0",
+            "#{pane_current_command}",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 #[test]
 fn save_honours_label_and_pin_when_the_structure_is_unchanged() {
     let Some(server) = Server::start() else {
@@ -120,14 +251,13 @@ fn save_honours_label_and_pin_when_the_structure_is_unchanged() {
     };
     let data = tempfile::tempdir().unwrap();
 
-    let first = save(data.path(), &server.socket, &[]);
-    assert!(first.starts_with("saved "), "{first}");
-    assert_eq!(snapshots(data.path()).len(), 1);
+    save_until_settled(data.path(), &server.socket);
+    let baseline = snapshots(data.path()).len();
 
     // A plain repeat save still dedups.
     let repeat = save(data.path(), &server.socket, &[]);
     assert!(repeat.starts_with("unchanged "), "{repeat}");
-    assert_eq!(snapshots(data.path()).len(), 1);
+    assert_eq!(snapshots(data.path()).len(), baseline);
 
     // A label is information the stored snapshot does not carry, so dedup must
     // not swallow it.
@@ -138,7 +268,7 @@ fn save_honours_label_and_pin_when_the_structure_is_unchanged() {
     );
     assert!(labelled.starts_with("saved "), "{labelled}");
     let all = snapshots(data.path());
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), baseline + 1);
     let stored = all
         .iter()
         .find(|snapshot| snapshot.label.as_deref() == Some("before-upgrade"))
@@ -156,7 +286,7 @@ fn save_honours_label_and_pin_when_the_structure_is_unchanged() {
     assert!(pin_only.contains("pinned "), "{pin_only}");
     assert_eq!(
         snapshots(data.path()).len(),
-        2,
+        baseline + 1,
         "--pin alone must not add history"
     );
     assert_eq!(pins(data.path()), vec![stored.id.clone()]);
