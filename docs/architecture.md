@@ -67,16 +67,36 @@ is unchanged, the sidecar is refreshed at most once per
 since the layout it was pinned to is gone.
 
 The elapsed time is measured against the sidecar's own `captured_at`, not an
-in-memory timer, so restarting the daemon does not produce an extra write.
+in-memory timer, so restarting the daemon does not produce an extra write. If
+wall-clock time moves backwards (NTP correction, VM restore, manual change) and
+leaves `captured_at` in the future, the sidecar is rewritten immediately to
+re-anchor the interval; otherwise a negative elapsed time would read as
+not-yet-due until the clock caught back up.
 
 Because the sidecar describes the present, a restore only consults it when
 every one of these holds: `--restore-processes` was given, the target is
 `current` from this socket's own store (never a historical id, never
-`--from-imports`), the sidecar's `base_snapshot_id` and `structural_hash` match
-that snapshot, and its socket key and server generation match the snapshot's
-origin. Pane ids absent from the snapshot are skipped, and the existing
-`trusted` plus allowlist checks still apply to whichever `RestartSpec` wins.
-Any failed condition drops back to the snapshot's own `restart` metadata and
-records a plan warning; nothing about session, window, or pane restore changes.
-Restoring a historical id therefore can never graft today's processes onto an
-older layout.
+`--from-imports`), the sidecar validates against its own schema and hash, its
+`base_snapshot_id` and `structural_hash` match that snapshot, its socket key
+and server generation match the snapshot's origin, and it covers exactly the
+snapshot's pane set. Any failed condition drops back to the snapshot's own
+`restart` metadata and records a plan warning; nothing about session, window,
+or pane restore changes. Restoring a historical id therefore can never graft
+today's processes onto an older layout.
+
+Once eligible, the sidecar is authoritative for **every** pane it covers, not
+only the ones it has a `restart` for. A pane with `restart: null` means nothing
+restorable is running there now, which suppresses the snapshot's older
+`restart` instead of falling back to it: capture drops a pane's restart
+whenever its foreground process has exited or `/proc` could not be read for it,
+and reviving that stale program would contradict the newer record. The
+`trusted` and allowlist checks still apply to whichever spec wins.
+
+The pane-set equality check is defensive rather than reachable in normal
+operation, since a stale sidecar fails the `base_snapshot_id` check first. It
+exists so a hand-built or tampered sidecar is rejected wholesale rather than
+applied to the subset of panes that happen to line up.
+
+`RestorePlan` reports `process_metadata_source` (`disabled`, `snapshot`, or
+`checkpoint`) and `process_checkpoint_captured_at`, so a dry-run can show which
+metadata produced the restart count and how stale it is.

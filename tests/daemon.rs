@@ -4,6 +4,7 @@ use tempfile::TempDir;
 use tmux_recover::{
     config::{AutosaveConfig, Config, RestoreConfig},
     model::{Snapshot, SnapshotSource},
+    restore::ProcessMetadataSource,
     storage::SnapshotStore,
     tmux::{capture::capture, control::ControlClient},
     util::socket_identity,
@@ -86,26 +87,39 @@ async fn polling_saves_cwd_changes_without_structure_hooks() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(3), || store.has_current()).await;
+    wait_until(Duration::from_secs(15), || store.has_current()).await;
     let cwd = server.directory.path().join("poll cwd");
     std::fs::create_dir(&cwd).unwrap();
     let shell_command = format!("cd -- '{}'", cwd.display());
-    let output = server
-        .tmux()
-        .args(["send-keys", "-t", "daemon:0.0", "-l"])
-        .arg(shell_command)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(
-        server
-            .tmux()
-            .args(["send-keys", "-t", "daemon:0.0", "Enter"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    wait_until(Duration::from_secs(3), || {
+    // Keys sent before the shell reaches its first prompt are dropped, and
+    // under load that prompt can be slow. Re-send until tmux reports the new
+    // cwd, then let the poll notice it.
+    let started = tokio::time::Instant::now();
+    while !pane_cwd(&server, "daemon:0.0").is_some_and(|path| path == cwd) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shell never changed directory"
+        );
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "-l"])
+                .arg(&shell_command)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "Enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    wait_until(Duration::from_secs(5), || {
         store.load_current().is_ok_and(|snapshot| {
             snapshot.state.windows[0].panes[0]
                 .cwd
@@ -143,6 +157,13 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
         },
         restore: RestoreConfig {
             auto: true,
+            // Two distinct races made this flake under load, and both needed
+            // fixing: the pane not having exec'd its shell by the time the
+            // daemon captured (see the wait below), and this window elapsing
+            // during the test's own setup, after which the daemon correctly
+            // declines. The gate itself is covered by `server_is_young`'s unit
+            // test, so widening it here loses no coverage.
+            auto_bootstrap_max_age_seconds: 600,
             ..RestoreConfig::default()
         },
         ..Config::default()
@@ -166,14 +187,29 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
     store.commit(&source, true).unwrap();
 
     server.stop();
+    // Auto-restore is a deliberate one-shot at daemon startup, and its gate
+    // requires the pane's foreground command to equal the default shell. The
+    // developer's interactive shell breaks that in two ways: `new-session -d`
+    // returns before the exec completes, and a prompt framework like oh-my-zsh
+    // runs `git` on every render, so the pane flickers off the shell name --
+    // and the daemon then correctly declines. Pin the pane to a bare `sh` with
+    // no rc file so its foreground command is stable, then wait for it.
+    // `default-shell` has to be set at server start, not after: naming the
+    // shell on the `new-session` command line would record a
+    // `pane_start_command`, and `target_is_bootstrap` requires none.
+    let conf = server.directory.path().join("bootstrap.conf");
+    std::fs::write(&conf, "set -g default-shell /bin/sh\n").unwrap();
     assert!(
         server
             .tmux()
-            .args(["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"])
+            .arg("-f")
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "bootstrap"])
             .status()
             .unwrap()
             .success()
     );
+    wait_for_default_shell_pane(&server, "bootstrap:0.0").await;
     let daemon_socket = server.socket.clone();
     let daemon_data = data.path().to_path_buf();
     let daemon_config = config.clone();
@@ -181,7 +217,7 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(15), || {
         let output = server
             .tmux()
             .args(["list-sessions", "-F", "#{session_name}"])
@@ -224,7 +260,7 @@ async fn hook_event_saves_changed_state() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(3), || store.has_current()).await;
+    wait_until(Duration::from_secs(15), || store.has_current()).await;
     let initial = store.load_current().unwrap();
     assert_eq!(initial.state.windows[0].panes.len(), 1);
 
@@ -239,7 +275,7 @@ async fn hook_event_saves_changed_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(15), || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].panes.len() == 2)
@@ -295,14 +331,48 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
     store.commit(&source, true).unwrap();
 
     server.stop();
+    // This test needs auto-restore to be *attempted* so preflight can fail. A
+    // bootstrap running the developer's interactive shell can be rejected by
+    // the gate before that (see `auto_restore_only_replaces_a_young_shell_bootstrap`),
+    // which would make this pass without exercising anything.
+    let conf = server.directory.path().join("bootstrap.conf");
+    std::fs::write(&conf, "set -g default-shell /bin/sh\n").unwrap();
     assert!(
         server
             .tmux()
-            .args(["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"])
+            .arg("-f")
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "bootstrap"])
             .status()
             .unwrap()
             .success()
     );
+    wait_for_default_shell_pane(&server, "bootstrap:0.0").await;
+
+    // Pin both preconditions, since a gate rejection and a preflight failure
+    // leave the same observable end state and would be indistinguishable
+    // below: the daemon must get past the gate, and preflight must then fail.
+    {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        let target = capture(&mut client, &server.socket).await.unwrap();
+        assert!(
+            tmux_recover::restore::target_is_auto_bootstrap(&target),
+            "auto-restore would be declined before preflight, making this test vacuous"
+        );
+        let options = tmux_recover::restore::restore_config_options(
+            &config.restore,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            tmux_recover::restore::preflight(&source, &target, &options).is_err(),
+            "the snapshot under test must fail preflight"
+        );
+    }
+
     let daemon_socket = server.socket.clone();
     let daemon_data = data.path().to_path_buf();
     let daemon_config = config.clone();
@@ -312,7 +382,7 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
 
     // The failed auto-restore must not tear the daemon down: the bootstrap
     // session stays put, and the daemon keeps watching and autosaving it.
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(15), || {
         store.load_current().is_ok_and(|snapshot| {
             snapshot
                 .state
@@ -331,6 +401,356 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
     let _ = task.await;
 }
 
+/// End-to-end cover for the process checkpoint sidecar against a real tmux
+/// server: a process-only change must reach the sidecar without adding a
+/// snapshot, a `current` restore must use it, an explicit snapshot id must
+/// not, and the program must actually come back.
+///
+/// Does not cover a sidecar pane with `restart: null`, which needs `tpgid <= 0`
+/// or a failing `/proc` read to arise for real; that suppression rule is
+/// covered by `restore`'s unit tests instead.
+///
+/// Linux-only because restart metadata is collected from `/proc`; on other
+/// targets `collect_restart_specs` returns nothing and there is no sidecar
+/// content to assert on.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sidecar_tracks_a_live_process_change_and_restores_it() {
+    let Some(server) = TestServer::start_shell() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(100),
+            process_checkpoint_interval: Duration::from_millis(1),
+        },
+        restore: RestoreConfig {
+            process_allowlist: vec!["sleep".to_owned()],
+            ..RestoreConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+
+    // Without this, running a command renames the window, which changes the
+    // structural hash and produces a snapshot -- the very churn the sidecar
+    // exists to avoid, and it would mask what this test is checking.
+    assert!(
+        server
+            .tmux()
+            .args([
+                "set-window-option",
+                "-t",
+                "daemon:0",
+                "automatic-rename",
+                "off"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    // 1. The daemon publishes a current snapshot and a sidecar beside it.
+    wait_until(Duration::from_secs(5), || {
+        store.has_current() && store.read_process_checkpoint().unwrap().is_some()
+    })
+    .await;
+    // An interactive shell's own startup is a source of real structural
+    // change: a framework like oh-my-zsh cd's into its plugin directory while
+    // sourcing, and the daemon correctly snapshots that. Wait for the count to
+    // stop moving before baselining, or step 3 blames those commits on the
+    // process change.
+    let snapshots_before = wait_for_stable_snapshot_count(&store).await;
+    let first = store.read_process_checkpoint().unwrap().unwrap();
+    assert_eq!(
+        first.base_snapshot_id,
+        store.current_snapshot_id().unwrap(),
+        "the sidecar must be pinned to the current snapshot"
+    );
+
+    // 2. A process-only change: no new pane, no layout change, same cwd.
+    //    Keystrokes sent before the shell reaches its first prompt are
+    //    dropped, and there is no event that reliably marks "prompt ready",
+    //    so re-send until tmux itself reports the new foreground process.
+    let started = tokio::time::Instant::now();
+    while pane_command(&server, "daemon:0.0") != "sleep" {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shell never ran the command"
+        );
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "sleep 300", "Enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // 3. It reaches the sidecar, and no snapshot is added for it. Waiting on
+    //    the recorded argv rather than on "the hash moved" keeps unrelated
+    //    startup churn from satisfying this early.
+    wait_until(Duration::from_secs(5), || {
+        store
+            .read_process_checkpoint()
+            .unwrap()
+            .is_some_and(|checkpoint| {
+                checkpoint.panes.iter().any(|pane| {
+                    pane.restart
+                        .as_ref()
+                        .is_some_and(|restart| restart.argv == ["sleep", "300"])
+                })
+            })
+    })
+    .await;
+    let updated = store.read_process_checkpoint().unwrap().unwrap();
+    assert_eq!(
+        store.list().unwrap().len(),
+        snapshots_before,
+        "a process-only change must not add a snapshot"
+    );
+    assert_eq!(updated.base_snapshot_id, first.base_snapshot_id);
+    assert_ne!(updated.process_hash, first.process_hash);
+
+    task.abort();
+    let _ = task.await;
+
+    // Restore into a fresh bootstrap server on the same socket.
+    let snapshot = store.load_current().unwrap();
+    server.stop();
+    assert!(
+        server
+            .tmux()
+            .args(["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut client = ControlClient::connect(&server.socket).await.unwrap();
+    let target = capture(&mut client, &server.socket).await.unwrap();
+
+    // 4. Restoring `current` uses the sidecar and finds the sleep.
+    assert!(tmux_recover::restore::process_checkpoint_is_offered(
+        "current", false, true
+    ));
+    let checkpoint = store.read_process_checkpoint().unwrap();
+    let options = tmux_recover::restore::restore_config_options(
+        &config.restore,
+        false,
+        false,
+        None,
+        true,
+        checkpoint.as_ref(),
+    );
+    let plan = tmux_recover::restore::preflight(&snapshot, &target, &options).unwrap();
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(
+        plan.process_metadata_source,
+        ProcessMetadataSource::Checkpoint
+    );
+    assert_eq!(plan.process_restarts, 1);
+    assert_eq!(
+        plan.process_checkpoint_captured_at,
+        Some(updated.captured_at)
+    );
+
+    // 5. Naming the same snapshot by id must not consult the sidecar, so it
+    //    falls back to metadata that only recorded the idle shell.
+    assert!(!tmux_recover::restore::process_checkpoint_is_offered(
+        &snapshot.id,
+        false,
+        true
+    ));
+    let snapshot_only = tmux_recover::restore::restore_config_options(
+        &config.restore,
+        false,
+        false,
+        None,
+        true,
+        None,
+    );
+    let snapshot_plan =
+        tmux_recover::restore::preflight(&snapshot, &target, &snapshot_only).unwrap();
+    assert_eq!(
+        snapshot_plan.process_metadata_source,
+        ProcessMetadataSource::Snapshot
+    );
+    assert_eq!(snapshot_plan.process_restarts, 0);
+
+    // 6. The program actually comes back in the restored pane.
+    let report = tmux_recover::restore::apply(&mut client, &snapshot, &target, &plan).await;
+    assert_eq!(
+        report.status,
+        tmux_recover::model::RestoreStatus::Succeeded,
+        "{report:#?}"
+    );
+    drop(client);
+    let pane_pid: u32 = String::from_utf8(
+        server
+            .tmux()
+            .args(["display-message", "-p", "-t", "daemon:0.0", "#{pane_pid}"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    assert!(
+        child_cmdlines(pane_pid).iter().any(|cmdline| cmdline
+            .first()
+            .is_some_and(|arg| arg.ends_with("sleep"))
+            && cmdline.get(1).is_some_and(|arg| arg == "300")),
+        "restored pane {pane_pid} is not running sleep 300: {:?}",
+        child_cmdlines(pane_pid)
+    );
+}
+
+/// Waits until `pane` reports the server's `default-shell` as its foreground
+/// command, which is the precondition `target_is_auto_bootstrap` checks.
+async fn wait_for_default_shell_pane(server: &TestServer, pane: &str) {
+    let output = server
+        .tmux()
+        .args(["show-options", "-gv", "default-shell"])
+        .output()
+        .unwrap();
+    let default_shell = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let expected = std::path::Path::new(&default_shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!expected.is_empty(), "tmux reported no default-shell");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let current = server
+            .tmux()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{pane_current_command}",
+            ])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        if current.as_deref() == Some(expected.as_str()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pane {pane} never reached the default shell {expected:?} (saw {current:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn pane_cwd(server: &TestServer, pane: &str) -> Option<std::path::PathBuf> {
+    let output = server
+        .tmux()
+        .args(["display-message", "-p", "-t", pane, "#{pane_current_path}"])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// Blocks until the snapshot count holds steady, then returns it. Used to
+/// separate the shell's own startup churn from the change under test.
+#[cfg(target_os = "linux")]
+async fn wait_for_stable_snapshot_count(store: &SnapshotStore) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = store.list().unwrap().len();
+    loop {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let now = store.list().unwrap().len();
+        if now == last {
+            return now;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "snapshot count never settled (last {last}, now {now})"
+        );
+        last = now;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pane_command(server: &TestServer, pane: &str) -> String {
+    let output = server
+        .tmux()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{pane_current_command}",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// argv of every direct child of `parent`, read from `/proc`. The restore
+/// wraps a restarted program as `sh -c '<cmd>; exec $SHELL'`, so the program
+/// itself is a child of the pane process rather than the pane process itself.
+#[cfg(target_os = "linux")]
+fn child_cmdlines(parent: u32) -> Vec<Vec<String>> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // The comm field can contain spaces and parentheses, so parse after
+        // the final ')' rather than splitting the whole line.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+        if fields.get(1).and_then(|ppid| ppid.parse::<u32>().ok()) != Some(parent) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        found.push(
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect(),
+        );
+    }
+    found
+}
+
+/// Polls `condition` until it holds. The timeout is a generous ceiling for a
+/// real hang, not a performance assertion: several tmux servers and daemons
+/// share this binary's runner, so a tight bound only produces flakes.
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {

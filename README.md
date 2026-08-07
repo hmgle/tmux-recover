@@ -106,11 +106,25 @@ daemon 用一个独立的 `process-current.json` 补上这个缺口：它与
 
 sidecar 描述的是"现在"，所以只有全部条件成立时恢复才会使用它：传入了
 `--restore-processes`、恢复目标是本 socket store 的 `current`（历史 ID 和
-`--from-imports` 都不行）、sidecar 的 `base_snapshot_id` 与
-`structural_hash` 与该快照一致、socket 与 server 代次匹配。快照中不存在的
-pane 会被跳过，`trusted` 与 allowlist 检查照旧执行。任一条件不成立就回退到
-快照自带的 `restart` 元数据并在计划中给出 warning，session/window/pane 的
-恢复不受影响。因此恢复历史 ID 永远不会把当前进程套到过去的布局上。
+`--from-imports` 都不行）、sidecar 自身 schema 与 hash 校验通过、
+`base_snapshot_id` 与 `structural_hash` 与该快照一致、socket 与 server 代次
+匹配、覆盖的 pane 集合与快照完全相同。任一条件不成立就回退到快照自带的
+`restart` 元数据并在计划中给出 warning，session/window/pane 的恢复不受影响。
+因此恢复历史 ID 永远不会把当前进程套到过去的布局上。
+
+一旦 sidecar 通过校验，它对覆盖的**每个** pane 都是权威来源。`restart: null`
+表示该 pane 当前没有可恢复的前台进程（进程已退出，或 `/proc` 读取失败），
+此时会压制快照中更旧的 `restart`，而不是回退去复活那个陈旧命令。`trusted`
+与 allowlist 检查始终生效。
+
+dry-run 和 `--json` 会输出 `process_metadata_source`（`disabled`/`snapshot`/
+`checkpoint`）与 checkpoint 捕获时间，便于审计这次 best-effort 进程恢复实际
+用了哪份元数据、有多旧：
+
+```text
+  process restarts: 1 (from checkpoint)
+  checkpoint age:   5s (captured 2026-08-07T12:00:29.105801375+00:00)
+```
 
 ### resurrect 导入
 

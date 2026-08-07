@@ -60,6 +60,18 @@ rewrite. Field names and order are part of the hash. The file is published with
 the same temp-file, `fsync`, rename, directory-`fsync` sequence as snapshots,
 so a reader sees either the previous checkpoint or the new one.
 
+`restart: null` is meaningful, not a gap: it records that the pane had no
+restorable foreground process at capture time, and a restore treats it as such
+rather than reaching back to the snapshot's older `restart`.
+
+Validation covers the schema version, the recomputed `process_hash`, and pane
+id uniqueness. Duplicates hash perfectly consistently, so only the explicit
+check catches them before a consumer's id lookup silently drops one entry.
+Both reads and writes validate, so the invariant holds for every file that
+reaches the disk rather than only for the ones this crate's capture path
+produces. A read distinguishes an absent sidecar from an unusable one, which is
+what lets a restore report that it ignored one.
+
 Resurrect files are import inputs, never native storage. The importer records
 the source path, BLAKE3 digest, detected v3/v4 version, and per-pane repair
 status. The v4 empty-title shift is repaired only when its field signature is

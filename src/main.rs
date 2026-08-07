@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
@@ -266,7 +267,18 @@ fn print_restore_plan(plan: &tmux_recover::restore::RestorePlan, json: bool) -> 
             "  objects:          {} sessions, {} windows, {} panes",
             plan.sessions, plan.windows, plan.panes
         );
-        println!("  process restarts: {}", plan.process_restarts);
+        println!(
+            "  process restarts: {} (from {})",
+            plan.process_restarts, plan.process_metadata_source
+        );
+        if let Some(captured_at) = plan.process_checkpoint_captured_at {
+            let age = Utc::now().signed_duration_since(captured_at);
+            println!(
+                "  checkpoint age:   {}s (captured {})",
+                age.num_seconds(),
+                captured_at.to_rfc3339()
+            );
+        }
         println!("  cwd fallbacks:    {}", plan.cwd_fallbacks.len());
         for fallback in &plan.cwd_fallbacks {
             println!(
