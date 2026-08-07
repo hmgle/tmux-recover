@@ -168,6 +168,8 @@ fn validate_state_for_restore(state: &TmuxState) -> Result<()> {
         if window.layout.is_empty() {
             bail!("window {} has no layout", window.name);
         }
+        validate_layout(&window.layout, window.panes.len())
+            .with_context(|| format!("window {} has an invalid layout", window.name))?;
     }
 
     let groups = session_groups(state);
@@ -217,6 +219,12 @@ fn validate_fallback(path: &Path) -> Result<PathBuf> {
     if !metadata.is_dir() {
         bail!("cwd fallback {} is not a directory", path.display());
     }
+    if path.to_str().is_none() {
+        bail!(
+            "cwd fallback {} is not valid UTF-8 and cannot be sent through tmux control mode",
+            path.display()
+        );
+    }
     Ok(path.to_path_buf())
 }
 
@@ -232,7 +240,131 @@ fn resolve_pane_cwd(pane: &Pane) -> Result<PathBuf> {
     if !metadata.is_dir() {
         bail!("{} is not a directory", path.display());
     }
+    if path.to_str().is_none() {
+        bail!(
+            "{} is not valid UTF-8 and cannot be sent through tmux control mode",
+            path.display()
+        );
+    }
     Ok(path)
+}
+
+fn validate_layout(layout: &str, expected_panes: usize) -> Result<()> {
+    const NAMED_LAYOUTS: &[&str] = &[
+        "even-horizontal",
+        "even-vertical",
+        "main-horizontal",
+        "main-horizontal-mirrored",
+        "main-vertical",
+        "main-vertical-mirrored",
+        "tiled",
+    ];
+    if NAMED_LAYOUTS.contains(&layout) {
+        return Ok(());
+    }
+    let bytes = layout.as_bytes();
+    if bytes.len() < 6 || !bytes[..4].iter().all(u8::is_ascii_hexdigit) || bytes[4] != b',' {
+        bail!("layout is neither a known name nor a checksummed layout tree");
+    }
+    let mut parser = LayoutParser {
+        input: bytes,
+        position: 5,
+    };
+    let panes = parser.cell()?;
+    if parser.position != bytes.len() {
+        bail!("layout has trailing data at byte {}", parser.position);
+    }
+    if panes != expected_panes {
+        bail!("layout contains {panes} panes, but the window contains {expected_panes}");
+    }
+    Ok(())
+}
+
+struct LayoutParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl LayoutParser<'_> {
+    fn cell(&mut self) -> Result<usize> {
+        self.number("cell width")?;
+        self.byte(b'x')?;
+        self.number("cell height")?;
+        self.byte(b',')?;
+        self.number("cell x position")?;
+        self.byte(b',')?;
+        self.number("cell y position")?;
+        match self.peek() {
+            Some(b',') => {
+                self.position += 1;
+                self.number("pane id")?;
+                Ok(1)
+            }
+            Some(open @ (b'[' | b'{')) => {
+                self.position += 1;
+                let close = if open == b'[' { b']' } else { b'}' };
+                let mut panes = self.cell()?;
+                let mut children = 1;
+                loop {
+                    match self.peek() {
+                        Some(byte) if byte == close => {
+                            self.position += 1;
+                            if children < 2 {
+                                bail!("layout container has fewer than two children");
+                            }
+                            return Ok(panes);
+                        }
+                        Some(b',') => {
+                            self.position += 1;
+                            panes += self.cell()?;
+                            children += 1;
+                        }
+                        Some(byte) => bail!(
+                            "unexpected layout byte {:?} at byte {}",
+                            char::from(byte),
+                            self.position
+                        ),
+                        None => bail!("unterminated layout container"),
+                    }
+                }
+            }
+            Some(byte) => bail!(
+                "unexpected layout byte {:?} at byte {}",
+                char::from(byte),
+                self.position
+            ),
+            None => bail!("layout cell has no pane id or children"),
+        }
+    }
+
+    fn number(&mut self, name: &str) -> Result<u32> {
+        let start = self.position;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.position += 1;
+        }
+        if self.position == start {
+            bail!("layout is missing {name} at byte {start}");
+        }
+        std::str::from_utf8(&self.input[start..self.position])?
+            .parse()
+            .with_context(|| format!("layout {name} is out of range"))
+    }
+
+    fn byte(&mut self, expected: u8) -> Result<()> {
+        if self.peek() != Some(expected) {
+            bail!(
+                "layout expected {:?} at byte {}",
+                char::from(expected),
+                self.position
+            );
+        }
+        self.position += 1;
+        Ok(())
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.position).copied()
+    }
 }
 
 fn process_basename(restart: &RestartSpec) -> String {
@@ -1043,5 +1175,14 @@ mod tests {
     #[test]
     fn shell_quote_does_not_allow_single_quote_escape() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn validates_layout_syntax_and_pane_count() {
+        let layout = "8b77,159x43,0,0[159x21,0,0{79x21,0,0,302,79x21,80,0,306},159x21,0,22{79x21,0,22,303,79x21,80,22,305}]";
+        validate_layout(layout, 4).unwrap();
+        assert!(validate_layout(layout, 3).is_err());
+        assert!(validate_layout("not-a-layout", 1).is_err());
+        validate_layout("tiled", 9).unwrap();
     }
 }
