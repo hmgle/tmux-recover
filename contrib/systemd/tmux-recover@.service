@@ -1,9 +1,19 @@
 [Unit]
 Description=tmux-recover daemon for %I
 After=default.target
+# Cap the restart loop: if the target tmux server never comes up (or the
+# socket path was never systemd-escaped, see below) this stops retrying
+# after Burst attempts within IntervalSec instead of respawning forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
+# %I is the escaped instance name; systemd un-escapes it back to the literal
+# socket path here, so the unit must be enabled with the systemd-escaped
+# form of the socket path as the instance, e.g. for /tmp/tmux-1000/default:
+#   systemd-escape '/tmp/tmux-1000/default'  ->  -tmp-tmux\x2d1000-default
+#   systemctl --user enable --now 'tmux-recover@-tmp-tmux\x2d1000-default.service'
 ExecStart=%h/.local/bin/tmux-recover daemon --socket "%I"
 Restart=on-failure
 RestartSec=2
