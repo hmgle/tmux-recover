@@ -54,11 +54,23 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
             client = ControlClient::connect(socket).await?;
         }
         Ok(false) => {}
-        Err(error) => {
+        Err(AutoRestoreError::ServerUntouched(error)) => {
             tracing::error!(
                 error = %format!("{error:#}"),
-                "automatic restore failed; continuing to watch the server without restoring"
+                "automatic restore was skipped; the server is unchanged and still being watched"
             );
+        }
+        Err(AutoRestoreError::ServerMutated(error)) => {
+            // Do not claim the server is unchanged here: apply() may have
+            // created or killed sessions before failing, and rollback may have
+            // stopped partway. Reconnect so hooks and the next capture see
+            // whatever actually survived.
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "automatic restore failed after changing the server; reconnecting and continuing to watch"
+            );
+            drop(client);
+            client = ControlClient::connect(socket).await?;
         }
     }
 
@@ -110,6 +122,22 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
                     Ok(CommitOutcome::Unchanged) => {}
                     Err(error) => {
                         tracing::error!(error = %format!("{error:#}"), "autosave failed; keeping the previous snapshot current");
+                        // A command that failed partway through a sequence left
+                        // blocks tmux will never send, so this connection can no
+                        // longer be read reliably. Replace it and reinstall the
+                        // hooks that were bound to the old client name.
+                        if client.is_poisoned() {
+                            match reconnect(socket).await {
+                                Ok(fresh) => {
+                                    client = fresh;
+                                    tracing::warn!("replaced a desynced control connection");
+                                }
+                                Err(error) => {
+                                    tracing::error!(error = %format!("{error:#}"), "could not replace the desynced control connection");
+                                    return Err(error);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -132,7 +160,7 @@ async fn auto_restore(
     store: &SnapshotStore,
     config: &Config,
     target: &crate::tmux::capture::CaptureResult,
-) -> Result<bool> {
+) -> std::result::Result<bool, AutoRestoreError> {
     if !config.restore.auto || !target_is_auto_bootstrap(target) || !server_is_young(target, config)
     {
         return Ok(false);
@@ -163,15 +191,45 @@ async fn auto_restore(
     let report = apply(client, &snapshot, target, &plan).await;
     let report_path = store.write_restore_report(&report)?;
     if report.status != RestoreStatus::Succeeded {
-        bail!(
+        // apply() has already run commands against the server, and rollback may
+        // itself have stopped partway, so the caller cannot keep using this
+        // connection or trust the state it captured earlier.
+        return Err(AutoRestoreError::ServerMutated(anyhow::anyhow!(
             "automatic restore failed with status {:?}; report: {}; error: {}",
             report.status,
             report_path.display(),
             report.error.as_deref().unwrap_or("unknown error")
-        );
+        )));
     }
     tracing::info!(snapshot = %snapshot.id, report = %report_path.display(), "automatically restored snapshot");
     Ok(true)
+}
+
+/// Distinguishes failures that left the server untouched from failures that
+/// may have already changed it. Only the latter require a reconnect.
+enum AutoRestoreError {
+    /// Failed before any restore command ran; the connection is still fine.
+    ServerUntouched(anyhow::Error),
+    /// apply() or its rollback ran at least partly; state and connection are
+    /// both suspect.
+    ServerMutated(anyhow::Error),
+}
+
+impl From<anyhow::Error> for AutoRestoreError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::ServerUntouched(error)
+    }
+}
+
+/// Opens a replacement control connection and rebinds the hooks, which name the
+/// client they notify and so do not survive the old connection.
+async fn reconnect(socket: &Path) -> Result<ControlClient> {
+    let mut client = ControlClient::connect(socket)
+        .await
+        .context("failed to reopen the tmux control connection")?;
+    install_hooks(&mut client).await?;
+    client.take_notifications();
+    Ok(client)
 }
 
 fn server_is_young(target: &crate::tmux::capture::CaptureResult, config: &Config) -> bool {
