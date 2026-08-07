@@ -155,6 +155,10 @@ tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 导入快照保存在独立的 `imports` store。v4 空 title 错位只有在字段签名明确时
 才会修复；修复状态和丢失信息会写入 snapshot diagnostics。
 
+导入不做结构去重：两份 resurrect 文件可能布局相同但来源不同（source path、
+digest、label 都不在结构 hash 内），因此每次导入都会记录一份，重复导入同一
+文件也会产生新条目。
+
 ## 自动恢复
 
 自动恢复默认关闭。在配置中启用：

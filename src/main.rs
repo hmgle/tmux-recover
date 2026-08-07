@@ -486,7 +486,14 @@ fn import_resurrect(data_dir: &Path, config: &Config, args: ImportResurrectArgs)
         result.snapshot.label = Some(label);
     }
     let store = SnapshotStore::imports(data_dir, &config.storage);
-    store.commit(&result.snapshot, true)?;
+    // Structural dedup is wrong for an import. Two resurrect files can describe
+    // the same layout and still be different history -- different source paths,
+    // digests, and labels, none of which the structural hash covers. Deduping
+    // reported an id that was never written, so `list --imports` showed only the
+    // first file, `--pin` failed with "not found", and `--json` published a
+    // nonexistent snapshot_id. An import is an explicit user action naming a
+    // specific file, so it always records one.
+    store.commit_always(&result.snapshot, true)?;
     if args.pin {
         store.pin(&result.snapshot.id)?;
     }
