@@ -33,6 +33,7 @@ enum Command {
     Show(SnapshotArgs),
     Validate(SnapshotArgs),
     Restore(RestoreArgs),
+    Daemon(DaemonArgs),
     Pin(SnapshotArgs),
     Unpin(SnapshotArgs),
 }
@@ -87,6 +88,12 @@ struct RestoreArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -119,9 +126,15 @@ async fn run() -> Result<()> {
         Command::Show(args) => show(&paths.data_dir, &config, args).await,
         Command::Validate(args) => validate(&paths.data_dir, &config, args).await,
         Command::Restore(args) => restore(&paths.data_dir, &config, args).await,
+        Command::Daemon(args) => daemon(&paths.data_dir, &config, args).await,
         Command::Pin(args) => pin(&paths.data_dir, &config, args, true).await,
         Command::Unpin(args) => pin(&paths.data_dir, &config, args, false).await,
     }
+}
+
+async fn daemon(data_dir: &Path, config: &Config, args: DaemonArgs) -> Result<()> {
+    let socket = resolve_socket(args.socket.as_deref()).await?;
+    tmux_recover::daemon::run(&socket, data_dir, config).await
 }
 
 async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Result<()> {

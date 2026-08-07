@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -48,6 +49,10 @@ pub enum CommitOutcome {
     Unchanged,
 }
 
+pub struct DaemonLock {
+    _file: File,
+}
+
 impl SnapshotStore {
     pub fn for_socket(data_dir: &Path, socket_key: &str, config: &StorageConfig) -> Self {
         Self {
@@ -65,6 +70,10 @@ impl SnapshotStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn has_current(&self) -> bool {
+        self.current_path().is_file()
     }
 
     pub fn commit(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
@@ -253,6 +262,28 @@ impl SnapshotStore {
         ));
         atomic_write(&path, &serde_json::to_vec_pretty(report)?)?;
         Ok(path)
+    }
+
+    pub fn acquire_daemon_lock(&self) -> Result<DaemonLock> {
+        fs::create_dir_all(&self.root)?;
+        let path = self.root.join("daemon.lock");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        FileExt::try_lock_exclusive(&file).with_context(|| {
+            format!(
+                "another tmux-recover daemon already owns {}",
+                path.display()
+            )
+        })?;
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.sync_all()?;
+        Ok(DaemonLock { _file: file })
     }
 
     fn snapshot_paths(&self) -> Result<Vec<PathBuf>> {

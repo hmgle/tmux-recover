@@ -20,6 +20,7 @@ pub struct CaptureResult {
     pub origin: Origin,
     pub state: TmuxState,
     pub diagnostics: Vec<Diagnostic>,
+    pub default_shell: Option<String>,
 }
 
 pub async fn capture(client: &mut ControlClient, requested_socket: &Path) -> Result<CaptureResult> {
@@ -165,6 +166,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
         },
         state,
         diagnostics: Vec::new(),
+        default_shell: field_optional_string(&metadata, 5)?,
     })
 }
 

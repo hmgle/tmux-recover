@@ -1,4 +1,5 @@
 pub mod config;
+pub mod daemon;
 pub mod model;
 pub mod process;
 pub mod restore;

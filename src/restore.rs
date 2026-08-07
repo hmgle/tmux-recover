@@ -51,7 +51,7 @@ pub fn preflight(
     validate_origin(snapshot, target, options.allow_origin_mismatch)?;
     validate_state_for_restore(&snapshot.state)?;
 
-    let target_is_bootstrap = is_bootstrap(&target.state);
+    let target_is_bootstrap = target_is_bootstrap(target);
     if !target_is_bootstrap && !options.replace {
         bail!("target server is not an empty bootstrap; use --replace after reviewing a dry-run");
     }
@@ -184,8 +184,24 @@ fn validate_state_for_restore(state: &TmuxState) -> Result<()> {
     Ok(())
 }
 
-fn is_bootstrap(state: &TmuxState) -> bool {
-    state.sessions.len() == 1 && state.windows.len() == 1 && state.windows[0].panes.len() == 1
+pub fn target_is_bootstrap(target: &CaptureResult) -> bool {
+    if target.state.sessions.len() != 1
+        || target.state.windows.len() != 1
+        || target.state.windows[0].panes.len() != 1
+    {
+        return false;
+    }
+    let pane = &target.state.windows[0].panes[0];
+    if pane.dead || pane.start_command.is_some() {
+        return false;
+    }
+    let Some(default_shell) = target.default_shell.as_deref() else {
+        return true;
+    };
+    let expected = Path::new(default_shell)
+        .file_name()
+        .and_then(|name| name.to_str());
+    pane.current_command.as_deref() == expected
 }
 
 fn validate_fallback(path: &Path) -> Result<PathBuf> {

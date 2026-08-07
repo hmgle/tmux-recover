@@ -165,6 +165,19 @@ impl ControlClient {
         }
     }
 
+    pub async fn client_name(&mut self) -> Result<String> {
+        let output = self
+            .execute("display-message -p -F \"#{client_name}\"")
+            .await?;
+        if output.len() != 1 {
+            bail!(
+                "tmux returned {} client-name lines, expected one",
+                output.len()
+            );
+        }
+        String::from_utf8(output[0].clone()).context("tmux returned an invalid client name")
+    }
+
     pub fn take_notifications(&mut self) -> Vec<Notification> {
         self.notifications.drain(..).collect()
     }
