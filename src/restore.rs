@@ -192,11 +192,16 @@ pub fn target_is_bootstrap(target: &CaptureResult) -> bool {
         return false;
     }
     let pane = &target.state.windows[0].panes[0];
-    if pane.dead || pane.start_command.is_some() {
+    !pane.dead && pane.start_command.is_none()
+}
+
+pub fn target_is_auto_bootstrap(target: &CaptureResult) -> bool {
+    if !target_is_bootstrap(target) {
         return false;
     }
+    let pane = &target.state.windows[0].panes[0];
     let Some(default_shell) = target.default_shell.as_deref() else {
-        return true;
+        return false;
     };
     let expected = Path::new(default_shell)
         .file_name()

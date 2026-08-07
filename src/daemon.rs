@@ -7,7 +7,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::{
     config::Config,
     model::{RestoreStatus, Snapshot, SnapshotSource},
-    restore::{apply, preflight, quote, restore_config_options, target_is_bootstrap},
+    restore::{apply, preflight, quote, restore_config_options, target_is_auto_bootstrap},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient},
     util::socket_identity,
@@ -49,9 +49,9 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         client = ControlClient::connect(socket).await?;
     }
 
-    save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
     install_hooks(&mut client).await?;
     client.take_notifications();
+    save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
 
     let mut poll = tokio::time::interval(config.autosave.poll_interval);
@@ -124,7 +124,8 @@ async fn auto_restore(
     config: &Config,
     target: &crate::tmux::capture::CaptureResult,
 ) -> Result<bool> {
-    if !config.restore.auto || !target_is_bootstrap(target) || !server_is_young(target, config) {
+    if !config.restore.auto || !target_is_auto_bootstrap(target) || !server_is_young(target, config)
+    {
         return Ok(false);
     }
     if !store.has_current() {
