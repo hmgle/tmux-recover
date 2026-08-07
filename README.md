@@ -11,6 +11,7 @@
 - 每个 socket 独立存储和加锁，多个 tmux server 不会互相覆盖；
 - JSON schema 区分空字符串、`null` 和缺失值，并支持非 UTF-8 Unix 路径；
 - 快照文件和 `current.json` 指针均原子写入，失败时保留上一份有效快照；
+- 独立的进程 checkpoint sidecar 跟踪 pane 当前运行的程序，不污染历史快照；
 - 恢复前执行 preflight，恢复过程中保留旧 session，失败后回滚并写报告；
 - 导入 tmux-resurrect v3/v4，并修复可确定的 v4 空 pane title 字段错位。
 
@@ -91,6 +92,26 @@ tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 进程可信、可执行文件 basename 位于 allowlist 时才会启动。导入的 resurrect
 命令永远不会执行。
 
+#### 进程 checkpoint sidecar
+
+结构去重让历史保持精简，但也意味着快照只记录布局最后一次变化时正在运行的
+进程。在已有 pane 里启动 `nvim` 不会产生新快照，`--restore-processes` 因此
+可能恢复成一小时前的 shell。
+
+daemon 用一个独立的 `process-current.json` 补上这个缺口：它与
+`current.json` 并列，每次原子覆盖而不追加历史，只记录每个 pane 的
+`pane_id`、`current_command` 和 `restart`。结构未变时最多每
+`autosave.process_checkpoint_interval`（默认 300 秒）刷新一次，且仅在
+`process_hash` 真正变化时才写；结构提交则立即刷新。
+
+sidecar 描述的是"现在"，所以只有全部条件成立时恢复才会使用它：传入了
+`--restore-processes`、恢复目标是本 socket store 的 `current`（历史 ID 和
+`--from-imports` 都不行）、sidecar 的 `base_snapshot_id` 与
+`structural_hash` 与该快照一致、socket 与 server 代次匹配。快照中不存在的
+pane 会被跳过，`trusted` 与 allowlist 检查照旧执行。任一条件不成立就回退到
+快照自带的 `restart` 元数据并在计划中给出 warning，session/window/pane 的
+恢复不受影响。因此恢复历史 ID 永远不会把当前进程套到过去的布局上。
+
 ### resurrect 导入
 
 ```sh
@@ -135,6 +156,7 @@ Linux 默认数据目录是
 sockets/<socket-key>/
   snapshots/*.json[.zst]
   current.json
+  process-current.json
   pins/
   restores/*.json
   daemon.lock

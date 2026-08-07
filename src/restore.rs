@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::{
     config::RestoreConfig,
     model::{
-        CwdFallbackRecord, EncodedPath, Pane, RestartSpec, RestoreReport, RestoreStatus, Session,
-        Snapshot, TmuxState,
+        CwdFallbackRecord, EncodedPath, Pane, ProcessCheckpoint, RestartSpec, RestoreReport,
+        RestoreStatus, Session, Snapshot, TmuxState,
     },
     tmux::{capture::CaptureResult, control::ControlClient},
     util::{hostname, uid},
@@ -32,8 +32,12 @@ pub struct RestorePlan {
     pub warnings: Vec<String>,
     #[serde(skip)]
     pane_cwds: HashMap<String, PathBuf>,
+    /// Pane id -> the `RestartSpec` to launch with, chosen from either the
+    /// process checkpoint sidecar (when eligible) or the structural
+    /// snapshot's own `restart` metadata. Only panes that will actually be
+    /// restarted appear here.
     #[serde(skip)]
-    restart_panes: HashSet<String>,
+    restart_specs: HashMap<String, RestartSpec>,
 }
 
 pub struct PreflightOptions<'a> {
@@ -42,6 +46,12 @@ pub struct PreflightOptions<'a> {
     pub cwd_fallback: Option<&'a Path>,
     pub restore_processes: bool,
     pub process_allowlist: &'a [String],
+    /// The socket's process checkpoint sidecar, if the caller determined
+    /// this restore targets `current` (not a historical snapshot id) and one
+    /// exists. `preflight` still re-checks eligibility itself: a sidecar
+    /// that no longer matches `snapshot` is ignored with a warning rather
+    /// than trusted.
+    pub process_checkpoint: Option<&'a ProcessCheckpoint>,
 }
 
 pub fn preflight(
@@ -89,14 +99,53 @@ pub fn preflight(
         .iter()
         .map(String::as_str)
         .collect();
-    let mut restart_panes = HashSet::new();
+
+    let mut warnings = Vec::new();
+    let effective_checkpoint = match options.process_checkpoint {
+        Some(checkpoint) if options.restore_processes => {
+            match checkpoint_eligibility(checkpoint, snapshot) {
+                Ok(()) => Some(checkpoint),
+                Err(reason) => {
+                    warnings.push(format!(
+                        "process checkpoint ignored ({reason}); using each pane's own restart metadata instead"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    // Looking checkpoint panes up by id (rather than iterating them directly)
+    // means a checkpoint pane whose id no longer exists in this snapshot is
+    // silently skipped: the requirement that "pane ID still exists in the
+    // structural snapshot" falls out of the lookup itself.
+    let checkpoint_panes: HashMap<&str, &RestartSpec> = effective_checkpoint
+        .map(|checkpoint| {
+            checkpoint
+                .panes
+                .iter()
+                .filter_map(|pane| {
+                    pane.restart
+                        .as_ref()
+                        .map(|restart| (pane.pane_id.as_str(), restart))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut restart_specs = HashMap::new();
     if options.restore_processes {
         for window in &snapshot.state.windows {
             for pane in &window.panes {
-                if pane.restart.as_ref().is_some_and(|restart| {
-                    restart.trusted && allowlist.contains(process_basename(restart).as_str())
-                }) {
-                    restart_panes.insert(pane.id.clone());
+                let restart = checkpoint_panes
+                    .get(pane.id.as_str())
+                    .copied()
+                    .or(pane.restart.as_ref());
+                if let Some(restart) = restart
+                    && restart.trusted
+                    && allowlist.contains(process_basename(restart).as_str())
+                {
+                    restart_specs.insert(pane.id.clone(), restart.clone());
                 }
             }
         }
@@ -115,12 +164,45 @@ pub fn preflight(
         sessions: snapshot.state.sessions.len(),
         windows: snapshot.state.windows.len(),
         panes,
-        process_restarts: restart_panes.len(),
+        process_restarts: restart_specs.len(),
         cwd_fallbacks,
-        warnings: Vec::new(),
+        warnings,
         pane_cwds,
-        restart_panes,
+        restart_specs,
     })
+}
+
+/// Checks the process checkpoint sidecar against the snapshot it would
+/// augment. Returns the reason it must be ignored, if any.
+///
+/// `base_snapshot_id` and `structural_hash` both matching already implies
+/// this is the snapshot the checkpoint was captured alongside; restoring a
+/// different, historical snapshot id can never pass this check even if the
+/// caller mistakenly supplies the latest sidecar for it, since a checkpoint's
+/// `base_snapshot_id` names exactly one snapshot.
+fn checkpoint_eligibility(checkpoint: &ProcessCheckpoint, snapshot: &Snapshot) -> Result<()> {
+    if checkpoint.base_snapshot_id != snapshot.id {
+        bail!(
+            "checkpoint is for snapshot {}, not {}",
+            checkpoint.base_snapshot_id,
+            snapshot.id
+        );
+    }
+    if checkpoint.structural_hash != snapshot.state.structural_hash()? {
+        bail!("checkpoint structural hash no longer matches the snapshot");
+    }
+    let socket_matches = snapshot
+        .origin
+        .socket
+        .as_ref()
+        .is_some_and(|socket| socket.key == checkpoint.origin.socket_key);
+    if !socket_matches {
+        bail!("checkpoint socket identity does not match the snapshot's origin");
+    }
+    if checkpoint.origin.server_started_at != snapshot.origin.server_started_at {
+        bail!("checkpoint was captured from a different server generation");
+    }
+    Ok(())
 }
 
 fn validate_origin(
@@ -948,13 +1030,9 @@ async fn restore_session_windows(
 }
 
 fn pane_launch(pane: &Pane, plan: &RestorePlan) -> Result<Option<String>> {
-    if !plan.restart_panes.contains(&pane.id) {
+    let Some(restart) = plan.restart_specs.get(&pane.id) else {
         return Ok(None);
-    }
-    let restart = pane
-        .restart
-        .as_ref()
-        .context("restart plan references missing process")?;
+    };
     let executable = restart.executable.to_path_buf()?;
     let mut argv = restart.argv.clone();
     if argv.is_empty() {
@@ -1147,12 +1225,32 @@ async fn switch_clients(
     Ok(())
 }
 
+/// Decides whether the process checkpoint sidecar may even be read for a
+/// restore, before any of its contents are checked.
+///
+/// The sidecar describes what is running *now*, so it only ever applies to a
+/// restore of `current` from the socket's own store. Naming a snapshot id
+/// explicitly opts out even when that id happens to be the current one: the
+/// restore then uses each pane's own `restart` metadata, which is what a
+/// caller asking for a specific point in time should get. `preflight`
+/// independently re-checks that the sidecar's `base_snapshot_id` matches, so
+/// this is the outer of two barriers against grafting current processes onto
+/// a past layout.
+pub fn process_checkpoint_is_offered(
+    snapshot_selector: &str,
+    from_imports: bool,
+    restore_processes: bool,
+) -> bool {
+    restore_processes && !from_imports && snapshot_selector == "current"
+}
+
 pub fn restore_config_options<'a>(
     config: &'a RestoreConfig,
     replace: bool,
     allow_origin_mismatch: bool,
     cwd_fallback: Option<&'a Path>,
     restore_processes: bool,
+    process_checkpoint: Option<&'a ProcessCheckpoint>,
 ) -> PreflightOptions<'a> {
     PreflightOptions {
         replace,
@@ -1160,12 +1258,357 @@ pub fn restore_config_options<'a>(
         cwd_fallback,
         restore_processes,
         process_allowlist: &config.process_allowlist,
+        process_checkpoint,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{
+        Diagnostic, Origin, PaneCwd, ProcessCheckpointOrigin, ProcessCheckpointPane,
+        SnapshotSource, SocketIdentity, Window, WindowLink,
+    };
+
     use super::*;
+
+    const LAYOUT: &str = "abcd,80x24,0,0{40x24,0,0,0,39x24,41,0,1}";
+    const SOCKET_KEY: &str = "socket-key";
+
+    fn restart(executable: &str, trusted: bool) -> RestartSpec {
+        RestartSpec {
+            executable: EncodedPath::from_path(Path::new(executable)),
+            argv: vec![executable.to_owned(), "file.txt".to_owned()],
+            trusted,
+        }
+    }
+
+    fn pane(id: &str, index: i32, cwd: &Path, restart: Option<RestartSpec>) -> Pane {
+        Pane {
+            id: id.to_owned(),
+            index,
+            title: None,
+            cwd: PaneCwd::inspect(Some(EncodedPath::from_path(cwd))),
+            current_command: Some("zsh".to_owned()),
+            start_command: None,
+            start_path: None,
+            pid: Some(1234),
+            tty: Some("/dev/pts/0".to_owned()),
+            dead: false,
+            dead_status: None,
+            restart,
+            import_status: None,
+        }
+    }
+
+    fn origin(socket_key: &str, server_started_at: Option<i64>) -> Origin {
+        Origin {
+            hostname: hostname().unwrap(),
+            uid: uid(),
+            os: std::env::consts::OS.to_owned(),
+            tool_version: "test".to_owned(),
+            tmux_version: Some("tmux 3.7b".to_owned()),
+            socket: Some(SocketIdentity {
+                path: EncodedPath::from_path(Path::new("/tmp/socket")),
+                key: socket_key.to_owned(),
+            }),
+            server_pid: Some(99),
+            server_started_at,
+        }
+    }
+
+    fn state(cwd: &Path, panes: Vec<Pane>) -> TmuxState {
+        TmuxState {
+            sessions: vec![Session {
+                id: "$0".to_owned(),
+                name: "work".to_owned(),
+                group: None,
+                created_at: Some(1),
+                active_window_id: Some("@0".to_owned()),
+                last_window_id: None,
+                windows: vec![WindowLink {
+                    window_id: "@0".to_owned(),
+                    index: 0,
+                }],
+            }],
+            windows: vec![Window {
+                id: "@0".to_owned(),
+                name: "main".to_owned(),
+                layout: if panes.len() == 1 {
+                    "even-horizontal".to_owned()
+                } else {
+                    LAYOUT.to_owned()
+                },
+                visible_layout: None,
+                width: 80,
+                height: 24,
+                zoomed: false,
+                automatic_rename: Some(false),
+                active_pane_id: Some(panes[0].id.clone()),
+                panes,
+            }],
+        }
+        .tap_validated(cwd)
+    }
+
+    /// Keeps `state` readable by asserting the fixture is internally
+    /// consistent at construction instead of at every use site.
+    trait TapValidated {
+        fn tap_validated(self, cwd: &Path) -> Self;
+    }
+
+    impl TapValidated for TmuxState {
+        fn tap_validated(self, cwd: &Path) -> Self {
+            assert!(cwd.is_dir(), "fixture cwd must exist");
+            self.validate().unwrap();
+            self
+        }
+    }
+
+    fn snapshot(cwd: &Path, panes: Vec<Pane>, server_started_at: Option<i64>) -> Snapshot {
+        Snapshot::new(
+            None,
+            SnapshotSource::Native {
+                reason: "test".to_owned(),
+            },
+            origin(SOCKET_KEY, server_started_at),
+            state(cwd, panes),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn bootstrap_target(cwd: &Path) -> CaptureResult {
+        CaptureResult {
+            origin: origin(SOCKET_KEY, Some(1)),
+            state: state(cwd, vec![pane("%9", 0, cwd, None)]),
+            diagnostics: Vec::<Diagnostic>::new(),
+            default_shell: Some("/bin/zsh".to_owned()),
+        }
+    }
+
+    fn checkpoint(
+        snapshot: &Snapshot,
+        panes: Vec<ProcessCheckpointPane>,
+        server_started_at: Option<i64>,
+    ) -> ProcessCheckpoint {
+        ProcessCheckpoint {
+            schema_version: crate::model::PROCESS_CHECKPOINT_SCHEMA_VERSION,
+            captured_at: Utc::now(),
+            base_snapshot_id: snapshot.id.clone(),
+            structural_hash: snapshot.state.structural_hash().unwrap(),
+            process_hash: crate::model::process_hash(&panes).unwrap(),
+            origin: ProcessCheckpointOrigin {
+                socket_key: SOCKET_KEY.to_owned(),
+                server_started_at,
+            },
+            panes,
+        }
+    }
+
+    fn checkpoint_pane(pane_id: &str, restart: Option<RestartSpec>) -> ProcessCheckpointPane {
+        ProcessCheckpointPane {
+            pane_id: pane_id.to_owned(),
+            current_command: restart
+                .as_ref()
+                .and_then(|restart| restart.argv.first().cloned()),
+            restart,
+        }
+    }
+
+    fn options<'a>(
+        allowlist: &'a [String],
+        checkpoint: Option<&'a ProcessCheckpoint>,
+    ) -> PreflightOptions<'a> {
+        PreflightOptions {
+            replace: false,
+            allow_origin_mismatch: false,
+            cwd_fallback: None,
+            restore_processes: true,
+            process_allowlist: allowlist,
+            process_checkpoint: checkpoint,
+        }
+    }
+
+    fn allowlist() -> Vec<String> {
+        vec!["vim".to_owned(), "nvim".to_owned()]
+    }
+
+    #[test]
+    fn eligible_checkpoint_overrides_the_snapshot_restart_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(
+            cwd,
+            vec![pane("%0", 0, cwd, Some(restart("/bin/vim", true)))],
+            Some(1),
+        );
+        let checkpoint = checkpoint(
+            &snapshot,
+            vec![checkpoint_pane("%0", Some(restart("/bin/nvim", true)))],
+            Some(1),
+        );
+        let allowlist = allowlist();
+        let plan = preflight(
+            &snapshot,
+            &bootstrap_target(cwd),
+            &options(&allowlist, Some(&checkpoint)),
+        )
+        .unwrap();
+
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.process_restarts, 1);
+        assert_eq!(
+            plan.restart_specs["%0"].executable,
+            EncodedPath::from_path(Path::new("/bin/nvim"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_for_a_different_snapshot_is_ignored_with_a_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(
+            cwd,
+            vec![pane("%0", 0, cwd, Some(restart("/bin/vim", true)))],
+            Some(1),
+        );
+        // Stands in for "restoring a historical id while the sidecar tracks
+        // the current one": the ids simply do not match.
+        let mut checkpoint = checkpoint(
+            &snapshot,
+            vec![checkpoint_pane("%0", Some(restart("/bin/nvim", true)))],
+            Some(1),
+        );
+        checkpoint.base_snapshot_id = "20260807T000000.000000Z-deadbeefdeadbeef".to_owned();
+        let allowlist = allowlist();
+        let plan = preflight(
+            &snapshot,
+            &bootstrap_target(cwd),
+            &options(&allowlist, Some(&checkpoint)),
+        )
+        .unwrap();
+
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("process checkpoint ignored"));
+        // Falls back to the snapshot's own restart metadata rather than
+        // dropping process restore altogether.
+        assert_eq!(
+            plan.restart_specs["%0"].executable,
+            EncodedPath::from_path(Path::new("/bin/vim"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_is_rejected_on_structural_socket_or_generation_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(cwd, vec![pane("%0", 0, cwd, None)], Some(1));
+        let panes = vec![checkpoint_pane("%0", Some(restart("/bin/nvim", true)))];
+        checkpoint_eligibility(&checkpoint(&snapshot, panes.clone(), Some(1)), &snapshot).unwrap();
+
+        let mut rewritten = checkpoint(&snapshot, panes.clone(), Some(1));
+        rewritten.structural_hash = "0".repeat(64);
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&rewritten, &snapshot).unwrap_err()
+            )
+            .contains("structural hash")
+        );
+
+        let mut other_socket = checkpoint(&snapshot, panes.clone(), Some(1));
+        other_socket.origin.socket_key = "different".to_owned();
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&other_socket, &snapshot).unwrap_err()
+            )
+            .contains("socket identity")
+        );
+
+        let restarted_server = checkpoint(&snapshot, panes, Some(2));
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&restarted_server, &snapshot).unwrap_err()
+            )
+            .contains("server generation")
+        );
+    }
+
+    #[test]
+    fn checkpoint_panes_still_pass_trust_allowlist_and_pane_existence_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(
+            cwd,
+            vec![
+                pane("%0", 0, cwd, None),
+                pane("%1", 1, cwd, Some(restart("/bin/vim", true))),
+            ],
+            Some(1),
+        );
+        let checkpoint = checkpoint(
+            &snapshot,
+            vec![
+                // Untrusted: must not be restarted even though it is allowlisted.
+                checkpoint_pane("%0", Some(restart("/bin/nvim", false))),
+                // Not allowlisted: overrides the snapshot's allowlisted vim,
+                // and is then rejected, so this pane restarts nothing.
+                checkpoint_pane("%1", Some(restart("/bin/ssh", true))),
+                // Pane no longer exists in the structural snapshot.
+                checkpoint_pane("%7", Some(restart("/bin/nvim", true))),
+            ],
+            Some(1),
+        );
+        let allowlist = allowlist();
+        let plan = preflight(
+            &snapshot,
+            &bootstrap_target(cwd),
+            &options(&allowlist, Some(&checkpoint)),
+        )
+        .unwrap();
+
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.process_restarts, 0);
+        assert!(plan.restart_specs.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_is_unused_when_processes_are_not_being_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(
+            cwd,
+            vec![pane("%0", 0, cwd, Some(restart("/bin/vim", true)))],
+            Some(1),
+        );
+        let checkpoint = checkpoint(
+            &snapshot,
+            vec![checkpoint_pane("%0", Some(restart("/bin/nvim", true)))],
+            Some(1),
+        );
+        let allowlist = allowlist();
+        let mut options = options(&allowlist, Some(&checkpoint));
+        options.restore_processes = false;
+        let plan = preflight(&snapshot, &bootstrap_target(cwd), &options).unwrap();
+
+        assert!(plan.warnings.is_empty());
+        assert_eq!(plan.process_restarts, 0);
+    }
+
+    #[test]
+    fn the_sidecar_is_only_offered_for_a_current_restore_of_this_socket() {
+        assert!(process_checkpoint_is_offered("current", false, true));
+        // A historical id must never be paired with the latest sidecar.
+        assert!(!process_checkpoint_is_offered(
+            "20260807T145233.123456Z-abcdef0123456789",
+            false,
+            true
+        ));
+        assert!(!process_checkpoint_is_offered("current", true, true));
+        assert!(!process_checkpoint_is_offered("current", false, false));
+    }
 
     #[test]
     fn tmux_quote_preserves_control_characters_and_expansion_tokens() {

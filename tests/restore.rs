@@ -208,7 +208,7 @@ async fn restores_special_fields_active_pane_and_zoom() {
         process_allowlist: vec!["sleep".to_owned()],
         ..RestoreConfig::default()
     };
-    let options = restore_config_options(&config, false, false, None, true);
+    let options = restore_config_options(&config, false, false, None, true, None);
     let plan = preflight(&snapshot, &target, &options).unwrap();
     assert_eq!(plan.process_restarts, 5);
     let report = apply(&mut client, &snapshot, &target, &plan).await;

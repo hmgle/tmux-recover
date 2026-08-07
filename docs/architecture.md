@@ -12,7 +12,8 @@ capture parser <--- indexed tmux hooks + 60s metadata poll
     | versioned Rust model + semantic hash
     v
 atomic snapshot file ---> atomic current.json pointer
-    |
+    |                          |
+    |                          +--> atomic process-current.json sidecar
     v
 preflight ---> transactional restore ---> durable restore report
 ```
@@ -47,3 +48,35 @@ executed unless `--restore-processes` is present and the executable basename is
 allowlisted. Imported resurrect command text is metadata only and is never
 trusted for execution. Structural capture and restore work without process
 metadata on macOS.
+
+## Process checkpoint sidecar
+
+Structural dedup is what keeps history small, but it also means a snapshot only
+records what was running at the moment the layout last changed. Start `nvim` in
+an existing pane and no new snapshot is written, so `--restore-processes` would
+recover the shell that was running an hour ago.
+
+`process-current.json` closes that gap without reintroducing the churn.
+It sits next to `current.json`, is overwritten in place rather than appended to
+history, and holds one entry per pane: `pane_id`, `current_command`, and
+`restart`. Its `process_hash` covers exactly those fields, so PIDs, TTYs, and
+capture timestamps cannot trigger a rewrite. When a capture's structural hash
+is unchanged, the sidecar is refreshed at most once per
+`autosave.process_checkpoint_interval` (default 300s), and only if
+`process_hash` actually moved. A structural commit refreshes it immediately,
+since the layout it was pinned to is gone.
+
+The elapsed time is measured against the sidecar's own `captured_at`, not an
+in-memory timer, so restarting the daemon does not produce an extra write.
+
+Because the sidecar describes the present, a restore only consults it when
+every one of these holds: `--restore-processes` was given, the target is
+`current` from this socket's own store (never a historical id, never
+`--from-imports`), the sidecar's `base_snapshot_id` and `structural_hash` match
+that snapshot, and its socket key and server generation match the snapshot's
+origin. Pane ids absent from the snapshot are skipped, and the existing
+`trusted` plus allowlist checks still apply to whichever `RestartSpec` wins.
+Any failed condition drops back to the snapshot's own `restart` metadata and
+records a plan warning; nothing about session, window, or pane restore changes.
+Restoring a historical id therefore can never graft today's processes onto an
+older layout.

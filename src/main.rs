@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
     model::{RestoreStatus, Snapshot, SnapshotSource},
-    restore::{apply, preflight, restore_config_options},
+    restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient, resolve_socket},
     util::socket_identity,
@@ -185,14 +185,37 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
                 .context("HOME is not set")?,
         );
     }
+    // A sidecar that cannot be read must not fail the restore: the structural
+    // snapshot still carries its own restart metadata. Surface it as a plan
+    // warning rather than an error, so a dry-run explains why process restore
+    // came up short instead of silently doing less than asked.
+    let mut checkpoint_warning = None;
+    let checkpoint = match process_checkpoint_is_offered(
+        &args.snapshot,
+        args.from_imports,
+        args.restore_processes,
+    ) {
+        true => match target_store.read_process_checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                checkpoint_warning = Some(format!(
+                    "process checkpoint ignored ({error:#}); using each pane's own restart metadata instead"
+                ));
+                None
+            }
+        },
+        false => None,
+    };
     let options = restore_config_options(
         &config.restore,
         args.replace,
         args.allow_origin_mismatch,
         args.cwd_fallback.as_deref(),
         args.restore_processes,
+        checkpoint.as_ref(),
     );
-    let plan = preflight(&snapshot, &target, &options)?;
+    let mut plan = preflight(&snapshot, &target, &options)?;
+    plan.warnings.extend(checkpoint_warning);
     print_restore_plan(&plan, args.json)?;
     if args.dry_run {
         return Ok(());
@@ -256,6 +279,9 @@ fn print_restore_plan(plan: &tmux_recover::restore::RestorePlan, json: bool) -> 
                     .unwrap_or_else(|| "<missing>".to_owned()),
                 fallback.replacement.display_lossy()
             );
+        }
+        for warning in &plan.warnings {
+            println!("  warning:          {warning}");
         }
     }
     Ok(())
