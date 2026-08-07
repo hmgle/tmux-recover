@@ -1,12 +1,12 @@
 use std::{cmp::max, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::{
     config::Config,
-    model::{RestoreStatus, Snapshot, SnapshotSource},
+    model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, quote, restore_config_options, target_is_auto_bootstrap},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient},
@@ -173,7 +173,7 @@ async fn auto_restore(
     let snapshot = store
         .load_current()
         .context("automatic restore could not load the current snapshot")?;
-    let options = restore_config_options(&config.restore, false, false, None, false);
+    let options = restore_config_options(&config.restore, false, false, None, false, None);
     let plan =
         preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;
     let safety = Snapshot::new(
@@ -248,6 +248,15 @@ async fn save_if_changed(
     reason: &str,
 ) -> Result<CommitOutcome> {
     let captured = capture(client, socket).await?;
+    let checkpoint_origin = ProcessCheckpointOrigin {
+        socket_key: captured
+            .origin
+            .socket
+            .as_ref()
+            .map(|socket| socket.key.clone())
+            .unwrap_or_default(),
+        server_started_at: captured.origin.server_started_at,
+    };
     let snapshot = Snapshot::new(
         None,
         SnapshotSource::Native {
@@ -258,11 +267,87 @@ async fn save_if_changed(
         captured.diagnostics,
     )?;
     let outcome = store.commit(&snapshot, true)?;
-    if outcome == CommitOutcome::Written {
-        let removed = store.prune(&config.retention)?;
-        tracing::info!(snapshot = %snapshot.id, pruned = removed.len(), "saved tmux snapshot");
+    match outcome {
+        CommitOutcome::Written => {
+            let removed = store.prune(&config.retention)?;
+            tracing::info!(snapshot = %snapshot.id, pruned = removed.len(), "saved tmux snapshot");
+            // Structural state just changed, so the sidecar's base pointer is
+            // stale no matter what the process hash says; refresh it
+            // unconditionally rather than waiting for the checkpoint
+            // interval, since the processes were already captured for this
+            // snapshot.
+            let structural_hash = snapshot.state.structural_hash()?;
+            let checkpoint = ProcessCheckpoint::capture(
+                snapshot.id.clone(),
+                structural_hash,
+                checkpoint_origin,
+                &snapshot.state,
+            )?;
+            if let Err(error) = store.write_process_checkpoint(&checkpoint) {
+                tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+            }
+        }
+        CommitOutcome::Unchanged => {
+            if let Err(error) =
+                maybe_refresh_process_checkpoint(store, config, &snapshot, checkpoint_origin)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+            }
+        }
     }
     Ok(outcome)
+}
+
+/// Rewrites the process checkpoint sidecar when structural state is
+/// unchanged, but only often enough to matter: `process_checkpoint_interval`
+/// gates how frequently this runs, and a hash comparison against the
+/// existing sidecar skips the write entirely when nothing a restore cares
+/// about has changed. The elapsed time is measured against the sidecar's own
+/// `captured_at`, not an in-memory timestamp, so a daemon restart does not
+/// immediately force a redundant write.
+fn maybe_refresh_process_checkpoint(
+    store: &SnapshotStore,
+    config: &Config,
+    snapshot: &Snapshot,
+    origin: ProcessCheckpointOrigin,
+) -> Result<()> {
+    // `commit` already confirmed this snapshot's structural state matches
+    // the persisted current snapshot, so the pointer's id is what a restore
+    // will actually check the sidecar's `base_snapshot_id` against.
+    let Some(base_snapshot_id) = store.current_snapshot_id() else {
+        return Ok(());
+    };
+    // An unreadable sidecar is treated as absent here, which makes the write
+    // below repair it. Only a restore needs to distinguish the two.
+    let existing = store.read_process_checkpoint().unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "replacing an unreadable process checkpoint"
+        );
+        None
+    });
+    let interval = TimeDelta::from_std(config.autosave.process_checkpoint_interval)
+        .unwrap_or(TimeDelta::zero());
+    let due = match &existing {
+        None => true,
+        Some(checkpoint) if checkpoint.base_snapshot_id != base_snapshot_id => true,
+        Some(checkpoint) => Utc::now().signed_duration_since(checkpoint.captured_at) >= interval,
+    };
+    if !due {
+        return Ok(());
+    }
+
+    let structural_hash = snapshot.state.structural_hash()?;
+    let checkpoint =
+        ProcessCheckpoint::capture(base_snapshot_id, structural_hash, origin, &snapshot.state)?;
+    let unchanged = existing.is_some_and(|previous| {
+        previous.base_snapshot_id == checkpoint.base_snapshot_id
+            && previous.process_hash == checkpoint.process_hash
+    });
+    if unchanged {
+        return Ok(());
+    }
+    store.write_process_checkpoint(&checkpoint)
 }
 
 async fn install_hooks(client: &mut ControlClient) -> Result<()> {
@@ -313,4 +398,242 @@ async fn shutdown_signal() -> Result<()> {
 async fn shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        config::{AutosaveConfig, StorageConfig},
+        model::{
+            EncodedPath, Origin, Pane, PaneCwd, RestartSpec, Session, SocketIdentity, TmuxState,
+            Window, WindowLink,
+        },
+    };
+
+    use super::*;
+
+    const SOCKET_KEY: &str = "socket-key";
+
+    fn config(process_checkpoint_interval: Duration) -> Config {
+        Config {
+            autosave: AutosaveConfig {
+                process_checkpoint_interval,
+                ..AutosaveConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn origin() -> ProcessCheckpointOrigin {
+        ProcessCheckpointOrigin {
+            socket_key: SOCKET_KEY.to_owned(),
+            server_started_at: Some(1),
+        }
+    }
+
+    /// Structurally identical snapshots that differ only in what the pane is
+    /// running, which is exactly the case the sidecar exists to cover.
+    fn snapshot(cwd: &Path, running: Option<&str>) -> Snapshot {
+        let restart = running.map(|executable| RestartSpec {
+            executable: EncodedPath::from_path(Path::new(executable)),
+            argv: vec![executable.to_owned()],
+            trusted: true,
+        });
+        Snapshot::new(
+            None,
+            SnapshotSource::Native {
+                reason: "test".to_owned(),
+            },
+            Origin {
+                hostname: "host".to_owned(),
+                uid: 1000,
+                os: "linux".to_owned(),
+                tool_version: "test".to_owned(),
+                tmux_version: Some("tmux 3.7b".to_owned()),
+                socket: Some(SocketIdentity {
+                    path: EncodedPath::from_path(Path::new("/tmp/socket")),
+                    key: SOCKET_KEY.to_owned(),
+                }),
+                server_pid: Some(99),
+                server_started_at: Some(1),
+            },
+            TmuxState {
+                sessions: vec![Session {
+                    id: "$0".to_owned(),
+                    name: "work".to_owned(),
+                    group: None,
+                    created_at: Some(1),
+                    active_window_id: Some("@0".to_owned()),
+                    last_window_id: None,
+                    windows: vec![WindowLink {
+                        window_id: "@0".to_owned(),
+                        index: 0,
+                    }],
+                }],
+                windows: vec![Window {
+                    id: "@0".to_owned(),
+                    name: "main".to_owned(),
+                    layout: "even-horizontal".to_owned(),
+                    visible_layout: None,
+                    width: 80,
+                    height: 24,
+                    zoomed: false,
+                    automatic_rename: Some(false),
+                    active_pane_id: Some("%0".to_owned()),
+                    panes: vec![Pane {
+                        id: "%0".to_owned(),
+                        index: 0,
+                        title: None,
+                        cwd: PaneCwd::inspect(Some(EncodedPath::from_path(cwd))),
+                        current_command: Some(running.unwrap_or("zsh").to_owned()),
+                        start_command: None,
+                        start_path: None,
+                        pid: Some(1234),
+                        tty: Some("/dev/pts/0".to_owned()),
+                        dead: false,
+                        dead_status: None,
+                        restart,
+                        import_status: None,
+                    }],
+                }],
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn process_only_change_rewrites_the_sidecar_without_a_new_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let config = config(Duration::ZERO.max(Duration::from_millis(1)));
+
+        let idle = snapshot(cwd, None);
+        assert_eq!(store.commit(&idle, true).unwrap(), CommitOutcome::Written);
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        let first = store.read_process_checkpoint().unwrap().unwrap();
+        assert_eq!(first.base_snapshot_id, store.current_snapshot_id().unwrap());
+
+        // Same layout, different program: structurally unchanged, so no new
+        // history snapshot, but the sidecar must follow the process.
+        let busy = snapshot(cwd, Some("/usr/bin/nvim"));
+        assert_eq!(
+            store.commit(&busy, true).unwrap(),
+            CommitOutcome::Unchanged,
+            "a process-only change must not create a history snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        maybe_refresh_process_checkpoint(&store, &config, &busy, origin()).unwrap();
+
+        let second = store.read_process_checkpoint().unwrap().unwrap();
+        assert_ne!(second.process_hash, first.process_hash);
+        assert_eq!(
+            second.panes[0].restart.as_ref().unwrap().executable,
+            EncodedPath::from_path(Path::new("/usr/bin/nvim"))
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interval_gate_defers_a_process_change_until_it_is_due() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let idle = snapshot(cwd, None);
+        store.commit(&idle, true).unwrap();
+
+        let patient = config(Duration::from_secs(300));
+        maybe_refresh_process_checkpoint(&store, &patient, &idle, origin()).unwrap();
+        let first = store.read_process_checkpoint().unwrap().unwrap();
+
+        // The gate is measured against the sidecar's own captured_at, so this
+        // holds even though the call below shares no in-memory state with the
+        // one above: a daemon restart cannot force an extra write either.
+        let busy = snapshot(cwd, Some("/usr/bin/nvim"));
+        maybe_refresh_process_checkpoint(&store, &patient, &busy, origin()).unwrap();
+        assert_eq!(
+            store.read_process_checkpoint().unwrap().unwrap(),
+            first,
+            "the sidecar must not be rewritten before the interval elapses"
+        );
+
+        // Once due, the same change is written.
+        let eager = config(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        maybe_refresh_process_checkpoint(&store, &eager, &busy, origin()).unwrap();
+        assert_ne!(
+            store
+                .read_process_checkpoint()
+                .unwrap()
+                .unwrap()
+                .process_hash,
+            first.process_hash
+        );
+    }
+
+    #[test]
+    fn a_due_but_unchanged_process_hash_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let config = config(Duration::from_millis(1));
+        let idle = snapshot(cwd, None);
+        store.commit(&idle, true).unwrap();
+
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        let first = store.read_process_checkpoint().unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+
+        // captured_at would move if this had been rewritten, so comparing the
+        // whole checkpoint proves the write was skipped rather than repeated.
+        assert_eq!(store.read_process_checkpoint().unwrap().unwrap(), first);
+    }
+
+    #[test]
+    fn a_new_base_snapshot_refreshes_the_sidecar_regardless_of_the_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let config = config(Duration::from_secs(300));
+        let idle = snapshot(cwd, None);
+        store.commit(&idle, true).unwrap();
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        let first = store.read_process_checkpoint().unwrap().unwrap();
+
+        // A structural change publishes a new current snapshot, which leaves
+        // the sidecar pinned to an id a restore would refuse to use. Waiting
+        // out the interval would leave process restore silently disabled for
+        // up to five minutes, so the stale base must be corrected at once.
+        let mut moved = snapshot(cwd, Some("/usr/bin/nvim"));
+        moved.state.windows[0].name = "renamed".to_owned();
+        let moved = Snapshot::new(
+            None,
+            SnapshotSource::Native {
+                reason: "test".to_owned(),
+            },
+            moved.origin,
+            moved.state,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(store.commit(&moved, true).unwrap(), CommitOutcome::Written);
+        maybe_refresh_process_checkpoint(&store, &config, &moved, origin()).unwrap();
+
+        let second = store.read_process_checkpoint().unwrap().unwrap();
+        assert_ne!(second.base_snapshot_id, first.base_snapshot_id);
+        assert_eq!(
+            second.base_snapshot_id,
+            store.current_snapshot_id().unwrap()
+        );
+        assert_eq!(
+            second.structural_hash,
+            moved.state.structural_hash().unwrap()
+        );
+    }
 }

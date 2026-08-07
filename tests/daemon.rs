@@ -73,6 +73,7 @@ async fn polling_saves_cwd_changes_without_structure_hooks() {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(80),
+            ..AutosaveConfig::default()
         },
         ..Config::default()
     };
@@ -138,6 +139,7 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(80),
             poll_interval: Duration::from_secs(5),
+            ..AutosaveConfig::default()
         },
         restore: RestoreConfig {
             auto: true,
@@ -209,6 +211,7 @@ async fn hook_event_saves_changed_state() {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(80),
             poll_interval: Duration::from_secs(5),
+            ..AutosaveConfig::default()
         },
         ..Config::default()
     };
@@ -260,6 +263,7 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(80),
             poll_interval: Duration::from_secs(5),
+            ..AutosaveConfig::default()
         },
         restore: RestoreConfig {
             auto: true,
