@@ -363,7 +363,12 @@ impl SnapshotStore {
     /// `commit`, this never touches the snapshots directory or the retention
     /// policy: it is a single file that is replaced in place, not a new
     /// history entry.
+    ///
+    /// Validates before publishing, so the invariants a reader relies on hold
+    /// for every file that ever reaches the disk, not only for the ones this
+    /// crate's own capture path produces.
     pub fn write_process_checkpoint(&self, checkpoint: &ProcessCheckpoint) -> Result<()> {
+        checkpoint.validate()?;
         atomic_write(
             &self.process_checkpoint_path(),
             &serde_json::to_vec_pretty(checkpoint)?,
@@ -723,6 +728,33 @@ mod tests {
         assert!(store.read_process_checkpoint().is_err());
 
         fs::remove_file(&path).unwrap();
+        assert!(store.read_process_checkpoint().unwrap().is_none());
+    }
+
+    #[test]
+    fn writing_an_invalid_process_checkpoint_publishes_nothing() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let mut checkpoint = crate::model::ProcessCheckpoint::capture(
+            "base-id".to_owned(),
+            "structural-hash".to_owned(),
+            crate::model::ProcessCheckpointOrigin {
+                socket_key: "socket".to_owned(),
+                server_started_at: Some(1),
+            },
+            &TmuxState {
+                sessions: vec![],
+                windows: vec![],
+            },
+        )
+        .unwrap();
+        checkpoint.process_hash = "0".repeat(64);
+
+        assert!(store.write_process_checkpoint(&checkpoint).is_err());
+        // The invariant holds for every file that reaches the disk, so a
+        // rejected checkpoint must not leave a partial one behind either.
+        assert!(!store.process_checkpoint_path().exists());
         assert!(store.read_process_checkpoint().unwrap().is_none());
     }
 

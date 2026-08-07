@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::{
@@ -28,6 +28,13 @@ pub struct RestorePlan {
     pub windows: usize,
     pub panes: usize,
     pub process_restarts: usize,
+    /// Which metadata the `process_restarts` count came from. Process restore
+    /// is best-effort, so a dry-run has to be able to show whether it used
+    /// the live sidecar or the snapshot's own older record.
+    pub process_metadata_source: ProcessMetadataSource,
+    /// When the sidecar was captured, if one was used. Its age is what tells
+    /// a caller how stale the restored processes may be.
+    pub process_checkpoint_captured_at: Option<DateTime<Utc>>,
     pub cwd_fallbacks: Vec<CwdFallbackRecord>,
     pub warnings: Vec<String>,
     #[serde(skip)]
@@ -38,6 +45,29 @@ pub struct RestorePlan {
     /// restarted appear here.
     #[serde(skip)]
     restart_specs: HashMap<String, RestartSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMetadataSource {
+    /// `--restore-processes` was not given; nothing will be started.
+    Disabled,
+    /// Each pane's own `restart` field, as recorded in the snapshot.
+    Snapshot,
+    /// The process checkpoint sidecar, which reflects what was running as of
+    /// its `captured_at`.
+    Checkpoint,
+}
+
+impl std::fmt::Display for ProcessMetadataSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Disabled => "disabled",
+            Self::Snapshot => "snapshot",
+            Self::Checkpoint => "checkpoint",
+        };
+        formatter.write_str(name)
+    }
 }
 
 pub struct PreflightOptions<'a> {
@@ -115,20 +145,15 @@ pub fn preflight(
         }
         _ => None,
     };
-    // Looking checkpoint panes up by id (rather than iterating them directly)
-    // means a checkpoint pane whose id no longer exists in this snapshot is
-    // silently skipped: the requirement that "pane ID still exists in the
-    // structural snapshot" falls out of the lookup itself.
-    let checkpoint_panes: HashMap<&str, &RestartSpec> = effective_checkpoint
+    // Eligibility already established that this checkpoint covers exactly the
+    // snapshot's panes, so it is the authoritative source for all of them --
+    // including the panes it reports as running nothing restorable.
+    let checkpoint_panes: HashMap<&str, Option<&RestartSpec>> = effective_checkpoint
         .map(|checkpoint| {
             checkpoint
                 .panes
                 .iter()
-                .filter_map(|pane| {
-                    pane.restart
-                        .as_ref()
-                        .map(|restart| (pane.pane_id.as_str(), restart))
-                })
+                .map(|pane| (pane.pane_id.as_str(), pane.restart.as_ref()))
                 .collect()
         })
         .unwrap_or_default();
@@ -137,10 +162,19 @@ pub fn preflight(
     if options.restore_processes {
         for window in &snapshot.state.windows {
             for pane in &window.panes {
-                let restart = checkpoint_panes
-                    .get(pane.id.as_str())
-                    .copied()
-                    .or(pane.restart.as_ref());
+                // `restart: null` in the sidecar means "nothing restorable is
+                // running here now", which must suppress the snapshot's older
+                // restart rather than fall back to it: capture drops a pane's
+                // restart whenever its foreground process exited or could not
+                // be read, and reviving that stale program is not what the
+                // pane's state says to do.
+                let restart = match effective_checkpoint {
+                    Some(_) => checkpoint_panes
+                        .get(pane.id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                    None => pane.restart.as_ref(),
+                };
                 if let Some(restart) = restart
                     && restart.trusted
                     && allowlist.contains(process_basename(restart).as_str())
@@ -157,6 +191,11 @@ pub fn preflight(
         .iter()
         .map(|window| window.panes.len())
         .sum();
+    let process_metadata_source = match (options.restore_processes, effective_checkpoint) {
+        (false, _) => ProcessMetadataSource::Disabled,
+        (true, Some(_)) => ProcessMetadataSource::Checkpoint,
+        (true, None) => ProcessMetadataSource::Snapshot,
+    };
     Ok(RestorePlan {
         snapshot_id: snapshot.id.clone(),
         replace: options.replace,
@@ -165,6 +204,9 @@ pub fn preflight(
         windows: snapshot.state.windows.len(),
         panes,
         process_restarts: restart_specs.len(),
+        process_metadata_source,
+        process_checkpoint_captured_at: effective_checkpoint
+            .map(|checkpoint| checkpoint.captured_at),
         cwd_fallbacks,
         warnings,
         pane_cwds,
@@ -181,6 +223,10 @@ pub fn preflight(
 /// caller mistakenly supplies the latest sidecar for it, since a checkpoint's
 /// `base_snapshot_id` names exactly one snapshot.
 fn checkpoint_eligibility(checkpoint: &ProcessCheckpoint, snapshot: &Snapshot) -> Result<()> {
+    // Re-check the checkpoint's own invariants rather than assuming the
+    // caller loaded it through the store: `PreflightOptions` is public, so a
+    // library caller can hand over one it built or parsed itself.
+    checkpoint.validate()?;
     if checkpoint.base_snapshot_id != snapshot.id {
         bail!(
             "checkpoint is for snapshot {}, not {}",
@@ -201,6 +247,33 @@ fn checkpoint_eligibility(checkpoint: &ProcessCheckpoint, snapshot: &Snapshot) -
     }
     if checkpoint.origin.server_started_at != snapshot.origin.server_started_at {
         bail!("checkpoint was captured from a different server generation");
+    }
+    // A matching structural hash already implies a matching pane set, so a
+    // difference here means one of the two was tampered with or hashes
+    // differently than it claims. Reject the whole checkpoint instead of
+    // applying it to the panes that do line up: partial trust in a file we
+    // have just shown to be inconsistent is worse than the documented
+    // fallback to the snapshot's own metadata.
+    let snapshot_panes: BTreeSet<&str> = snapshot
+        .state
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .map(|pane| pane.id.as_str())
+        .collect();
+    let checkpoint_panes = checkpoint.pane_ids();
+    if snapshot_panes != checkpoint_panes {
+        bail!(
+            "checkpoint covers {} panes, the snapshot {}; missing {:?}, unexpected {:?}",
+            checkpoint_panes.len(),
+            snapshot_panes.len(),
+            snapshot_panes
+                .difference(&checkpoint_panes)
+                .collect::<Vec<_>>(),
+            checkpoint_panes
+                .difference(&snapshot_panes)
+                .collect::<Vec<_>>()
+        );
     }
     Ok(())
 }
@@ -1537,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_panes_still_pass_trust_allowlist_and_pane_existence_checks() {
+    fn checkpoint_panes_still_pass_trust_and_allowlist_checks() {
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path();
         let snapshot = snapshot(
@@ -1556,8 +1629,6 @@ mod tests {
                 // Not allowlisted: overrides the snapshot's allowlisted vim,
                 // and is then rejected, so this pane restarts nothing.
                 checkpoint_pane("%1", Some(restart("/bin/ssh", true))),
-                // Pane no longer exists in the structural snapshot.
-                checkpoint_pane("%7", Some(restart("/bin/nvim", true))),
             ],
             Some(1),
         );
@@ -1570,8 +1641,152 @@ mod tests {
         .unwrap();
 
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            plan.process_metadata_source,
+            ProcessMetadataSource::Checkpoint
+        );
         assert_eq!(plan.process_restarts, 0);
         assert!(plan.restart_specs.is_empty());
+    }
+
+    #[test]
+    fn eligible_checkpoint_with_null_restart_suppresses_the_snapshot_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        // The snapshot remembers vim from when the layout last changed.
+        let snapshot = snapshot(
+            cwd,
+            vec![pane("%0", 0, cwd, Some(restart("/bin/vim", true)))],
+            Some(1),
+        );
+        // The sidecar says nothing restorable is running there now, which is
+        // what capture records when a pane's foreground process has exited or
+        // /proc could not be read for it. Reviving vim would contradict the
+        // newer, more authoritative record.
+        let checkpoint = checkpoint(&snapshot, vec![checkpoint_pane("%0", None)], Some(1));
+        let allowlist = allowlist();
+        let plan = preflight(
+            &snapshot,
+            &bootstrap_target(cwd),
+            &options(&allowlist, Some(&checkpoint)),
+        )
+        .unwrap();
+
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            plan.process_metadata_source,
+            ProcessMetadataSource::Checkpoint
+        );
+        assert_eq!(plan.process_restarts, 0);
+        assert!(
+            plan.restart_specs.is_empty(),
+            "a null checkpoint restart must not fall back to the snapshot's: {:?}",
+            plan.restart_specs
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_pane_set_that_differs_from_the_snapshot_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(
+            cwd,
+            vec![
+                pane("%0", 0, cwd, Some(restart("/bin/vim", true))),
+                pane("%1", 1, cwd, None),
+            ],
+            Some(1),
+        );
+
+        // A matching structural hash implies a matching pane set, so a
+        // difference means one side is not what it claims to be.
+        let mut extra = checkpoint(
+            &snapshot,
+            vec![
+                checkpoint_pane("%0", Some(restart("/bin/nvim", true))),
+                checkpoint_pane("%1", None),
+                checkpoint_pane("%7", Some(restart("/bin/nvim", true))),
+            ],
+            Some(1),
+        );
+        let error = format!(
+            "{:#}",
+            checkpoint_eligibility(&extra, &snapshot).unwrap_err()
+        );
+        assert!(error.contains("unexpected [\"%7\"]"), "{error}");
+
+        extra.panes.retain(|pane| pane.pane_id != "%7");
+        extra.panes.retain(|pane| pane.pane_id != "%1");
+        extra.process_hash = crate::model::process_hash(&extra.panes).unwrap();
+        let error = format!(
+            "{:#}",
+            checkpoint_eligibility(&extra, &snapshot).unwrap_err()
+        );
+        assert!(error.contains("missing [\"%1\"]"), "{error}");
+
+        // Rejected checkpoints fall back to the snapshot's own metadata.
+        let allowlist = allowlist();
+        let plan = preflight(
+            &snapshot,
+            &bootstrap_target(cwd),
+            &options(&allowlist, Some(&extra)),
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(
+            plan.process_metadata_source,
+            ProcessMetadataSource::Snapshot
+        );
+        assert_eq!(
+            plan.restart_specs["%0"].executable,
+            EncodedPath::from_path(Path::new("/bin/vim"))
+        );
+    }
+
+    #[test]
+    fn an_invalid_checkpoint_is_rejected_before_its_contents_are_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let snapshot = snapshot(cwd, vec![pane("%0", 0, cwd, None)], Some(1));
+
+        let mut wrong_hash = checkpoint(&snapshot, vec![checkpoint_pane("%0", None)], Some(1));
+        wrong_hash.process_hash = "0".repeat(64);
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&wrong_hash, &snapshot).unwrap_err()
+            )
+            .contains("hash mismatch")
+        );
+
+        let mut wrong_schema = checkpoint(&snapshot, vec![checkpoint_pane("%0", None)], Some(1));
+        wrong_schema.schema_version = 99;
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&wrong_schema, &snapshot).unwrap_err()
+            )
+            .contains("schema")
+        );
+
+        // Duplicates hash consistently, so only an explicit check catches
+        // them before one entry is silently dropped by the id lookup.
+        let panes = vec![
+            checkpoint_pane("%0", Some(restart("/bin/vim", true))),
+            checkpoint_pane("%0", None),
+        ];
+        let duplicated = ProcessCheckpoint {
+            process_hash: crate::model::process_hash(&panes).unwrap(),
+            panes,
+            ..checkpoint(&snapshot, vec![checkpoint_pane("%0", None)], Some(1))
+        };
+        assert!(
+            format!(
+                "{:#}",
+                checkpoint_eligibility(&duplicated, &snapshot).unwrap_err()
+            )
+            .contains("duplicate pane %0")
+        );
     }
 
     #[test]

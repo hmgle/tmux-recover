@@ -499,7 +499,7 @@ impl ProcessCheckpoint {
     ) -> Result<Self> {
         let panes = process_checkpoint_panes(state);
         let process_hash = process_hash(&panes)?;
-        Ok(Self {
+        let checkpoint = Self {
             schema_version: PROCESS_CHECKPOINT_SCHEMA_VERSION,
             captured_at: Utc::now(),
             base_snapshot_id,
@@ -507,7 +507,9 @@ impl ProcessCheckpoint {
             process_hash,
             origin,
             panes,
-        })
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -518,6 +520,18 @@ impl ProcessCheckpoint {
                 PROCESS_CHECKPOINT_SCHEMA_VERSION
             );
         }
+        // Consumers index panes by id, so a duplicate would silently discard
+        // one entry. The hash cannot catch this on its own: duplicates hash
+        // perfectly consistently.
+        let mut seen = std::collections::HashSet::with_capacity(self.panes.len());
+        for pane in &self.panes {
+            if !seen.insert(pane.pane_id.as_str()) {
+                bail!(
+                    "process checkpoint contains duplicate pane {}",
+                    pane.pane_id
+                );
+            }
+        }
         let actual = process_hash(&self.panes)?;
         if actual != self.process_hash {
             bail!(
@@ -527,6 +541,14 @@ impl ProcessCheckpoint {
             );
         }
         Ok(())
+    }
+
+    /// The pane ids this checkpoint describes.
+    pub fn pane_ids(&self) -> std::collections::BTreeSet<&str> {
+        self.panes
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
+            .collect()
     }
 }
 
