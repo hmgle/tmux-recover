@@ -404,11 +404,20 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
 /// End-to-end cover for the process checkpoint sidecar against a real tmux
 /// server: a process-only change must reach the sidecar without adding a
 /// snapshot, a `current` restore must use it, an explicit snapshot id must
-/// not, and the program must actually come back.
+/// not, the program must actually come back, and the daemon must keep writing
+/// eligible checkpoints once it is watching the restored server.
 ///
 /// Does not cover a sidecar pane with `restart: null`, which needs `tpgid <= 0`
 /// or a failing `/proc` read to arise for real; that suppression rule is
 /// covered by `restore`'s unit tests instead.
+///
+/// Nor does step 7 reproduce a structural-hash collision across the generation
+/// boundary, which is what makes `commit` compare `Origin`. A first restore
+/// allocates fresh ids because the bootstrap consumes the low ones, so the
+/// structure differs and `commit` writes regardless; the collision needs a
+/// second cycle whose restart specs also line up, which conflicts with this
+/// test restoring a live process. Verified by hand against a live server, and
+/// guarded by `same_structural_state_from_a_new_server_generation_is_written`.
 ///
 /// Linux-only because restart metadata is collected from `/proc`; on other
 /// targets `collect_restart_specs` returns nothing and there is no sidecar
@@ -532,6 +541,11 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
     // Restore into a fresh bootstrap server on the same socket.
     let snapshot = store.load_current().unwrap();
     server.stop();
+    // tmux reports `start_time` in whole seconds, and a test restarts the
+    // server far faster than a real crash-and-recover would. Step 7 below is
+    // about behaviour across a generation boundary, so make the generations
+    // actually distinguishable.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(
         server
             .tmux()
@@ -619,6 +633,127 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
         "restored pane {pane_pid} is not running sleep 300: {:?}",
         child_cmdlines(pane_pid)
     );
+
+    // 7. Keep going on the restored server, which is the case that broke: a
+    //    restore reproduces tmux ids deterministically, so this new generation
+    //    can present the exact structure of the snapshot it came from. If the
+    //    daemon deduped that away, `current` would stay pinned to the old
+    //    generation and every checkpoint written from here on would be
+    //    rejected as coming from a different generation.
+    let restored_generation = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket)
+            .await
+            .unwrap()
+            .origin
+            .server_started_at
+    };
+    assert_ne!(
+        restored_generation, first.origin.server_started_at,
+        "this step is only meaningful across a generation boundary"
+    );
+
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    wait_until(Duration::from_secs(15), || {
+        store
+            .load_current()
+            .is_ok_and(|snapshot| snapshot.origin.server_started_at == restored_generation)
+    })
+    .await;
+    let rebased = store.load_current().unwrap();
+    let snapshots_after_rebase = wait_for_stable_snapshot_count(&store).await;
+
+    // A further process-only change must produce a checkpoint that is still
+    // eligible against the rebased snapshot.
+    // The restore launched the program as `sh -c '<cmd>; exec $SHELL'`, so a
+    // C-c would kill that wrapper before it reaches the exec, taking the only
+    // session and the whole server with it. Terminate just the `sleep` child
+    // and the wrapper proceeds to exec the shell, leaving a live pane at a
+    // prompt.
+    let sleep_pid = child_cmdlines_with_pids(pane_pid)
+        .into_iter()
+        .find(|(_, cmdline)| cmdline.first().is_some_and(|arg| arg.ends_with("sleep")))
+        .map(|(pid, _)| pid)
+        .expect("the restored sleep must be running to be replaced");
+    assert!(
+        Command::new("kill")
+            .arg(sleep_pid.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let started = tokio::time::Instant::now();
+    while pane_command(&server, "daemon:0.0") != "cat" {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shell never ran the second command"
+        );
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "cat", "Enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    wait_until(Duration::from_secs(10), || {
+        store
+            .read_process_checkpoint()
+            .unwrap()
+            .is_some_and(|checkpoint| {
+                checkpoint.base_snapshot_id == rebased.id
+                    && checkpoint
+                        .panes
+                        .iter()
+                        .any(|pane| pane.current_command.as_deref() == Some("cat"))
+            })
+    })
+    .await;
+    let after = store.read_process_checkpoint().unwrap().unwrap();
+    assert_eq!(
+        store.list().unwrap().len(),
+        snapshots_after_rebase,
+        "a process-only change must not add a snapshot after a restore either"
+    );
+    assert_eq!(after.origin.server_started_at, restored_generation);
+
+    let target = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    // `replace` because the target is the restored session now, not a
+    // bootstrap; this preflight is only here to read back the plan's verdict on
+    // the checkpoint.
+    let options = tmux_recover::restore::restore_config_options(
+        &config.restore,
+        true,
+        false,
+        None,
+        true,
+        Some(&after),
+    );
+    let plan = tmux_recover::restore::preflight(&rebased, &target, &options).unwrap();
+    assert!(
+        plan.warnings.is_empty(),
+        "checkpoint rejected after a restore: {:?}",
+        plan.warnings
+    );
+    assert_eq!(
+        plan.process_metadata_source,
+        ProcessMetadataSource::Checkpoint
+    );
+
+    task.abort();
+    let _ = task.await;
 }
 
 /// Waits until `pane` reports the server's `default-shell` as its foreground
@@ -713,6 +848,14 @@ fn pane_command(server: &TestServer, pane: &str) -> String {
 /// itself is a child of the pane process rather than the pane process itself.
 #[cfg(target_os = "linux")]
 fn child_cmdlines(parent: u32) -> Vec<Vec<String>> {
+    child_cmdlines_with_pids(parent)
+        .into_iter()
+        .map(|(_, cmdline)| cmdline)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn child_cmdlines_with_pids(parent: u32) -> Vec<(u32, Vec<String>)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return found;
@@ -737,13 +880,14 @@ fn child_cmdlines(parent: u32) -> Vec<Vec<String>> {
         let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
-        found.push(
+        found.push((
+            pid,
             bytes
                 .split(|byte| *byte == 0)
                 .filter(|part| !part.is_empty())
                 .map(|part| String::from_utf8_lossy(part).into_owned())
                 .collect(),
-        );
+        ));
     }
     found
 }
