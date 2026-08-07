@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Schema version of [`ProcessCheckpoint`], tracked separately from
+/// [`SCHEMA_VERSION`] because the checkpoint is an independent artifact: it
+/// can gain fields or be reformatted without forcing every snapshot on disk
+/// to be migrated too.
+pub const PROCESS_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "encoding", rename_all = "snake_case")]
 pub enum EncodedPath {
@@ -439,6 +445,140 @@ pub struct RestartSpec {
     pub executable: EncodedPath,
     pub argv: Vec<String>,
     pub trusted: bool,
+}
+
+/// Independent, atomically-overwritten record of what is currently running in
+/// each pane, kept alongside `current.json` but never itself dropped into
+/// snapshot history.
+///
+/// Structural snapshots capture `restart` too, but only at the moment a
+/// history snapshot is written, which can lag far behind what a pane is
+/// actually running: a shell that started `nvim` two minutes after the last
+/// structural change would not be reflected in any snapshot until the next
+/// one is taken. This sidecar is refreshed on a separate, shorter interval so
+/// that a restore's `--restore-processes` step can recover recently started
+/// programs, without needing a matching full snapshot for every such change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCheckpoint {
+    pub schema_version: u32,
+    pub captured_at: DateTime<Utc>,
+    /// The `current.json` snapshot id this checkpoint was captured alongside.
+    /// A restore must only apply this checkpoint when it still matches the
+    /// current pointer, or "what's running now" gets grafted onto "the
+    /// layout from an earlier point in time".
+    pub base_snapshot_id: String,
+    /// The base snapshot's structural hash, checked in addition to its id: an
+    /// id match with a mismatched structural hash means the base snapshot was
+    /// rewritten (e.g. repaired after corruption) since this checkpoint was
+    /// captured.
+    pub structural_hash: String,
+    pub process_hash: String,
+    pub origin: ProcessCheckpointOrigin,
+    pub panes: Vec<ProcessCheckpointPane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCheckpointOrigin {
+    pub socket_key: String,
+    pub server_started_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCheckpointPane {
+    pub pane_id: String,
+    pub current_command: Option<String>,
+    pub restart: Option<RestartSpec>,
+}
+
+impl ProcessCheckpoint {
+    pub fn capture(
+        base_snapshot_id: String,
+        structural_hash: String,
+        origin: ProcessCheckpointOrigin,
+        state: &TmuxState,
+    ) -> Result<Self> {
+        let panes = process_checkpoint_panes(state);
+        let process_hash = process_hash(&panes)?;
+        Ok(Self {
+            schema_version: PROCESS_CHECKPOINT_SCHEMA_VERSION,
+            captured_at: Utc::now(),
+            base_snapshot_id,
+            structural_hash,
+            process_hash,
+            origin,
+            panes,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PROCESS_CHECKPOINT_SCHEMA_VERSION {
+            bail!(
+                "unsupported process checkpoint schema {}, expected {}",
+                self.schema_version,
+                PROCESS_CHECKPOINT_SCHEMA_VERSION
+            );
+        }
+        let actual = process_hash(&self.panes)?;
+        if actual != self.process_hash {
+            bail!(
+                "process checkpoint hash mismatch: expected {}, got {}",
+                self.process_hash,
+                actual
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Projects every pane in `state` into the fields a [`ProcessCheckpoint`]
+/// tracks. Called both to build a fresh checkpoint and to recompute
+/// `process_hash` for comparison against the previous one.
+pub fn process_checkpoint_panes(state: &TmuxState) -> Vec<ProcessCheckpointPane> {
+    state
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .map(|pane| ProcessCheckpointPane {
+            pane_id: pane.id.clone(),
+            current_command: pane.current_command.clone(),
+            restart: pane.restart.clone(),
+        })
+        .collect()
+}
+
+/// Hashes exactly the fields that identify what a pane is running, so that an
+/// idle server with unrelated churn (a snapshot capture's timestamp, PIDs,
+/// TTYs) does not force a checkpoint rewrite every poll. Field order and
+/// names are part of the hash, so changing them changes every process hash.
+pub fn process_hash(panes: &[ProcessCheckpointPane]) -> Result<String> {
+    #[derive(Serialize)]
+    struct HashedPane<'a> {
+        pane_id: &'a str,
+        current_command: Option<&'a str>,
+        restart: Option<HashedRestart<'a>>,
+    }
+    #[derive(Serialize)]
+    struct HashedRestart<'a> {
+        executable: &'a EncodedPath,
+        argv: &'a [String],
+        trusted: bool,
+    }
+
+    let view: Vec<HashedPane<'_>> = panes
+        .iter()
+        .map(|pane| HashedPane {
+            pane_id: &pane.pane_id,
+            current_command: pane.current_command.as_deref(),
+            restart: pane.restart.as_ref().map(|restart| HashedRestart {
+                executable: &restart.executable,
+                argv: &restart.argv,
+                trusted: restart.trusted,
+            }),
+        })
+        .collect();
+    Ok(blake3::hash(&serde_json::to_vec(&view)?)
+        .to_hex()
+        .to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

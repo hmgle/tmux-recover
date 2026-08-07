@@ -52,8 +52,11 @@ impl Config {
         if self.autosave.debounce.is_zero()
             || self.autosave.min_interval.is_zero()
             || self.autosave.poll_interval.is_zero()
+            || self.autosave.process_checkpoint_interval.is_zero()
         {
-            bail!("autosave debounce, min_interval, and poll_interval must be greater than zero");
+            bail!(
+                "autosave debounce, min_interval, poll_interval, and process_checkpoint_interval must be greater than zero"
+            );
         }
         if self.retention.hourly_days < 0 || self.retention.daily_days < 0 {
             bail!("retention hourly_days and daily_days must not be negative");
@@ -74,6 +77,13 @@ pub struct AutosaveConfig {
     pub min_interval: Duration,
     #[serde(with = "duration_seconds")]
     pub poll_interval: Duration,
+    /// Minimum time between process checkpoint sidecar rewrites when
+    /// structural state is unchanged. Process restore is already best-effort,
+    /// so this does not need to be as tight as `poll_interval`; overwriting
+    /// in place (rather than adding a history entry) is what makes a shorter
+    /// interval affordable at all.
+    #[serde(with = "duration_seconds")]
+    pub process_checkpoint_interval: Duration,
 }
 
 impl Default for AutosaveConfig {
@@ -82,6 +92,7 @@ impl Default for AutosaveConfig {
             debounce: Duration::from_secs(5),
             min_interval: Duration::from_secs(30),
             poll_interval: Duration::from_secs(60),
+            process_checkpoint_interval: Duration::from_secs(300),
         }
     }
 }
@@ -164,6 +175,10 @@ mod tests {
         assert_eq!(config.autosave.debounce, Duration::from_secs(5));
         assert_eq!(config.autosave.min_interval, Duration::from_secs(30));
         assert_eq!(config.autosave.poll_interval, Duration::from_secs(60));
+        assert_eq!(
+            config.autosave.process_checkpoint_interval,
+            Duration::from_secs(300)
+        );
         assert_eq!(config.retention.recent, 100);
         assert!(!config.restore.auto);
         config.validate().unwrap();
@@ -173,6 +188,13 @@ mod tests {
     fn rejects_invalid_intervals() {
         let mut config = Config::default();
         config.autosave.poll_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_process_checkpoint_interval() {
+        let mut config = Config::default();
+        config.autosave.process_checkpoint_interval = Duration::ZERO;
         assert!(config.validate().is_err());
     }
 }

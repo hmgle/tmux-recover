@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{RetentionConfig, StorageConfig},
-    model::{RestoreReport, Snapshot},
+    model::{ProcessCheckpoint, RestoreReport, Snapshot},
 };
 
 #[derive(Debug, Clone)]
@@ -139,6 +139,14 @@ impl SnapshotStore {
         let bytes = fs::read(self.current_path()).ok()?;
         let pointer: CurrentPointer = serde_json::from_slice(&bytes).ok()?;
         (pointer.schema_version == 1).then_some(pointer)
+    }
+
+    /// The snapshot id the current pointer names, without reading the
+    /// snapshot body it points at. Process checkpoint bookkeeping only needs
+    /// the id to pin itself to; callers that need the validated snapshot
+    /// should use [`Self::load_current`] instead.
+    pub fn current_snapshot_id(&self) -> Option<String> {
+        self.read_pointer().map(|pointer| pointer.snapshot_id)
     }
 
     pub fn load_current(&self) -> Result<Snapshot> {
@@ -329,6 +337,39 @@ impl SnapshotStore {
         Ok(removed)
     }
 
+    /// Reads the process checkpoint sidecar, if one has ever been written.
+    ///
+    /// `Ok(None)` means no sidecar exists; an `Err` means one exists but is
+    /// unusable. The daemon treats both the same (the next checkpoint
+    /// replaces whatever is there), but a restore needs the distinction so it
+    /// can say the sidecar was ignored rather than silently falling back to
+    /// each pane's own restart metadata.
+    pub fn read_process_checkpoint(&self) -> Result<Option<ProcessCheckpoint>> {
+        let path = self.process_checkpoint_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let checkpoint: ProcessCheckpoint = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        checkpoint.validate()?;
+        Ok(Some(checkpoint))
+    }
+
+    /// Atomically overwrites the process checkpoint sidecar. Unlike
+    /// `commit`, this never touches the snapshots directory or the retention
+    /// policy: it is a single file that is replaced in place, not a new
+    /// history entry.
+    pub fn write_process_checkpoint(&self, checkpoint: &ProcessCheckpoint) -> Result<()> {
+        atomic_write(
+            &self.process_checkpoint_path(),
+            &serde_json::to_vec_pretty(checkpoint)?,
+        )
+    }
+
     pub fn write_restore_report(&self, report: &RestoreReport) -> Result<PathBuf> {
         let reports = self.root.join("restores");
         fs::create_dir_all(&reports)?;
@@ -388,6 +429,10 @@ impl SnapshotStore {
 
     fn current_path(&self) -> PathBuf {
         self.root.join("current.json")
+    }
+
+    fn process_checkpoint_path(&self) -> PathBuf {
+        self.root.join("process-current.json")
     }
 }
 
@@ -609,6 +654,76 @@ mod tests {
         );
         let repaired = store.load_current().unwrap();
         assert_eq!(repaired.state.sessions[0].name, "one");
+    }
+
+    #[test]
+    fn process_checkpoint_round_trips_and_is_absent_until_written() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        assert!(store.read_process_checkpoint().unwrap().is_none());
+
+        let checkpoint = crate::model::ProcessCheckpoint::capture(
+            "base-id".to_owned(),
+            "structural-hash".to_owned(),
+            crate::model::ProcessCheckpointOrigin {
+                socket_key: "socket".to_owned(),
+                server_started_at: Some(1),
+            },
+            &TmuxState {
+                sessions: vec![],
+                windows: vec![],
+            },
+        )
+        .unwrap();
+        store.write_process_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            store.read_process_checkpoint().unwrap(),
+            Some(checkpoint.clone())
+        );
+
+        // Overwriting in place must not leave a stale sidecar or a temp file
+        // behind; it replaces the same path every time.
+        let mut second = checkpoint.clone();
+        second.base_snapshot_id = "second-id".to_owned();
+        store.write_process_checkpoint(&second).unwrap();
+        assert_eq!(store.read_process_checkpoint().unwrap(), Some(second));
+        assert!(!store.snapshots_dir().join("process-current.json").exists());
+    }
+
+    #[test]
+    fn an_unreadable_process_checkpoint_is_distinguished_from_an_absent_one() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        fs::create_dir_all(store.root()).unwrap();
+        let path = store.process_checkpoint_path();
+
+        // Truncated body: a restore must be able to say the sidecar was
+        // ignored rather than quietly restoring fewer processes than asked.
+        fs::write(&path, b"{\"schema_version\":1,").unwrap();
+        assert!(store.read_process_checkpoint().is_err());
+
+        // Intact JSON whose panes no longer match the recorded hash.
+        let mut checkpoint = crate::model::ProcessCheckpoint::capture(
+            "base-id".to_owned(),
+            "structural-hash".to_owned(),
+            crate::model::ProcessCheckpointOrigin {
+                socket_key: "socket".to_owned(),
+                server_started_at: Some(1),
+            },
+            &TmuxState {
+                sessions: vec![],
+                windows: vec![],
+            },
+        )
+        .unwrap();
+        checkpoint.process_hash = "0".repeat(64);
+        fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(store.read_process_checkpoint().is_err());
+
+        fs::remove_file(&path).unwrap();
+        assert!(store.read_process_checkpoint().unwrap().is_none());
     }
 
     #[test]

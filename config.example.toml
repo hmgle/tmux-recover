@@ -2,6 +2,10 @@
 debounce = 5
 min_interval = 30
 poll_interval = 60
+# How often process-current.json may be rewritten while the layout is
+# unchanged. Only used by --restore-processes; it overwrites one file in place
+# rather than adding to snapshot history.
+process_checkpoint_interval = 300
 
 [retention]
 recent = 100
