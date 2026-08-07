@@ -226,7 +226,10 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(15), || {
+    // An auto-restore has to start a daemon, capture, preflight, and rebuild
+    // the session before this holds, so it gets a larger ceiling than the
+    // single-step waits elsewhere.
+    wait_until(Duration::from_secs(45), || {
         let output = server
             .tmux()
             .args(["list-sessions", "-F", "#{session_name}"])
@@ -968,7 +971,9 @@ fn child_cmdlines_with_pids(parent: u32) -> Vec<(u32, Vec<String>)> {
 
 /// Polls `condition` until it holds. The timeout is a generous ceiling for a
 /// real hang, not a performance assertion: several tmux servers and daemons
-/// share this binary's runner, so a tight bound only produces flakes.
+/// share this binary's runner, so a tight bound only produces flakes. Callers
+/// waiting on an auto-restore use a larger one still, since that path starts a
+/// daemon, captures, preflights, and rebuilds a session before it can hold.
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {

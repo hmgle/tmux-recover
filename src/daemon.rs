@@ -233,10 +233,22 @@ async fn reconnect(socket: &Path) -> Result<ControlClient> {
 }
 
 fn server_is_young(target: &crate::tmux::capture::CaptureResult, config: &Config) -> bool {
+    server_is_young_at(target, config, Utc::now().timestamp())
+}
+
+/// `now` is a parameter so the window's boundaries can be asserted exactly.
+/// Reading the clock inside made the test racy: it sampled `Utc::now()` to build
+/// the input, and a scheduling delay before this second read pushed an
+/// on-the-boundary age one second over.
+fn server_is_young_at(
+    target: &crate::tmux::capture::CaptureResult,
+    config: &Config,
+    now: i64,
+) -> bool {
     let Some(started_at) = target.origin.server_started_at else {
         return false;
     };
-    let age = Utc::now().timestamp() - started_at;
+    let age = now - started_at;
     (-5..=config.restore.auto_bootstrap_max_age_seconds).contains(&age)
 }
 
@@ -530,7 +542,10 @@ mod tests {
         let cwd = directory.path();
         let mut config = Config::default();
         config.restore.auto_bootstrap_max_age_seconds = 30;
-        let now = Utc::now().timestamp();
+        // A fixed instant, not `Utc::now()`: the boundary assertions below are
+        // exact, so a clock read between building the input and checking it
+        // would make them load-dependent.
+        let now = 1_700_000_000i64;
         let target = |started_at: Option<i64>| CaptureResult {
             origin: Origin {
                 server_started_at: started_at,
@@ -544,19 +559,31 @@ mod tests {
             default_shell: None,
         };
 
-        assert!(super::server_is_young(&target(Some(now)), &config));
-        assert!(super::server_is_young(&target(Some(now - 30)), &config));
+        assert!(super::server_is_young_at(&target(Some(now)), &config, now));
+        assert!(super::server_is_young_at(
+            &target(Some(now - 30)),
+            &config,
+            now
+        ));
         assert!(
-            !super::server_is_young(&target(Some(now - 31)), &config),
+            !super::server_is_young_at(&target(Some(now - 31)), &config, now),
             "a server older than the window must not be auto-restored over"
         );
         // A small negative age absorbs clock skew between the tmux server's
         // recorded start time and this process's clock.
-        assert!(super::server_is_young(&target(Some(now + 5)), &config));
-        assert!(!super::server_is_young(&target(Some(now + 6)), &config));
+        assert!(super::server_is_young_at(
+            &target(Some(now + 5)),
+            &config,
+            now
+        ));
+        assert!(!super::server_is_young_at(
+            &target(Some(now + 6)),
+            &config,
+            now
+        ));
         // No recorded start time means the age cannot be established, so the
         // conservative answer is "not young".
-        assert!(!super::server_is_young(&target(None), &config));
+        assert!(!super::server_is_young_at(&target(None), &config, now));
     }
 
     #[test]
