@@ -22,17 +22,28 @@ pub struct ControlClient {
 
 impl ControlClient {
     pub async fn connect(socket: &Path) -> Result<Self> {
-        let mut child = Command::new("tmux")
-            .env_remove("TMUX")
-            .arg("-S")
-            .arg(socket)
-            .args([
-                "-u",
-                "-C",
-                "attach-session",
-                "-f",
-                "ignore-size,no-output,active-pane,no-detach-on-destroy",
-            ])
+        Self::connect_to(socket, None).await
+    }
+
+    pub async fn connect_to(socket: &Path, target_session: Option<&str>) -> Result<Self> {
+        tracing::debug!(
+            target: "tmux_recover::control",
+            socket = %socket.display(),
+            target_session,
+            "connect tmux control client"
+        );
+        let mut command = Command::new("tmux");
+        command.env_remove("TMUX").arg("-S").arg(socket).args([
+            "-u",
+            "-C",
+            "attach-session",
+            "-f",
+            "ignore-size,no-output,active-pane,no-detach-on-destroy",
+        ]);
+        if let Some(target_session) = target_session {
+            command.arg("-t").arg(target_session);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -87,6 +98,7 @@ impl ControlClient {
         command: &str,
         block_count: usize,
     ) -> Result<Vec<Vec<Vec<u8>>>> {
+        tracing::debug!(target: "tmux_recover::control", blocks = block_count, command, "execute tmux command");
         self.stdin.write_all(command.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -105,6 +117,15 @@ impl ControlClient {
             loop {
                 let line = self.read_line().await?;
                 if line.starts_with(b"%end ") {
+                    tracing::debug!(
+                        target: "tmux_recover::control",
+                        lines = output.len(),
+                        output = ?output
+                            .iter()
+                            .map(|line| String::from_utf8_lossy(line).into_owned())
+                            .collect::<Vec<_>>(),
+                        "tmux command completed"
+                    );
                     blocks.push(output);
                     break;
                 }

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod model;
 pub mod process;
+pub mod restore;
 pub mod storage;
 pub mod tmux;
 pub mod util;

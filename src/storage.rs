@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{RetentionConfig, StorageConfig},
-    model::Snapshot,
+    model::{RestoreReport, Snapshot},
 };
 
 #[derive(Debug, Clone)]
@@ -241,6 +241,18 @@ impl SnapshotStore {
             sync_directory(&self.snapshots_dir())?;
         }
         Ok(removed)
+    }
+
+    pub fn write_restore_report(&self, report: &RestoreReport) -> Result<PathBuf> {
+        let reports = self.root.join("restores");
+        fs::create_dir_all(&reports)?;
+        let path = reports.join(format!(
+            "{}-{}.json",
+            report.started_at.format("%Y%m%dT%H%M%S%.6fZ"),
+            report.snapshot_id
+        ));
+        atomic_write(&path, &serde_json::to_vec_pretty(report)?)?;
+        Ok(path)
     }
 
     fn snapshot_paths(&self) -> Result<Vec<PathBuf>> {

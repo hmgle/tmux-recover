@@ -366,6 +366,35 @@ pub enum Severity {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreReport {
+    pub schema_version: u32,
+    pub snapshot_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub status: RestoreStatus,
+    pub replaced_existing: bool,
+    pub cwd_fallbacks: Vec<CwdFallbackRecord>,
+    pub restored_processes: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreStatus {
+    Succeeded,
+    FailedRolledBack,
+    FailedRollbackIncomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CwdFallbackRecord {
+    pub pane_id: String,
+    pub original: Option<EncodedPath>,
+    pub replacement: EncodedPath,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;

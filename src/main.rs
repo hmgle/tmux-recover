@@ -1,10 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
-    model::{Snapshot, SnapshotSource},
+    model::{RestoreStatus, Snapshot, SnapshotSource},
+    restore::{apply, preflight, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient, resolve_socket},
     util::socket_identity,
@@ -28,6 +32,7 @@ enum Command {
     #[command(alias = "view")]
     Show(SnapshotArgs),
     Validate(SnapshotArgs),
+    Restore(RestoreArgs),
     Pin(SnapshotArgs),
     Unpin(SnapshotArgs),
 }
@@ -60,6 +65,28 @@ struct SnapshotArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    #[arg(default_value = "current")]
+    snapshot: String,
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    replace: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long, value_name = "HOME|PATH")]
+    cwd_fallback: Option<PathBuf>,
+    #[arg(long)]
+    restore_processes: bool,
+    #[arg(long)]
+    allow_origin_mismatch: bool,
+    #[arg(long)]
+    json: bool,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -69,6 +96,13 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     let cli = Cli::parse();
     let mut paths = AppPaths::discover()?;
     if let Some(data_dir) = cli.data_dir {
@@ -84,9 +118,115 @@ async fn run() -> Result<()> {
         Command::List(args) => list(&paths.data_dir, &config, args).await,
         Command::Show(args) => show(&paths.data_dir, &config, args).await,
         Command::Validate(args) => validate(&paths.data_dir, &config, args).await,
+        Command::Restore(args) => restore(&paths.data_dir, &config, args).await,
         Command::Pin(args) => pin(&paths.data_dir, &config, args, true).await,
         Command::Unpin(args) => pin(&paths.data_dir, &config, args, false).await,
     }
+}
+
+async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Result<()> {
+    let socket = resolve_socket(args.socket.as_deref()).await?;
+    let identity = socket_identity(&socket)?;
+    let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
+    let snapshot = store.load(&args.snapshot)?;
+    let mut client = ControlClient::connect(&socket).await?;
+    let target = capture(&mut client, &socket).await?;
+
+    if args.cwd_fallback.as_deref() == Some(Path::new("HOME")) {
+        args.cwd_fallback = Some(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .context("HOME is not set")?,
+        );
+    }
+    let options = restore_config_options(
+        &config.restore,
+        args.replace,
+        args.allow_origin_mismatch,
+        args.cwd_fallback.as_deref(),
+        args.restore_processes,
+    );
+    let plan = preflight(&snapshot, &target, &options)?;
+    print_restore_plan(&plan, args.json)?;
+    if args.dry_run {
+        return Ok(());
+    }
+    if args.replace && !args.yes {
+        confirm_replace()?;
+    }
+
+    let safety_snapshot = Snapshot::new(
+        Some(format!("pre-restore {}", snapshot.id)),
+        SnapshotSource::Native {
+            reason: "pre_restore".to_owned(),
+        },
+        target.origin.clone(),
+        target.state.clone(),
+        target.diagnostics.clone(),
+    )?;
+    store.commit(&safety_snapshot, false)?;
+    store.pin(&safety_snapshot.id)?;
+    println!("safety snapshot: {}", safety_snapshot.id);
+
+    let report = apply(&mut client, &snapshot, &target, &plan).await;
+    let report_path = store.write_restore_report(&report)?;
+    println!("restore report: {}", report_path.display());
+    match report.status {
+        RestoreStatus::Succeeded => {
+            println!("restored {}", snapshot.id);
+            Ok(())
+        }
+        RestoreStatus::FailedRolledBack | RestoreStatus::FailedRollbackIncomplete => {
+            anyhow::bail!(
+                "restore failed with status {:?}: {}",
+                report.status,
+                report.error.as_deref().unwrap_or("unknown error")
+            )
+        }
+    }
+}
+
+fn print_restore_plan(plan: &tmux_recover::restore::RestorePlan, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+    } else {
+        println!("restore plan for {}", plan.snapshot_id);
+        println!("  target bootstrap: {}", plan.target_is_bootstrap);
+        println!("  replace existing: {}", plan.replace);
+        println!(
+            "  objects:          {} sessions, {} windows, {} panes",
+            plan.sessions, plan.windows, plan.panes
+        );
+        println!("  process restarts: {}", plan.process_restarts);
+        println!("  cwd fallbacks:    {}", plan.cwd_fallbacks.len());
+        for fallback in &plan.cwd_fallbacks {
+            println!(
+                "    {}: {} -> {}",
+                fallback.pane_id,
+                fallback
+                    .original
+                    .as_ref()
+                    .map(|path| path.display_lossy())
+                    .unwrap_or_else(|| "<missing>".to_owned()),
+                fallback.replacement.display_lossy()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn confirm_replace() -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--replace requires an interactive confirmation or --yes");
+    }
+    eprint!("Replace the existing tmux server state? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut response = String::new();
+    std::io::stdin().read_line(&mut response)?;
+    if !matches!(response.trim(), "y" | "Y" | "yes" | "YES") {
+        anyhow::bail!("restore cancelled");
+    }
+    Ok(())
 }
 
 async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
