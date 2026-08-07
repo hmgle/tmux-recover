@@ -17,6 +17,8 @@ use crate::{
     util::{hostname, uid},
 };
 
+const HOLD_COMMAND: &str = "exec sleep 86400";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RestorePlan {
     pub snapshot_id: String,
@@ -330,11 +332,17 @@ async fn apply_inner(
 
         let clients = list_clients(client).await?;
         let built = build_snapshot(client, snapshot, plan, &mut new_sessions).await?;
+        let first_session = snapshot
+            .state
+            .sessions
+            .first()
+            .context("no restored sessions")?
+            .id
+            .as_str();
         let first_target = built
             .sessions
-            .values()
-            .next()
-            .context("no restored sessions")?
+            .get(first_session)
+            .context("first restored session is missing")?
             .clone();
         let socket = target
             .origin
@@ -344,6 +352,15 @@ async fn apply_inner(
             .path
             .to_path_buf()?;
         let mut final_client = ControlClient::connect_to(&socket, Some(&first_target)).await?;
+        restore_properties(
+            &mut final_client,
+            &snapshot.state,
+            &built.windows,
+            &built.panes,
+        )
+        .await?;
+        let restored_processes =
+            start_panes(&mut final_client, &snapshot.state, plan, &built.panes).await?;
         restore_zoomed_windows(&mut final_client, &snapshot.state, &built.panes).await?;
         restore_session_windows(&mut final_client, &snapshot.state, &built.sessions).await?;
         restore_pane_titles(&mut final_client, &snapshot.state, &built.panes).await?;
@@ -355,7 +372,7 @@ async fn apply_inner(
             )
             .await?;
         }
-        Ok::<usize, anyhow::Error>(built.restored_processes)
+        Ok::<usize, anyhow::Error>(restored_processes)
     }
     .await;
 
@@ -403,8 +420,8 @@ struct BackupSession {
 
 struct BuiltState {
     sessions: HashMap<String, String>,
+    windows: HashMap<String, String>,
     panes: HashMap<String, String>,
-    restored_processes: usize,
 }
 
 async fn build_snapshot(
@@ -473,8 +490,6 @@ async fn build_snapshot(
     let owners = window_owners(state);
     let mut window_ids = HashMap::new();
     let mut pane_ids = HashMap::new();
-    let mut restored_processes = 0;
-
     for window in &state.windows {
         let owner = owners
             .get(&window.id)
@@ -491,24 +506,34 @@ async fn build_snapshot(
             .pane_cwds
             .get(&first_pane.id)
             .context("pane cwd is missing from plan")?;
-        let launch = pane_launch(first_pane, plan)?;
         let mut command = format!(
             "new-window -d -P -F \"#{{window_id}}|#{{pane_id}}\" -t {} -n {} -c {}",
             quote(&format!("{}:{}", target_session, owner.1)),
             quote(&window.name),
             quote_path(cwd)?
         );
-        if let Some(launch) = launch {
-            command.push(' ');
-            command.push_str(&quote(&launch));
-            restored_processes += 1;
-        }
+        command.push(' ');
+        command.push_str(&quote(HOLD_COMMAND));
         let output = client.execute(&command).await?;
         let fields = output_fields(&output)?;
         let new_window = fields[0].clone();
         let first_new_pane = fields[1].clone();
         window_ids.insert(window.id.clone(), new_window.clone());
-        pane_ids.insert(first_pane.id.clone(), first_new_pane);
+        pane_ids.insert(first_pane.id.clone(), first_new_pane.clone());
+        let mut split_target = first_new_pane;
+
+        if window.width > 0 && window.height > 0 {
+            execute_empty(
+                client,
+                &format!(
+                    "resize-window -t {} -x {} -y {}",
+                    quote(&new_window),
+                    window.width,
+                    window.height
+                ),
+            )
+            .await?;
+        }
 
         let min_index = window
             .panes
@@ -541,22 +566,21 @@ async fn build_snapshot(
                 .context("pane cwd is missing from plan")?;
             let mut command = format!(
                 "split-window -d -P -F \"#{{pane_id}}\" -t {} -c {}",
-                quote(&new_window),
+                quote(&split_target),
                 quote_path(cwd)?
             );
-            if let Some(launch) = pane_launch(pane, plan)? {
-                command.push(' ');
-                command.push_str(&quote(&launch));
-                restored_processes += 1;
-            }
+            command.push(' ');
+            command.push_str(&quote(HOLD_COMMAND));
             let output = client.execute(&command).await?;
             let fields = output_fields(&output)?;
-            pane_ids.insert(pane.id.clone(), fields[0].clone());
+            let new_pane = fields[0].clone();
+            pane_ids.insert(pane.id.clone(), new_pane.clone());
             execute_empty(
                 client,
-                &format!("resize-pane -t {} -U 999", quote(&new_window)),
+                &format!("resize-pane -t {} -U 999", quote(&new_pane)),
             )
             .await?;
+            split_target = new_pane;
         }
     }
 
@@ -617,12 +641,39 @@ async fn build_snapshot(
         }
     }
 
-    restore_properties(client, state, &window_ids, &pane_ids).await?;
     Ok(BuiltState {
         sessions: session_ids,
+        windows: window_ids,
         panes: pane_ids,
-        restored_processes,
     })
+}
+
+async fn start_panes(
+    client: &mut ControlClient,
+    state: &TmuxState,
+    plan: &RestorePlan,
+    pane_ids: &HashMap<String, String>,
+) -> Result<usize> {
+    let mut restored_processes = 0;
+    for pane in state.windows.iter().flat_map(|window| &window.panes) {
+        let new_pane = pane_ids.get(&pane.id).context("missing restored pane")?;
+        let cwd = plan
+            .pane_cwds
+            .get(&pane.id)
+            .context("pane cwd is missing from plan")?;
+        let mut command = format!(
+            "respawn-pane -k -t {} -c {}",
+            quote(new_pane),
+            quote_path(cwd)?
+        );
+        if let Some(launch) = pane_launch(pane, plan)? {
+            command.push(' ');
+            command.push_str(&quote(&launch));
+            restored_processes += 1;
+        }
+        execute_empty(client, &command).await?;
+    }
+    Ok(restored_processes)
 }
 
 async fn restore_properties(
@@ -635,11 +686,16 @@ async fn restore_properties(
         let new_window = window_ids
             .get(&window.id)
             .context("missing restored window")?;
+        let layout_target = window
+            .panes
+            .first()
+            .and_then(|pane| pane_ids.get(&pane.id))
+            .context("missing pane target for restored layout")?;
         execute_empty(
             client,
             &format!(
                 "select-layout -t {} {}",
-                quote(new_window),
+                quote(layout_target),
                 quote(&window.layout)
             ),
         )
@@ -924,11 +980,15 @@ async fn switch_clients(
     built: &BuiltState,
     snapshot: &Snapshot,
 ) -> Result<()> {
+    let first_session = snapshot
+        .state
+        .sessions
+        .first()
+        .context("no restored sessions")?;
     let first_target = built
         .sessions
-        .values()
-        .next()
-        .context("no restored sessions")?;
+        .get(&first_session.id)
+        .context("first restored session is missing")?;
     for attachment in clients {
         let target = backups
             .iter()

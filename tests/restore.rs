@@ -73,7 +73,7 @@ async fn restores_special_fields_active_pane_and_zoom() {
                 "-d",
                 "-P",
                 "-F",
-                "#{window_id}|#{pane_id}",
+                "#{session_id}|#{window_id}|#{pane_id}",
                 "-s",
                 "work:雪",
                 "-n",
@@ -83,7 +83,11 @@ async fn restores_special_fields_active_pane_and_zoom() {
             .arg(&cwd_one)
             .arg("sleep 60"),
     );
-    let (window_id, first_pane) = first.trim().split_once('|').unwrap();
+    let mut first_fields = first.trim().split('|');
+    let session_id = first_fields.next().unwrap();
+    let window_id = first_fields.next().unwrap();
+    let first_pane = first_fields.next().unwrap();
+    assert_eq!(first_fields.next(), None);
     let second_pane = output(
         server
             .tmux()
@@ -94,11 +98,55 @@ async fn restores_special_fields_active_pane_and_zoom() {
             .arg("sleep 60"),
     );
     let second_pane = second_pane.trim();
+    let third_pane = output(
+        server
+            .tmux()
+            .args(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t"])
+            .arg(first_pane)
+            .arg("-c")
+            .arg(&cwd_one)
+            .arg("sleep 60"),
+    );
+    let third_pane = third_pane.trim();
+    let fourth_pane = output(
+        server
+            .tmux()
+            .args(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t"])
+            .arg(first_pane)
+            .arg("-c")
+            .arg(&cwd_two)
+            .arg("sleep 60"),
+    );
+    let fourth_pane = fourth_pane.trim();
+    let auxiliary = output(
+        server
+            .tmux()
+            .args([
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}|#{pane_id}",
+                "-t",
+            ])
+            .arg(format!("{session_id}:1"))
+            .args(["-n", "aux", "-c"])
+            .arg(&cwd_one)
+            .arg("sleep 60"),
+    );
+    let (auxiliary_window, auxiliary_pane) = auxiliary.trim().split_once('|').unwrap();
     std::thread::sleep(Duration::from_millis(100));
     success(server.tmux().args([
         "set-window-option",
         "-t",
         window_id,
+        "automatic-rename",
+        "off",
+    ]));
+    success(server.tmux().args([
+        "set-window-option",
+        "-t",
+        auxiliary_window,
         "automatic-rename",
         "off",
     ]));
@@ -117,6 +165,21 @@ async fn restores_special_fields_active_pane_and_zoom() {
                 .tmux()
                 .args(["select-pane", "-t", second_pane, "-T", "title:雪"]),
         );
+        success(
+            server
+                .tmux()
+                .args(["select-pane", "-t", third_pane, "-T", "third"]),
+        );
+        success(
+            server
+                .tmux()
+                .args(["select-pane", "-t", fourth_pane, "-T", "fourth"]),
+        );
+        success(
+            server
+                .tmux()
+                .args(["select-pane", "-t", auxiliary_pane, "-T", "auxiliary"]),
+        );
         capture(&mut client, &server.socket).await.unwrap()
     };
     let snapshot = Snapshot::new(
@@ -129,14 +192,13 @@ async fn restores_special_fields_active_pane_and_zoom() {
         source.diagnostics,
     )
     .unwrap();
-    assert_eq!(
-        snapshot.state.windows[0].panes[0].title.as_deref(),
-        Some("")
-    );
-    assert_eq!(
-        snapshot.state.windows[0].panes[1].title.as_deref(),
-        Some("title:雪")
-    );
+    let main = snapshot
+        .state
+        .windows
+        .iter()
+        .find(|window| window.name == "main window")
+        .unwrap();
+    assert_pane_properties(main, &cwd_one, &cwd_two);
 
     server.stop();
     success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
@@ -148,7 +210,7 @@ async fn restores_special_fields_active_pane_and_zoom() {
     };
     let options = restore_config_options(&config, false, false, None, true);
     let plan = preflight(&snapshot, &target, &options).unwrap();
-    assert_eq!(plan.process_restarts, 2);
+    assert_eq!(plan.process_restarts, 5);
     let report = apply(&mut client, &snapshot, &target, &plan).await;
     assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
     drop(client);
@@ -159,19 +221,26 @@ async fn restores_special_fields_active_pane_and_zoom() {
     };
     assert_eq!(restored.state.sessions.len(), 1);
     assert_eq!(restored.state.sessions[0].name, "work:雪");
-    assert_eq!(restored.state.windows.len(), 1);
-    let window = &restored.state.windows[0];
+    assert_eq!(restored.state.windows.len(), 2);
+    let window = restored
+        .state
+        .windows
+        .iter()
+        .find(|window| window.name == "main window")
+        .unwrap();
     assert_eq!(window.name, "main window");
     assert!(window.zoomed);
-    assert_eq!(window.panes.len(), 2);
-    assert_eq!(window.panes[0].title.as_deref(), Some(""));
-    assert_eq!(window.panes[1].title.as_deref(), Some("title:雪"));
-    assert_eq!(cwd(&window.panes[0]), cwd_one);
-    assert_eq!(cwd(&window.panes[1]), cwd_two);
-    assert_eq!(
-        window.active_pane_id.as_deref(),
-        Some(window.panes[1].id.as_str())
-    );
+    assert_eq!(window.panes.len(), 4);
+    assert_pane_properties(window, &cwd_one, &cwd_two);
+    let auxiliary = restored
+        .state
+        .windows
+        .iter()
+        .find(|window| window.name == "aux")
+        .unwrap();
+    assert_eq!(auxiliary.panes.len(), 1);
+    assert_eq!(auxiliary.panes[0].title.as_deref(), Some("auxiliary"));
+    assert_eq!(cwd(&auxiliary.panes[0]), cwd_one);
 }
 
 fn output(command: &mut Command) -> String {
@@ -195,4 +264,40 @@ fn success(command: &mut Command) {
 
 fn cwd(pane: &tmux_recover::model::Pane) -> std::path::PathBuf {
     pane.cwd.path.as_ref().unwrap().to_path_buf().unwrap()
+}
+
+fn assert_pane_properties(
+    window: &tmux_recover::model::Window,
+    cwd_one: &std::path::Path,
+    cwd_two: &std::path::Path,
+) {
+    let mut titles: Vec<&str> = window
+        .panes
+        .iter()
+        .filter_map(|pane| pane.title.as_deref())
+        .collect();
+    titles.sort_unstable();
+    assert_eq!(titles, ["", "fourth", "third", "title:雪"]);
+    assert_eq!(
+        window
+            .panes
+            .iter()
+            .filter(|pane| cwd(pane) == cwd_one)
+            .count(),
+        2
+    );
+    assert_eq!(
+        window
+            .panes
+            .iter()
+            .filter(|pane| cwd(pane) == cwd_two)
+            .count(),
+        2
+    );
+    let active = window
+        .panes
+        .iter()
+        .find(|pane| Some(&pane.id) == window.active_pane_id.as_ref())
+        .unwrap();
+    assert_eq!(active.title.as_deref(), Some("title:雪"));
 }

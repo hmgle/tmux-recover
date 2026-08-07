@@ -38,7 +38,7 @@ impl ControlClient {
             "-C",
             "attach-session",
             "-f",
-            "ignore-size,no-output,active-pane,no-detach-on-destroy",
+            "ignore-size,no-output,no-detach-on-destroy",
         ]);
         if let Some(target_session) = target_session {
             command.arg("-t").arg(target_session);
@@ -136,6 +136,12 @@ impl ControlClient {
                         .collect::<Vec<_>>()
                         .join("\n");
                     bail!("tmux command failed: {detail}");
+                }
+                if line.starts_with(b"%exit") {
+                    bail!(
+                        "tmux control client exited while a command was pending: {}",
+                        text_lossy(&line)
+                    );
                 }
                 output.push(line);
             }
