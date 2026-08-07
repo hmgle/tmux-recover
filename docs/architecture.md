@@ -32,6 +32,15 @@ cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
 current snapshot, so an idle server does not produce a new snapshot on every
 poll.
 
+Dedup also requires the capture's `origin` to match, not just the structural
+hash. A restore reproduces tmux ids deterministically, so a fresh server
+generation can present the exact structure of the snapshot it was restored
+from. On structure alone, `current` would stay pinned to the previous
+generation's snapshot, and every process checkpoint written afterwards would
+carry the new generation and be rejected as mismatched for the life of that
+server. Comparing `origin` costs at most one extra snapshot when the tool or
+tmux version changes, which is a real history boundary.
+
 Known limitation: the fixed hook slot is a shared namespace. If another tool
 also binds `set-hook -g '<name>[901]'`, one daemon's startup cleanup or shutdown
 removal will delete the other's hook. A future version should make the slot

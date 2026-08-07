@@ -63,6 +63,15 @@ pub enum CommitOutcome {
     Unchanged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dedup {
+    /// Skip the write when the current snapshot already holds this structure
+    /// from this same server generation. The autosave default.
+    OnUnchangedStructure,
+    /// Always write a history entry.
+    Never,
+}
+
 pub struct DaemonLock {
     _file: File,
 }
@@ -91,6 +100,23 @@ impl SnapshotStore {
     }
 
     pub fn commit(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
+        self.commit_with(snapshot, set_current, Dedup::OnUnchangedStructure)
+    }
+
+    /// Writes a history entry even when the structure is unchanged. For an
+    /// explicit user action that carries information the current snapshot does
+    /// not already hold -- a label, for instance -- where reporting `Unchanged`
+    /// would silently discard what the user asked for.
+    pub fn commit_always(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
+        self.commit_with(snapshot, set_current, Dedup::Never)
+    }
+
+    fn commit_with(
+        &self,
+        snapshot: &Snapshot,
+        set_current: bool,
+        dedup: Dedup,
+    ) -> Result<CommitOutcome> {
         snapshot.validate()?;
         fs::create_dir_all(self.snapshots_dir())?;
         fs::create_dir_all(self.pins_dir())?;
@@ -104,8 +130,22 @@ impl SnapshotStore {
         // exactly the snapshot automatic restore depends on. This is one read
         // per autosave tick, not the linear scan over history that made
         // pruning slow.
-        if set_current
+        //
+        // `Origin` has to match too, not just the structural hash. A restore
+        // reproduces tmux ids deterministically, so a fresh server generation
+        // can present the exact same structure as the snapshot it was restored
+        // from -- verified against a live server. Deduping on structure alone
+        // would then leave `current` pointing at the old generation's snapshot
+        // forever, and every process checkpoint written afterwards would carry
+        // the new generation and be rejected by
+        // `checkpoint_eligibility` for the rest of the server's life. Every
+        // Origin field is stable within a generation, so this cannot cause
+        // per-tick churn; a tool or tmux upgrade writes one extra snapshot,
+        // which is a real history boundary worth recording.
+        if dedup == Dedup::OnUnchangedStructure
+            && set_current
             && let Ok(current) = self.load_current()
+            && current.origin == snapshot.origin
             && current.state.structural_hash()? == structural_hash
         {
             return Ok(CommitOutcome::Unchanged);
@@ -560,6 +600,73 @@ mod tests {
         assert_eq!(
             store.load_current().unwrap().semantic_hash,
             first.semantic_hash
+        );
+    }
+
+    #[test]
+    fn same_structural_state_from_a_new_server_generation_is_written() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let mut first = snapshot("one");
+        first.origin.server_started_at = Some(1000);
+        first.origin.server_pid = Some(10);
+        assert_eq!(store.commit(&first, true).unwrap(), CommitOutcome::Written);
+
+        // A restore reproduces tmux ids deterministically, so the same
+        // structure can reappear under a new server generation. Deduping it
+        // away would leave `current` on the old generation and make every
+        // later process checkpoint ineligible for the rest of the server's
+        // life.
+        let mut restarted = snapshot("one");
+        restarted.origin.server_started_at = Some(2000);
+        restarted.origin.server_pid = Some(20);
+        assert_eq!(
+            restarted.state.structural_hash().unwrap(),
+            first.state.structural_hash().unwrap(),
+            "this test is only meaningful if the structure is identical"
+        );
+        assert_eq!(
+            store.commit(&restarted, true).unwrap(),
+            CommitOutcome::Written
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(
+            store.load_current().unwrap().origin.server_started_at,
+            Some(2000),
+            "current must rebase onto the new generation"
+        );
+
+        // Within one generation, dedup still applies.
+        let mut same_generation = snapshot("one");
+        same_generation.origin.server_started_at = Some(2000);
+        same_generation.origin.server_pid = Some(20);
+        assert_eq!(
+            store.commit(&same_generation, true).unwrap(),
+            CommitOutcome::Unchanged
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn commit_always_writes_history_for_unchanged_structure() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let first = snapshot("one");
+        assert_eq!(store.commit(&first, true).unwrap(), CommitOutcome::Written);
+
+        // Same structure, but carrying a label the stored one does not have.
+        let mut labelled = snapshot("one");
+        labelled.label = Some("before-upgrade".to_owned());
+        assert_eq!(
+            store.commit_always(&labelled, true).unwrap(),
+            CommitOutcome::Written
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(
+            store.load_current().unwrap().label.as_deref(),
+            Some("before-upgrade")
         );
     }
 
