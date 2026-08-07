@@ -37,7 +37,7 @@ const STRUCTURE_HOOKS: &[&str] = &[
 ];
 
 pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> {
-    validate_cadence(config)?;
+    config.validate()?;
     let identity = socket_identity(socket)?;
     let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
     let _lock = store.acquire_daemon_lock()?;
@@ -105,16 +105,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         tracing::warn!(error = %format!("{error:#}"), "failed to remove daemon hooks");
     }
     tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
-    Ok(())
-}
-
-fn validate_cadence(config: &Config) -> Result<()> {
-    if config.autosave.debounce.is_zero()
-        || config.autosave.min_interval.is_zero()
-        || config.autosave.poll_interval.is_zero()
-    {
-        bail!("autosave debounce, min_interval, and poll_interval must be greater than zero");
-    }
     Ok(())
 }
 

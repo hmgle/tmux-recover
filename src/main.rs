@@ -27,15 +27,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Capture the current tmux server into a native snapshot.
     Save(SaveArgs),
+    /// List native snapshots for a socket or imported snapshots.
     List(StoreArgs),
+    /// Inspect one snapshot. The `view` alias is also accepted.
     #[command(alias = "view")]
     Show(SnapshotArgs),
+    /// Verify the schema, graph references, and semantic hash.
     Validate(SnapshotArgs),
+    /// Preflight and transactionally restore a snapshot.
     Restore(RestoreArgs),
+    /// Watch one tmux socket and save changed state continuously.
     Daemon(DaemonArgs),
+    /// Convert a tmux-resurrect v3 or v4 file to native JSON.
     ImportResurrect(ImportResurrectArgs),
+    /// Exempt a snapshot from retention pruning.
     Pin(SnapshotArgs),
+    /// Remove a snapshot's retention pin.
     Unpin(SnapshotArgs),
 }
 

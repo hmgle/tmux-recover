@@ -34,8 +34,7 @@ pub fn collect_restart_specs(pane_pids: impl Iterator<Item = u32>) -> HashMap<u3
 
 #[cfg(not(target_os = "linux"))]
 pub fn collect_restart_specs(_pane_pids: impl Iterator<Item = u32>) -> HashMap<u32, RestartSpec> {
-    // Native process metadata is optional. The macOS backend is filled by libproc when available;
-    // a missing backend must never make the structural snapshot fail.
+    // Process metadata is optional; structural capture must still work on every target.
     HashMap::new()
 }
 

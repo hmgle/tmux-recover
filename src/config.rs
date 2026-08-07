@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +27,7 @@ impl AppPaths {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub autosave: AutosaveConfig,
     pub retention: RetentionConfig,
@@ -42,13 +42,31 @@ impl Config {
         }
         let input = fs::read_to_string(&paths.config_file)
             .with_context(|| format!("failed to read {}", paths.config_file.display()))?;
-        toml::from_str(&input)
-            .with_context(|| format!("failed to parse {}", paths.config_file.display()))
+        let config: Self = toml::from_str(&input)
+            .with_context(|| format!("failed to parse {}", paths.config_file.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.autosave.debounce.is_zero()
+            || self.autosave.min_interval.is_zero()
+            || self.autosave.poll_interval.is_zero()
+        {
+            bail!("autosave debounce, min_interval, and poll_interval must be greater than zero");
+        }
+        if self.retention.hourly_days < 0 || self.retention.daily_days < 0 {
+            bail!("retention hourly_days and daily_days must not be negative");
+        }
+        if self.restore.auto_bootstrap_max_age_seconds < 0 {
+            bail!("restore auto_bootstrap_max_age_seconds must not be negative");
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutosaveConfig {
     #[serde(with = "duration_seconds")]
     pub debounce: Duration,
@@ -69,7 +87,7 @@ impl Default for AutosaveConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetentionConfig {
     pub recent: usize,
     pub hourly_days: i64,
@@ -87,11 +105,10 @@ impl Default for RetentionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RestoreConfig {
     pub auto: bool,
     pub auto_bootstrap_max_age_seconds: i64,
-    pub process_restore: bool,
     pub process_allowlist: Vec<String>,
 }
 
@@ -100,7 +117,6 @@ impl Default for RestoreConfig {
         Self {
             auto: false,
             auto_bootstrap_max_age_seconds: 30,
-            process_restore: false,
             process_allowlist: [
                 "vi", "vim", "view", "nvim", "emacs", "man", "less", "more", "tail", "top", "htop",
                 "irssi", "weechat", "mutt",
@@ -113,7 +129,7 @@ impl Default for RestoreConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub zstd: bool,
 }
@@ -150,5 +166,13 @@ mod tests {
         assert_eq!(config.autosave.poll_interval, Duration::from_secs(60));
         assert_eq!(config.retention.recent, 100);
         assert!(!config.restore.auto);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_intervals() {
+        let mut config = Config::default();
+        config.autosave.poll_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
     }
 }
