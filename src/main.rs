@@ -34,6 +34,7 @@ enum Command {
     Validate(SnapshotArgs),
     Restore(RestoreArgs),
     Daemon(DaemonArgs),
+    ImportResurrect(ImportResurrectArgs),
     Pin(SnapshotArgs),
     Unpin(SnapshotArgs),
 }
@@ -54,6 +55,8 @@ struct StoreArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    imports: bool,
 }
 
 #[derive(Debug, Args)]
@@ -64,6 +67,8 @@ struct SnapshotArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    imports: bool,
 }
 
 #[derive(Debug, Args)]
@@ -86,12 +91,25 @@ struct RestoreArgs {
     allow_origin_mismatch: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    from_imports: bool,
 }
 
 #[derive(Debug, Args)]
 struct DaemonArgs {
     #[arg(long)]
     socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ImportResurrectArgs {
+    path: PathBuf,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    pin: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -127,6 +145,7 @@ async fn run() -> Result<()> {
         Command::Validate(args) => validate(&paths.data_dir, &config, args).await,
         Command::Restore(args) => restore(&paths.data_dir, &config, args).await,
         Command::Daemon(args) => daemon(&paths.data_dir, &config, args).await,
+        Command::ImportResurrect(args) => import_resurrect(&paths.data_dir, &config, args),
         Command::Pin(args) => pin(&paths.data_dir, &config, args, true).await,
         Command::Unpin(args) => pin(&paths.data_dir, &config, args, false).await,
     }
@@ -140,8 +159,13 @@ async fn daemon(data_dir: &Path, config: &Config, args: DaemonArgs) -> Result<()
 async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Result<()> {
     let socket = resolve_socket(args.socket.as_deref()).await?;
     let identity = socket_identity(&socket)?;
-    let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
-    let snapshot = store.load(&args.snapshot)?;
+    let target_store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
+    let source_store = if args.from_imports {
+        SnapshotStore::imports(data_dir, &config.storage)
+    } else {
+        target_store.clone()
+    };
+    let snapshot = source_store.load(&args.snapshot)?;
     let mut client = ControlClient::connect(&socket).await?;
     let target = capture(&mut client, &socket).await?;
 
@@ -177,12 +201,12 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
         target.state.clone(),
         target.diagnostics.clone(),
     )?;
-    store.commit(&safety_snapshot, false)?;
-    store.pin(&safety_snapshot.id)?;
+    target_store.commit(&safety_snapshot, false)?;
+    target_store.pin(&safety_snapshot.id)?;
     println!("safety snapshot: {}", safety_snapshot.id);
 
     let report = apply(&mut client, &snapshot, &target, &plan).await;
-    let report_path = store.write_restore_report(&report)?;
+    let report_path = target_store.write_restore_report(&report)?;
     println!("restore report: {}", report_path.display());
     match report.status {
         RestoreStatus::Succeeded => {
@@ -280,7 +304,7 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
 }
 
 async fn list(data_dir: &Path, config: &Config, args: StoreArgs) -> Result<()> {
-    let store = socket_store(data_dir, config, args.socket.as_deref()).await?;
+    let store = selected_store(data_dir, config, args.socket.as_deref(), args.imports).await?;
     let summaries = store.list()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
@@ -303,7 +327,7 @@ async fn list(data_dir: &Path, config: &Config, args: StoreArgs) -> Result<()> {
 }
 
 async fn show(data_dir: &Path, config: &Config, args: SnapshotArgs) -> Result<()> {
-    let store = socket_store(data_dir, config, args.socket.as_deref()).await?;
+    let store = selected_store(data_dir, config, args.socket.as_deref(), args.imports).await?;
     let snapshot = store.load(&args.snapshot)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -337,7 +361,7 @@ async fn show(data_dir: &Path, config: &Config, args: SnapshotArgs) -> Result<()
 }
 
 async fn validate(data_dir: &Path, config: &Config, args: SnapshotArgs) -> Result<()> {
-    let store = socket_store(data_dir, config, args.socket.as_deref()).await?;
+    let store = selected_store(data_dir, config, args.socket.as_deref(), args.imports).await?;
     let snapshot = store.load(&args.snapshot)?;
     snapshot.validate()?;
     if args.json {
@@ -352,7 +376,7 @@ async fn validate(data_dir: &Path, config: &Config, args: SnapshotArgs) -> Resul
 }
 
 async fn pin(data_dir: &Path, config: &Config, args: SnapshotArgs, should_pin: bool) -> Result<()> {
-    let store = socket_store(data_dir, config, args.socket.as_deref()).await?;
+    let store = selected_store(data_dir, config, args.socket.as_deref(), args.imports).await?;
     if should_pin {
         store.pin(&args.snapshot)?;
         println!("pinned {}", args.snapshot);
@@ -363,11 +387,58 @@ async fn pin(data_dir: &Path, config: &Config, args: SnapshotArgs, should_pin: b
     Ok(())
 }
 
-async fn socket_store(
+fn import_resurrect(data_dir: &Path, config: &Config, args: ImportResurrectArgs) -> Result<()> {
+    let mut result = tmux_recover::import::import_resurrect(&args.path)?;
+    if let Some(label) = args.label {
+        result.snapshot.label = Some(label);
+    }
+    let store = SnapshotStore::imports(data_dir, &config.storage);
+    store.commit(&result.snapshot, true)?;
+    if args.pin {
+        store.pin(&result.snapshot.id)?;
+    }
+    let removed = store.prune(&config.retention)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "snapshot_id": result.snapshot.id,
+                "detected_version": match &result.snapshot.source {
+                    SnapshotSource::ResurrectImport { detected_version, .. } => detected_version,
+                    SnapshotSource::Native { .. } => unreachable!(),
+                },
+                "panes": {
+                    "exact": result.exact_panes,
+                    "repaired": result.repaired_panes,
+                    "ambiguous": result.ambiguous_panes,
+                },
+                "diagnostics": result.snapshot.diagnostics.len(),
+                "pruned": removed,
+            })
+        );
+    } else {
+        println!("imported {}", result.snapshot.id);
+        println!(
+            "panes: {} exact, {} repaired, {} ambiguous",
+            result.exact_panes, result.repaired_panes, result.ambiguous_panes
+        );
+        println!("diagnostics: {}", result.snapshot.diagnostics.len());
+        if !removed.is_empty() {
+            println!("pruned {} old imports", removed.len());
+        }
+    }
+    Ok(())
+}
+
+async fn selected_store(
     data_dir: &Path,
     config: &Config,
     socket: Option<&Path>,
+    imports: bool,
 ) -> Result<SnapshotStore> {
+    if imports {
+        return Ok(SnapshotStore::imports(data_dir, &config.storage));
+    }
     let socket = resolve_socket(socket).await?;
     let identity = socket_identity(&socket)?;
     Ok(SnapshotStore::for_socket(
