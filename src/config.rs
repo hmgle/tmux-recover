@@ -58,6 +58,13 @@ impl Config {
                 "autosave debounce, min_interval, poll_interval, and process_checkpoint_interval must be greater than zero"
             );
         }
+        // The checkpoint interval is compared against timestamps as a
+        // `chrono::TimeDelta`, which has a narrower range than `Duration`.
+        // Reject it here rather than letting the conversion fail at the point
+        // where the daemon can only log and carry on.
+        if let Err(error) = chrono::TimeDelta::from_std(self.autosave.process_checkpoint_interval) {
+            bail!("autosave process_checkpoint_interval is too large: {error}");
+        }
         if self.retention.hourly_days < 0 || self.retention.daily_days < 0 {
             bail!("retention hourly_days and daily_days must not be negative");
         }
@@ -196,5 +203,19 @@ mod tests {
         let mut config = Config::default();
         config.autosave.process_checkpoint_interval = Duration::ZERO;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_process_checkpoint_interval_chrono_cannot_represent() {
+        // Duration outruns chrono::TimeDelta, and the daemon compares the
+        // interval as a TimeDelta. Caught here rather than degrading into a
+        // zero interval that rewrites the sidecar on every tick.
+        let mut config = Config::default();
+        config.autosave.process_checkpoint_interval = Duration::MAX;
+        let error = format!("{:#}", config.validate().unwrap_err());
+        assert!(
+            error.contains("process_checkpoint_interval is too large"),
+            "{error}"
+        );
     }
 }

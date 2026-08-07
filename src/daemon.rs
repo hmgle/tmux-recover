@@ -326,13 +326,31 @@ fn maybe_refresh_process_checkpoint(
         );
         None
     });
+    // Rejected by `Config::validate`, so this only fires for a hand-built
+    // Config; still an error rather than a silent zero interval, which would
+    // rewrite the sidecar on every tick.
     let interval = TimeDelta::from_std(config.autosave.process_checkpoint_interval)
-        .unwrap_or(TimeDelta::zero());
-    let due = match &existing {
-        None => true,
-        Some(checkpoint) if checkpoint.base_snapshot_id != base_snapshot_id => true,
-        Some(checkpoint) => Utc::now().signed_duration_since(checkpoint.captured_at) >= interval,
-    };
+        .map_err(|error| anyhow::anyhow!("process_checkpoint_interval is out of range: {error}"))?;
+    let now = Utc::now();
+    // Wall-clock time can move backwards (NTP correction, VM restore, manual
+    // clock change), which leaves the existing captured_at in the future and
+    // its elapsed time negative. Force a rewrite in that case: the sidecar
+    // would otherwise be judged not-yet-due until the clock caught back up to
+    // a timestamp that may be arbitrarily far ahead.
+    let clock_moved_backwards = existing
+        .as_ref()
+        .is_some_and(|checkpoint| now < checkpoint.captured_at);
+    if clock_moved_backwards {
+        tracing::warn!(
+            "process checkpoint is stamped in the future; rewriting it to re-anchor the interval"
+        );
+    }
+    let due = clock_moved_backwards
+        || match &existing {
+            None => true,
+            Some(checkpoint) if checkpoint.base_snapshot_id != base_snapshot_id => true,
+            Some(checkpoint) => now.signed_duration_since(checkpoint.captured_at) >= interval,
+        };
     if !due {
         return Ok(());
     }
@@ -340,10 +358,13 @@ fn maybe_refresh_process_checkpoint(
     let structural_hash = snapshot.state.structural_hash()?;
     let checkpoint =
         ProcessCheckpoint::capture(base_snapshot_id, structural_hash, origin, &snapshot.state)?;
-    let unchanged = existing.is_some_and(|previous| {
-        previous.base_snapshot_id == checkpoint.base_snapshot_id
-            && previous.process_hash == checkpoint.process_hash
-    });
+    // A future timestamp has to be replaced even when nothing else changed,
+    // since re-anchoring the clock is the whole point of that rewrite.
+    let unchanged = !clock_moved_backwards
+        && existing.is_some_and(|previous| {
+            previous.base_snapshot_id == checkpoint.base_snapshot_id
+                && previous.process_hash == checkpoint.process_hash
+        });
     if unchanged {
         return Ok(());
     }
@@ -408,6 +429,7 @@ mod tests {
             EncodedPath, Origin, Pane, PaneCwd, RestartSpec, Session, SocketIdentity, TmuxState,
             Window, WindowLink,
         },
+        tmux::capture::CaptureResult,
     };
 
     use super::*;
@@ -503,6 +525,41 @@ mod tests {
     }
 
     #[test]
+    fn server_is_young_bounds_the_auto_restore_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let mut config = Config::default();
+        config.restore.auto_bootstrap_max_age_seconds = 30;
+        let now = Utc::now().timestamp();
+        let target = |started_at: Option<i64>| CaptureResult {
+            origin: Origin {
+                server_started_at: started_at,
+                ..snapshot(cwd, None).origin
+            },
+            state: TmuxState {
+                sessions: vec![],
+                windows: vec![],
+            },
+            diagnostics: Vec::new(),
+            default_shell: None,
+        };
+
+        assert!(super::server_is_young(&target(Some(now)), &config));
+        assert!(super::server_is_young(&target(Some(now - 30)), &config));
+        assert!(
+            !super::server_is_young(&target(Some(now - 31)), &config),
+            "a server older than the window must not be auto-restored over"
+        );
+        // A small negative age absorbs clock skew between the tmux server's
+        // recorded start time and this process's clock.
+        assert!(super::server_is_young(&target(Some(now + 5)), &config));
+        assert!(!super::server_is_young(&target(Some(now + 6)), &config));
+        // No recorded start time means the age cannot be established, so the
+        // conservative answer is "not young".
+        assert!(!super::server_is_young(&target(None), &config));
+    }
+
+    #[test]
     fn process_only_change_rewrites_the_sidecar_without_a_new_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path();
@@ -592,6 +649,38 @@ mod tests {
         // captured_at would move if this had been rewritten, so comparing the
         // whole checkpoint proves the write was skipped rather than repeated.
         assert_eq!(store.read_process_checkpoint().unwrap().unwrap(), first);
+    }
+
+    #[test]
+    fn a_future_captured_at_is_rewritten_to_survive_a_clock_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let config = config(Duration::from_secs(300));
+        let idle = snapshot(cwd, None);
+        store.commit(&idle, true).unwrap();
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+
+        // Stand in for the clock moving backwards (NTP correction, VM restore,
+        // manual change): the sidecar's captured_at is now far in the future.
+        let mut stranded = store.read_process_checkpoint().unwrap().unwrap();
+        stranded.captured_at = Utc::now() + TimeDelta::days(30);
+        store.write_process_checkpoint(&stranded).unwrap();
+
+        // Elapsed time is negative, so a plain `>= interval` test would judge
+        // this not-yet-due for the next 30 days. The process hash has not
+        // changed either, so only the rollback check can force this write.
+        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        let reanchored = store.read_process_checkpoint().unwrap().unwrap();
+        assert!(
+            reanchored.captured_at < stranded.captured_at,
+            "captured_at was not re-anchored: {} vs {}",
+            reanchored.captured_at,
+            stranded.captured_at
+        );
+        assert!(reanchored.captured_at <= Utc::now());
+        assert_eq!(reanchored.process_hash, stranded.process_hash);
     }
 
     #[test]
