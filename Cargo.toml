@@ -1,0 +1,37 @@
+[package]
+name = "tmux-recover"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Reliable tmux session snapshots, restore, and continuous saving"
+license = "MIT"
+repository = "https://github.com/gle/tmux-recover"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+fs2 = "0.4"
+libc = "0.2"
+nix = { version = "0.30", features = ["fs", "process", "signal", "term", "user"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zstd = "0.13"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+strip = true
+
