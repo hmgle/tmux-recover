@@ -45,6 +45,10 @@ pub struct RestorePlan {
     /// restarted appear here.
     #[serde(skip)]
     restart_specs: HashMap<String, RestartSpec>,
+    /// Shell to enter after a restored process exits. This comes from tmux's
+    /// `default-shell`, not the environment of the tmux-recover process.
+    #[serde(skip)]
+    process_fallback_shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -196,6 +200,19 @@ pub fn preflight(
         (true, Some(_)) => ProcessMetadataSource::Checkpoint,
         (true, None) => ProcessMetadataSource::Snapshot,
     };
+    // Resolve this during preflight, before apply mutates the server. Falling
+    // back to tmux-recover's own $SHELL is incorrect when the daemon runs under
+    // systemd or tmux has an explicitly configured default-shell.
+    let process_fallback_shell = if restart_specs.is_empty() {
+        None
+    } else {
+        Some(
+            target
+                .default_shell
+                .clone()
+                .context("target tmux server did not report a default-shell")?,
+        )
+    };
     Ok(RestorePlan {
         snapshot_id: snapshot.id.clone(),
         replace: options.replace,
@@ -211,6 +228,7 @@ pub fn preflight(
         warnings,
         pane_cwds,
         restart_specs,
+        process_fallback_shell,
     })
 }
 
@@ -1111,15 +1129,47 @@ fn pane_launch(pane: &Pane, plan: &RestorePlan) -> Result<Option<String>> {
     if argv.is_empty() {
         argv.push(executable.to_string_lossy().into_owned());
     }
-    let mut command = shell_quote_path(&executable)?;
+    let mut program = shell_quote_path(&executable)?;
     for argument in argv.iter().skip(1) {
-        command.push(' ');
-        command.push_str(&shell_quote(argument));
+        program.push(' ');
+        program.push_str(&shell_quote(argument));
     }
-    command.push_str("; exec ");
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-    command.push_str(&shell_quote(&shell));
-    Ok(Some(command))
+    let shell = plan
+        .process_fallback_shell
+        .as_deref()
+        .context("restore plan has no process fallback shell")?;
+    // `<program>; exec <shell>` looks right and is not: the wrapper shares the
+    // pane's foreground process group, so a C-c kills the wrapper along with
+    // the program and the `exec` never runs. The pane dies, and if it was the
+    // last one the session and server go with it -- a user pressing C-c on a
+    // restored program to get back to a prompt would instead lose the pane.
+    //
+    // So a fixed /bin/sh supervisor ignores SIGINT and SIGQUIT while the program
+    // runs in a subshell that resets both before exec'ing. Ignored dispositions
+    // survive exec, so the supervisor must reset them again before entering the
+    // target server's default-shell; otherwise commands launched from sh and
+    // bash after the first C-c inherit SIGINT as ignored. The outer tmux shell
+    // only has to exec /bin/sh, so its own syntax does not need to support the
+    // POSIX `trap` and subshell expressions in the supervisor.
+    //
+    // C-z is a known gap: it stops the program and the wrapper keeps waiting,
+    // leaving the pane wedged. Fixing it needs the wrapper to be an
+    // interactive shell with real job control, which is a larger change than
+    // this; ignoring SIGTSTP instead just makes C-z silently do nothing and
+    // measurably breaks the C-c path. The pane stays alive either way.
+    let supervisor = process_supervisor(&program, shell);
+    Ok(Some(format!(
+        "exec '/bin/sh' '-c' {}",
+        shell_quote(&supervisor)
+    )))
+}
+
+fn process_supervisor(program: &str, shell: &str) -> String {
+    format!(
+        "trap '' INT QUIT; (trap - INT QUIT; exec {program}); \
+         trap - INT QUIT; exec {}",
+        shell_quote(shell)
+    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1504,6 +1554,64 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         vec!["vim".to_owned(), "nvim".to_owned()]
+    }
+
+    /// A restored program has to be interruptible without destroying the pane.
+    /// `<program>; exec <shell>` shares the pane's foreground process group, so
+    /// a C-c killed the wrapper too and the `exec` never ran; the pane died,
+    /// and with it the session if it was the last pane. The wrapper therefore
+    /// ignores SIGINT, and the program's subshell resets it to default before
+    /// exec'ing, because an ignored disposition survives exec and would leave
+    /// the program immune to C-c.
+    #[test]
+    fn a_restored_program_is_wrapped_so_c_c_cannot_kill_the_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let with_restart = pane("%0", 0, cwd, Some(restart("/usr/bin/vim", true)));
+        // Build the plan through preflight so the launch string is derived the
+        // same way a real restore derives it.
+        let snapshot = snapshot(cwd, vec![with_restart.clone()], Some(10));
+        let target = bootstrap_target(cwd);
+        let allowlist = vec!["vim".to_owned()];
+        let plan = preflight(&snapshot, &target, &options(&allowlist, None)).unwrap();
+        assert_eq!(plan.process_restarts, 1, "{:?}", plan.warnings);
+
+        let supervisor = process_supervisor("'/usr/bin/vim' 'file.txt'", "/bin/zsh");
+        assert_eq!(
+            supervisor,
+            "trap '' INT QUIT; (trap - INT QUIT; exec '/usr/bin/vim' 'file.txt'); \
+             trap - INT QUIT; exec '/bin/zsh'"
+        );
+        let launch = pane_launch(&with_restart, &plan).unwrap().unwrap();
+        assert!(
+            launch.starts_with("exec '/bin/sh' '-c' "),
+            "tmux's default shell must only have to exec the POSIX supervisor: {launch}"
+        );
+        assert!(
+            launch.ends_with(&shell_quote(&supervisor)),
+            "the launch command must carry the validated supervisor: {launch}"
+        );
+
+        // A pane with no restart spec is left entirely alone.
+        let without = pane("%1", 1, cwd, None);
+        assert!(pane_launch(&without, &plan).unwrap().is_none());
+    }
+
+    #[test]
+    fn process_restore_requires_the_target_servers_default_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let with_restart = pane("%0", 0, cwd, Some(restart("/usr/bin/vim", true)));
+        let snapshot = snapshot(cwd, vec![with_restart], Some(10));
+        let mut target = bootstrap_target(cwd);
+        target.default_shell = None;
+        let allowlist = vec!["vim".to_owned()];
+
+        let error = preflight(&snapshot, &target, &options(&allowlist, None)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not report a default-shell"),
+            "{error:#}"
+        );
     }
 
     #[test]

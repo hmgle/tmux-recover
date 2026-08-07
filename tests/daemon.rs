@@ -20,6 +20,12 @@ impl TestServer {
         Self::start_with_command(Some("sleep 60"))
     }
 
+    /// A pane running a bare `sh`. Both callers baseline a snapshot count and
+    /// then assert nothing was added, so the user's real interactive shell is
+    /// unusable here: a framework like oh-my-zsh cd's into its plugin directory
+    /// while sourcing, which is real structural change the daemon correctly
+    /// commits. Under load that churn can pause long enough to look settled and
+    /// then resume, so waiting it out is not enough -- it has to not happen.
     fn start_shell() -> Option<Self> {
         Self::start_with_command(None)
     }
@@ -34,15 +40,18 @@ impl TestServer {
         }
         let directory = tempfile::tempdir().ok()?;
         let socket = directory.path().join("tmux.sock");
+        // `default-shell` has to be set at server start: naming the shell on
+        // the `new-session` command line would record a `pane_start_command`,
+        // which `target_is_bootstrap` requires to be absent.
+        let config = directory.path().join("tmux.conf");
+        std::fs::write(&config, "set -g default-shell /bin/sh\n").ok()?;
         let mut command = Command::new("tmux");
-        command.args(["-S"]).arg(&socket).args([
-            "-f",
-            "/dev/null",
-            "new-session",
-            "-d",
-            "-s",
-            "daemon",
-        ]);
+        command
+            .args(["-S"])
+            .arg(&socket)
+            .arg("-f")
+            .arg(&config)
+            .args(["new-session", "-d", "-s", "daemon"]);
         if let Some(start_command) = start_command {
             command.arg(start_command);
         }
@@ -625,13 +634,20 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
     .trim()
     .parse()
     .unwrap();
+    wait_until(Duration::from_secs(10), || {
+        child_cmdlines(pane_pid).iter().any(|cmdline| {
+            cmdline.first().is_some_and(|arg| arg.ends_with("sleep"))
+                && cmdline.get(1).is_some_and(|arg| arg == "300")
+        })
+    })
+    .await;
+    let restored_children = child_cmdlines(pane_pid);
     assert!(
-        child_cmdlines(pane_pid).iter().any(|cmdline| cmdline
+        restored_children.iter().any(|cmdline| cmdline
             .first()
             .is_some_and(|arg| arg.ends_with("sleep"))
             && cmdline.get(1).is_some_and(|arg| arg == "300")),
-        "restored pane {pane_pid} is not running sleep 300: {:?}",
-        child_cmdlines(pane_pid)
+        "restored pane {pane_pid} is not running sleep 300: {restored_children:?}"
     );
 
     // 7. Keep going on the restored server, which is the case that broke: a
@@ -671,22 +687,78 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
 
     // A further process-only change must produce a checkpoint that is still
     // eligible against the rebased snapshot.
-    // The restore launched the program as `sh -c '<cmd>; exec $SHELL'`, so a
-    // C-c would kill that wrapper before it reaches the exec, taking the only
-    // session and the whole server with it. Terminate just the `sleep` child
-    // and the wrapper proceeds to exec the shell, leaving a live pane at a
-    // prompt.
-    let sleep_pid = child_cmdlines_with_pids(pane_pid)
-        .into_iter()
-        .find(|(_, cmdline)| cmdline.first().is_some_and(|arg| arg.ends_with("sleep")))
-        .map(|(pid, _)| pid)
-        .expect("the restored sleep must be running to be replaced");
+    // Interrupt the restored program the way a user would. This is the case
+    // the old `<cmd>; exec <shell>` wrapper got wrong: C-c killed the wrapper
+    // with the program and the pane died, taking this single-pane session and
+    // the whole server with it.
     assert!(
-        Command::new("kill")
-            .arg(sleep_pid.to_string())
+        server
+            .tmux()
+            .args(["send-keys", "-t", "daemon:0.0", "C-c"])
             .status()
             .unwrap()
             .success()
+    );
+    wait_until(Duration::from_secs(10), || {
+        !child_cmdlines(pane_pid)
+            .iter()
+            .any(|cmdline| cmdline.first().is_some_and(|arg| arg.ends_with("sleep")))
+    })
+    .await;
+    assert!(
+        server
+            .tmux()
+            .args(["has-session", "-t", "daemon"])
+            .status()
+            .unwrap()
+            .success(),
+        "C-c on a restored program killed the pane and the session with it"
+    );
+    assert!(
+        !child_cmdlines(pane_pid)
+            .iter()
+            .any(|cmdline| cmdline.first().is_some_and(|arg| arg.ends_with("sleep"))),
+        "C-c did not reach the restored program: {:?}",
+        child_cmdlines(pane_pid)
+    );
+    wait_for_default_shell_pane(&server, "daemon:0.0").await;
+
+    // The wrapper ignored SIGINT while waiting for the restored process. That
+    // disposition survives exec, so verify it was reset before entering tmux's
+    // configured default-shell: a second command must still respond to C-c.
+    // This also proves the fallback is /bin/sh from the target server rather
+    // than this test runner's SHELL (normally zsh).
+    let started = tokio::time::Instant::now();
+    while pane_command(&server, "daemon:0.0") != "sleep" {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "fallback shell never ran the second sleep"
+        );
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "sleep 300", "Enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        server
+            .tmux()
+            .args(["send-keys", "-t", "daemon:0.0", "C-c"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for_default_shell_pane(&server, "daemon:0.0").await;
+    assert!(
+        !child_cmdlines(pane_pid)
+            .iter()
+            .any(|cmdline| cmdline.first().is_some_and(|arg| arg.ends_with("sleep"))),
+        "the fallback shell passed ignored SIGINT to its child: {:?}",
+        child_cmdlines(pane_pid)
     );
 
     let started = tokio::time::Instant::now();
@@ -843,9 +915,11 @@ fn pane_command(server: &TestServer, pane: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// argv of every direct child of `parent`, read from `/proc`. The restore
-/// wraps a restarted program as `sh -c '<cmd>; exec $SHELL'`, so the program
-/// itself is a child of the pane process rather than the pane process itself.
+/// argv of every direct child of `parent`, read from `/proc`. The restore wraps
+/// a restarted program in a shell that survives C-c and then exec's the user's
+/// shell, so the program is a child of the pane process rather than the pane
+/// process itself. The wrapper's subshell exec's the program, so it stays a
+/// direct child and does not need a recursive walk.
 #[cfg(target_os = "linux")]
 fn child_cmdlines(parent: u32) -> Vec<Vec<String>> {
     child_cmdlines_with_pids(parent)

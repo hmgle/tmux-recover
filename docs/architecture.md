@@ -58,6 +58,24 @@ allowlisted. Imported resurrect command text is metadata only and is never
 trusted for execution. Structural capture and restore work without process
 metadata on macOS.
 
+A restarted program is launched through a fixed `/bin/sh` supervisor:
+`trap '' INT QUIT; (trap - INT QUIT; exec <program>); trap - INT QUIT; exec
+<shell>`. The obvious `<program>; exec <shell>` is wrong: the wrapper shares the
+pane's foreground process group, so a C-c killed the wrapper along with the
+program, the `exec` never ran, and the pane died -- taking the session and even
+the server with it when it was the last pane. The supervisor ignores SIGINT and
+SIGQUIT while the program's subshell resets both before exec'ing. It resets them
+again before entering the target tmux server's captured `default-shell`, since
+an ignored disposition survives exec and would otherwise make later children
+of sh and bash immune to C-c. The outer tmux shell only executes `exec /bin/sh
+-c ...`, so fish or another configured `default-shell` does not have to parse
+the supervisor's POSIX `trap` and subshell syntax.
+
+C-z is a known gap: it stops the program while the wrapper keeps waiting, so the
+pane is left wedged, though alive. Fixing it properly needs the wrapper to be an
+interactive shell with real job control. Ignoring SIGTSTP instead was measured
+and rejected: it makes C-z silently do nothing and breaks the C-c path.
+
 ## Process checkpoint sidecar
 
 Structural dedup is what keeps history small, but it also means a snapshot only

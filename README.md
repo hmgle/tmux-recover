@@ -96,6 +96,13 @@ tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 进程可信、可执行文件 basename 位于 allowlist 时才会启动。导入的 resurrect
 命令永远不会执行。
 
+恢复的程序运行在固定的 `/bin/sh` supervisor 中，程序本身在重置 SIGINT/SIGQUIT
+的子 shell 里 exec。这样 C-c 只结束该程序并把 pane 交还给 tmux 配置的
+`default-shell`，而不会连 wrapper 一起杀掉、导致 pane（乃至最后一个 pane 所属的
+session 与 server）消失。进入 `default-shell` 前会再次重置信号，后续命令仍可正常
+响应 C-c。已知限制：C-z 会暂停该程序而 supervisor 仍在等待，pane 会卡住但不会
+消失。
+
 #### 进程 checkpoint sidecar
 
 结构去重让历史保持精简，但也意味着快照只记录布局最后一次变化时正在运行的
