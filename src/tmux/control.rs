@@ -18,6 +18,7 @@ pub struct ControlClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     notifications: VecDeque<Notification>,
+    poisoned: bool,
 }
 
 impl ControlClient {
@@ -63,6 +64,7 @@ impl ControlClient {
             stdin,
             stdout: BufReader::new(stdout),
             notifications: VecDeque::new(),
+            poisoned: false,
         };
         client.drain_startup().await?;
         Ok(client)
@@ -104,15 +106,7 @@ impl ControlClient {
         self.stdin.flush().await?;
 
         let mut blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(block_count);
-        // tmux runs every semicolon-separated command in the sequence
-        // regardless of earlier failures, emitting one %begin/%end (or
-        // %error) block per command. If we bailed out on the first %error
-        // we would leave the later blocks unread on the wire, and the next
-        // call's %begin scan would consume them instead of desyncing loudly.
-        // So keep draining every requested block and only report the first
-        // error once the stream is back in a clean state.
-        let mut first_error: Option<String> = None;
-        for _ in 0..block_count {
+        for index in 0..block_count {
             loop {
                 let line = self.read_line().await?;
                 if line.starts_with(b"%begin ") {
@@ -138,20 +132,31 @@ impl ControlClient {
                     break;
                 }
                 if line.starts_with(b"%error ") {
-                    if first_error.is_none() {
-                        let detail = output
-                            .iter()
-                            .map(|line| String::from_utf8_lossy(line))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        first_error = Some(format!("tmux command failed: {detail}"));
+                    // tmux abandons the rest of a semicolon-separated sequence
+                    // at the first failure, so the blocks we have not read yet
+                    // will never arrive: waiting for them would hang forever.
+                    // Return now, but mark the client unusable when the error
+                    // landed mid-sequence, because we cannot prove where the
+                    // stream stands. Callers must reconnect rather than reuse it.
+                    if index + 1 < block_count {
+                        self.poisoned = true;
                     }
-                    blocks.push(output);
-                    break;
+                    let detail = output
+                        .iter()
+                        .map(|line| String::from_utf8_lossy(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let detail = if detail.is_empty() {
+                        text_lossy(&line)
+                    } else {
+                        detail
+                    };
+                    bail!(
+                        "tmux command failed at step {} of {block_count}: {detail}",
+                        index + 1
+                    );
                 }
                 if line.starts_with(b"%exit") {
-                    // The connection itself is gone, so there is nothing left
-                    // to drain; unlike %error this must bail immediately.
                     bail!(
                         "tmux control client exited while a command was pending: {}",
                         text_lossy(&line)
@@ -160,10 +165,14 @@ impl ControlClient {
                 output.push(line);
             }
         }
-        if let Some(error) = first_error {
-            bail!(error);
-        }
         Ok(blocks)
+    }
+
+    /// True once a command failed partway through a multi-command sequence.
+    /// The remaining blocks were never emitted, so the connection cannot be
+    /// trusted for further commands and the caller should reconnect.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub async fn next_notification(&mut self) -> Result<Notification> {
