@@ -35,16 +35,17 @@ pub struct SnapshotSummary {
     pub path: PathBuf,
 }
 
+/// Names the snapshot that a restore should use by default.
+///
+/// Deliberately carries no structural hash: dedup must compare against the
+/// snapshot body so that a corrupt or missing target is detected and rewritten
+/// rather than being reported as unchanged forever.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CurrentPointer {
     schema_version: u32,
     snapshot_id: String,
     filename: String,
     semantic_hash: String,
-    /// Absent in pointers written before structural dedup existed. An empty
-    /// value never matches a real hash, so the next commit re-writes it.
-    #[serde(default)]
-    structural_hash: String,
 }
 
 /// Cheap directory listing entry. Deriving the timestamp from the filename lets
@@ -95,11 +96,17 @@ impl SnapshotStore {
         fs::create_dir_all(self.pins_dir())?;
 
         let structural_hash = snapshot.state.structural_hash()?;
-        // Compare against the pointer rather than loading and re-validating the
-        // current snapshot: this runs on every autosave tick.
+        // Dedup against the current snapshot's own body, not just the pointer:
+        // if the file it names is truncated, missing, or otherwise unreadable
+        // then `load_current` fails, we fall through, and the damage is
+        // repaired by this write. Trusting the pointer alone would report
+        // Unchanged forever and leave a corrupt current in place, which is
+        // exactly the snapshot automatic restore depends on. This is one read
+        // per autosave tick, not the linear scan over history that made
+        // pruning slow.
         if set_current
-            && let Some(current) = self.read_pointer()
-            && current.structural_hash == structural_hash
+            && let Ok(current) = self.load_current()
+            && current.state.structural_hash()? == structural_hash
         {
             return Ok(CommitOutcome::Unchanged);
         }
@@ -121,7 +128,6 @@ impl SnapshotStore {
                 snapshot_id: snapshot.id.clone(),
                 filename,
                 semantic_hash: snapshot.semantic_hash.clone(),
-                structural_hash,
             };
             atomic_write(&self.current_path(), &serde_json::to_vec_pretty(&pointer)?)?;
         }
@@ -405,46 +411,36 @@ fn created_at_from_id(id: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+/// Writes `bytes` to `path` so that readers only ever see the old or the new
+/// content, never a partial file.
+///
+/// The temp file is created in the target's own directory (so the rename stays
+/// within one filesystem) with an OS-random name, and is deleted automatically
+/// if any step before the rename fails. Note the durability limit: the rename
+/// itself is atomic, but a crash between `sync_all` and the parent `fsync` can
+/// still leave the directory entry unflushed. Callers that need a snapshot to
+/// be durable before it is referenced must sequence their writes accordingly,
+/// as `commit` does by writing the snapshot before the pointer.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("atomic write target has no parent")?;
     fs::create_dir_all(parent)?;
     let file_name = path
         .file_name()
         .context("atomic write target has no name")?;
-    // A PID-only suffix would collide forever if a process died mid-write and
-    // its PID was later reused, since `create_new` would keep failing against
-    // the orphaned temp file. A random suffix makes every attempt distinct.
-    let nonce: u64 = std::iter::repeat_with(rand_byte)
-        .take(8)
-        .fold(0, |acc, byte| (acc << 8) | u64::from(byte));
-    let temp_path = parent.join(format!(
-        ".{}.{}.{nonce:016x}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .with_context(|| format!("failed to create {}", temp_path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temp_path, path)?;
+    // `NamedTempFile` names the file from the OS random source and removes it on
+    // drop, so a failure partway through cannot orphan a temp file and a
+    // recycled PID cannot collide with a previous attempt.
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{}.", file_name.to_string_lossy()))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a temp file in {}", parent.display()))?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
     sync_directory(parent)
-}
-
-fn rand_byte() -> u8 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // No crypto dependency needed for a filename disambiguator; a coarse
-    // mix of the clock and this stack address is enough entropy to avoid a
-    // collision with a previous attempt from the same or another process.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos())
-        .unwrap_or_default();
-    let address = &nanos as *const u32 as u64;
-    (nanos as u64 ^ address) as u8
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -540,6 +536,79 @@ mod tests {
             store.load_current().unwrap().semantic_hash,
             snapshot.semantic_hash
         );
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_behind() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("payload.json");
+        atomic_write(&target, b"first").unwrap();
+        atomic_write(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+
+        // A publish onto a path that cannot be replaced must clean up after
+        // itself rather than orphaning the temp file it created.
+        let blocked = directory.path().join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        assert!(atomic_write(&blocked, b"nope").is_err());
+
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "orphaned temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn corrupt_current_body_is_rewritten_even_when_state_is_unchanged() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let first = snapshot("one");
+        assert_eq!(store.commit(&first, true).unwrap(), CommitOutcome::Written);
+
+        // Truncate the snapshot the pointer names, leaving the pointer intact.
+        let target = store
+            .snapshot_paths()
+            .unwrap()
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&first.id))
+            })
+            .expect("the committed snapshot exists on disk");
+        fs::write(&target, b"{\"schema_version\":1,").unwrap();
+        assert!(store.load_current().is_err(), "current must be unreadable");
+
+        // Same structural state as before. Deduplicating on the pointer alone
+        // would report Unchanged and leave the corruption in place forever.
+        assert_eq!(
+            store.commit(&snapshot("one"), true).unwrap(),
+            CommitOutcome::Written
+        );
+        assert!(store.load_current().is_ok(), "current must be repaired");
+    }
+
+    #[test]
+    fn missing_current_target_is_repaired_by_the_next_commit() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let first = snapshot("one");
+        store.commit(&first, true).unwrap();
+        for path in store.snapshot_paths().unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        assert!(store.load_current().is_err());
+
+        assert_eq!(
+            store.commit(&snapshot("one"), true).unwrap(),
+            CommitOutcome::Written
+        );
+        let repaired = store.load_current().unwrap();
+        assert_eq!(repaired.state.sessions[0].name, "one");
     }
 
     #[test]
