@@ -330,11 +330,28 @@ impl TmuxState {
                 }
             }
         }
+        // tmux pane ids are unique per server, not per window, and consumers
+        // rely on that: pane_cwds, restart_specs, the old-to-new pane mapping
+        // during restore, and the sidecar's pane-set comparison all key on the
+        // bare id, so a pane repeated across two windows would silently
+        // overwrite an entry rather than fail. Native capture cannot produce
+        // this, but validation is what a corrupt or hand-built snapshot is
+        // checked against.
+        let mut seen_panes: HashSet<&str> = HashSet::new();
         for window in &self.windows {
             let pane_ids: HashSet<&str> =
                 window.panes.iter().map(|item| item.id.as_str()).collect();
             if pane_ids.len() != window.panes.len() {
                 bail!("window {} contains duplicate pane IDs", window.name);
+            }
+            for pane in &window.panes {
+                if !seen_panes.insert(pane.id.as_str()) {
+                    bail!(
+                        "snapshot reuses pane {} in more than one window (window {})",
+                        pane.id,
+                        window.name
+                    );
+                }
             }
             if let Some(active) = &window.active_pane_id
                 && !pane_ids.contains(active.as_str())
@@ -699,5 +716,58 @@ mod tests {
         let absent = serde_json::to_value(Option::<String>::None).unwrap();
         assert_eq!(empty, "");
         assert!(absent.is_null());
+    }
+
+    #[test]
+    fn a_pane_id_reused_across_windows_is_rejected() {
+        let pane = |id: &str| Pane {
+            id: id.to_owned(),
+            index: 0,
+            title: None,
+            cwd: PaneCwd::inspect(None),
+            current_command: None,
+            start_command: None,
+            start_path: None,
+            pid: None,
+            tty: None,
+            dead: false,
+            dead_status: None,
+            restart: None,
+            import_status: None,
+        };
+        let window = |id: &str, panes: Vec<Pane>| Window {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            layout: "b25d,80x24,0,0,0".to_owned(),
+            visible_layout: None,
+            width: 80,
+            height: 24,
+            zoomed: false,
+            automatic_rename: None,
+            active_pane_id: Some(panes[0].id.clone()),
+            panes,
+        };
+        // tmux pane ids are server-global. Two windows both claiming %0 would
+        // silently collapse in every pane-keyed map a restore builds, so this
+        // has to fail validation rather than validate and misbehave later.
+        let state = TmuxState {
+            sessions: vec![],
+            windows: vec![
+                window("@0", vec![pane("%0")]),
+                window("@1", vec![pane("%0")]),
+            ],
+        };
+        let error = format!("{:#}", state.validate().unwrap_err());
+        assert!(error.contains("reuses pane %0"), "{error}");
+
+        // Distinct ids across windows stay valid.
+        let state = TmuxState {
+            sessions: vec![],
+            windows: vec![
+                window("@0", vec![pane("%0")]),
+                window("@1", vec![pane("%1")]),
+            ],
+        };
+        state.validate().unwrap();
     }
 }

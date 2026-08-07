@@ -72,6 +72,12 @@ reaches the disk rather than only for the ones this crate's capture path
 produces. A read distinguishes an absent sidecar from an unusable one, which is
 what lets a restore report that it ignored one.
 
+Snapshots enforce the same uniqueness. tmux pane ids are unique per server, so
+a snapshot repeating one across two windows is rejected: `pane_cwds`,
+`restart_specs`, the old-to-new pane mapping, and this sidecar's pane-set
+comparison all key on the bare id, and would silently drop an entry rather
+than fail.
+
 Resurrect files are import inputs, never native storage. The importer records
 the source path, BLAKE3 digest, detected v3/v4 version, and per-pane repair
 status. The v4 empty-title shift is repaired only when its field signature is
