@@ -145,8 +145,15 @@ imports/
 current 不会被清理。`storage.zstd = true` 可启用 zstd。
 
 systemd user service 模板位于
-[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。TPM
-是 Linux/macOS 上推荐的 server 生命周期集成方式。
+[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。实例名必须是
+socket 路径经 `systemd-escape` 转义后的结果：
+
+```sh
+instance="$(systemd-escape '/tmp/tmux-1000/default')"
+systemctl --user enable --now "tmux-recover@${instance}.service"
+```
+
+TPM 是 Linux/macOS 上推荐的 server 生命周期集成方式。
 
 ## 设计与限制
 

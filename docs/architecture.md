@@ -22,10 +22,19 @@ Its snapshots, current pointer, pins, daemon lock, and restore reports live in
 an isolated directory. A daemon lock prevents two writers for one socket;
 different socket directories can be watched concurrently.
 
-The daemon installs indexed hook entries and never writes `status-right`.
-Structure events are debounced. cwd and pane title changes are found by a
-low-frequency poll. A capture is committed only when its semantic hash differs
-from the current snapshot.
+The daemon installs indexed hook entries (slot 901, a fixed constant) and never
+writes `status-right`. On startup it first clears that slot so a crashed
+predecessor cannot leave a stale hook pointed at a dead client. Structure
+events are debounced. cwd and pane title changes are found by a low-frequency
+poll. A capture is committed only when its structural hash (topology, layout,
+cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
+current snapshot, so an idle server does not produce a new snapshot on every
+poll.
+
+Known limitation: the fixed hook slot is a shared namespace. If another tool
+also binds `set-hook -g '<name>[901]'`, one daemon's startup cleanup or shutdown
+removal will delete the other's hook. A future version should make the slot
+configurable or save and restore whatever was already bound there.
 
 Restore first validates schema, hash, origin, graph references, cwd policy,
 and optional process policy. Existing sessions are renamed to temporary backup

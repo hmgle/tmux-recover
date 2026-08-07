@@ -1,19 +1,25 @@
 [Unit]
 Description=tmux-recover daemon for %I
+# NOTE: default.target does not wait for the tmux server's socket to exist.
+# If the socket is not up yet when this unit starts, the daemon fails to
+# connect and burns through the restart budget below before tmux is ready.
+# Long-term this needs either the daemon retrying its initial connection
+# with backoff, or the unit being started by TPM once the server it targets
+# already exists, rather than unconditionally at login.
 After=default.target
-# Cap the restart loop: if the target tmux server never comes up (or the
-# socket path was never systemd-escaped, see below) this stops retrying
-# after Burst attempts within IntervalSec instead of respawning forever.
+# Cap the restart loop: without a limit, a socket that never comes up makes
+# systemd respawn this unit every RestartSec forever.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
-# %I is the escaped instance name; systemd un-escapes it back to the literal
-# socket path here, so the unit must be enabled with the systemd-escaped
-# form of the socket path as the instance, e.g. for /tmp/tmux-1000/default:
-#   systemd-escape '/tmp/tmux-1000/default'  ->  -tmp-tmux\x2d1000-default
-#   systemctl --user enable --now 'tmux-recover@-tmp-tmux\x2d1000-default.service'
+# The instance must be the systemd-escaped socket path: %i is the escaped
+# instance name systemd matches the unit file on, and %I (used below) is that
+# same instance with escaping undone back to the literal path. For
+# /tmp/tmux-1000/default:
+#   instance="$(systemd-escape '/tmp/tmux-1000/default')"
+#   systemctl --user enable --now "tmux-recover@${instance}.service"
 ExecStart=%h/.local/bin/tmux-recover daemon --socket "%I"
 Restart=on-failure
 RestartSec=2
