@@ -248,6 +248,85 @@ async fn hook_event_saves_changed_state() {
     let _ = task.await;
 }
 
+#[tokio::test]
+async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(80),
+            poll_interval: Duration::from_secs(5),
+        },
+        restore: RestoreConfig {
+            auto: true,
+            ..RestoreConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let mut captured = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    // Point the pane at a cwd that no longer exists so preflight fails.
+    let missing = server.directory.path().join("gone-before-restore");
+    captured.state.windows[0].panes[0].cwd = tmux_recover::model::PaneCwd::inspect(Some(
+        tmux_recover::model::EncodedPath::from(missing.as_os_str()),
+    ));
+    let source = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        captured.origin,
+        captured.state,
+        captured.diagnostics,
+    )
+    .unwrap();
+    store.commit(&source, true).unwrap();
+
+    server.stop();
+    assert!(
+        server
+            .tmux()
+            .args(["-f", "/dev/null", "new-session", "-d", "-s", "bootstrap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    // The failed auto-restore must not tear the daemon down: the bootstrap
+    // session stays put, and the daemon keeps watching and autosaving it.
+    wait_until(Duration::from_secs(3), || {
+        store.load_current().is_ok_and(|snapshot| {
+            snapshot
+                .state
+                .sessions
+                .first()
+                .is_some_and(|session| session.name == "bootstrap")
+        })
+    })
+    .await;
+    assert!(
+        !task.is_finished(),
+        "daemon exited after a failed auto-restore"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + timeout;
     while !condition() {

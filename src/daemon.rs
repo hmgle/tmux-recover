@@ -44,11 +44,30 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
 
     let mut client = ControlClient::connect(socket).await?;
     let initial = capture(&mut client, socket).await?;
-    if auto_restore(&mut client, &store, config, &initial).await? {
-        drop(client);
-        client = ControlClient::connect(socket).await?;
+    // A failed auto-restore (bad snapshot, stale cwd, whatever) must not take
+    // the whole daemon down: the server is still there and still worth
+    // watching, so log it and fall through to the normal watch loop instead
+    // of propagating the error out of `run`.
+    match auto_restore(&mut client, &store, config, &initial).await {
+        Ok(true) => {
+            drop(client);
+            client = ControlClient::connect(socket).await?;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "automatic restore failed; continuing to watch the server without restoring"
+            );
+        }
     }
 
+    // Clear any hooks a crashed predecessor left behind before installing
+    // fresh ones, so a leftover set-hook doesn't linger pointed at a dead
+    // client once this daemon exits.
+    if let Err(error) = remove_hooks(&mut client).await {
+        tracing::debug!(error = %format!("{error:#}"), "no stale daemon hooks to remove");
+    }
     install_hooks(&mut client).await?;
     client.take_notifications();
     save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
