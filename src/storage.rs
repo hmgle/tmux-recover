@@ -41,6 +41,19 @@ struct CurrentPointer {
     snapshot_id: String,
     filename: String,
     semantic_hash: String,
+    /// Absent in pointers written before structural dedup existed. An empty
+    /// value never matches a real hash, so the next commit re-writes it.
+    #[serde(default)]
+    structural_hash: String,
+}
+
+/// Cheap directory listing entry. Deriving the timestamp from the filename lets
+/// `prune` decide what to keep without parsing or hashing snapshot bodies.
+#[derive(Debug, Clone)]
+struct StoredEntry {
+    id: String,
+    created_at: DateTime<Utc>,
+    path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +94,12 @@ impl SnapshotStore {
         fs::create_dir_all(self.snapshots_dir())?;
         fs::create_dir_all(self.pins_dir())?;
 
+        let structural_hash = snapshot.state.structural_hash()?;
+        // Compare against the pointer rather than loading and re-validating the
+        // current snapshot: this runs on every autosave tick.
         if set_current
-            && let Ok(current) = self.load_current()
-            && current.semantic_hash == snapshot.semantic_hash
+            && let Some(current) = self.read_pointer()
+            && current.structural_hash == structural_hash
         {
             return Ok(CommitOutcome::Unchanged);
         }
@@ -105,10 +121,18 @@ impl SnapshotStore {
                 snapshot_id: snapshot.id.clone(),
                 filename,
                 semantic_hash: snapshot.semantic_hash.clone(),
+                structural_hash,
             };
             atomic_write(&self.current_path(), &serde_json::to_vec_pretty(&pointer)?)?;
         }
         Ok(CommitOutcome::Written)
+    }
+
+    /// Reads the current pointer without touching the snapshot it names.
+    fn read_pointer(&self) -> Option<CurrentPointer> {
+        let bytes = fs::read(self.current_path()).ok()?;
+        let pointer: CurrentPointer = serde_json::from_slice(&bytes).ok()?;
+        (pointer.schema_version == 1).then_some(pointer)
     }
 
     pub fn load_current(&self) -> Result<Snapshot> {
@@ -160,11 +184,24 @@ impl SnapshotStore {
         Ok(snapshot)
     }
 
+    /// Full listing for user-facing commands. Unreadable entries are reported
+    /// and skipped rather than failing the whole listing, so one corrupt or
+    /// future-schema file cannot hide every other snapshot.
     pub fn list(&self) -> Result<Vec<SnapshotSummary>> {
-        let current_id = self.load_current().ok().map(|snapshot| snapshot.id);
+        let current_id = self.read_pointer().map(|pointer| pointer.snapshot_id);
         let mut summaries = Vec::new();
         for path in self.snapshot_paths()? {
-            let snapshot = self.load_path(&path)?;
+            let snapshot = match self.load_path(&path) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{error:#}"),
+                        "skipping unreadable snapshot"
+                    );
+                    continue;
+                }
+            };
             summaries.push(SnapshotSummary {
                 id: snapshot.id.clone(),
                 created_at: snapshot.created_at,
@@ -187,6 +224,36 @@ impl SnapshotStore {
         Ok(summaries)
     }
 
+    /// Directory scan that reads no snapshot bodies. Entries whose filename is
+    /// not a recognisable snapshot id are omitted, which keeps them out of
+    /// retention decisions entirely.
+    fn entries(&self) -> Result<Vec<StoredEntry>> {
+        let mut entries = Vec::new();
+        for path in self.snapshot_paths()? {
+            let Some(id) = snapshot_id_from_path(&path) else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "snapshot filename is not a recognisable id; retention will leave it alone"
+                );
+                continue;
+            };
+            let Some(created_at) = created_at_from_id(&id) else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "snapshot id has no parsable timestamp; retention will leave it alone"
+                );
+                continue;
+            };
+            entries.push(StoredEntry {
+                id,
+                created_at,
+                path,
+            });
+        }
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+        Ok(entries)
+    }
+
     pub fn pin(&self, id: &str) -> Result<()> {
         let snapshot = self.load(id)?;
         fs::create_dir_all(self.pins_dir())?;
@@ -207,44 +274,48 @@ impl SnapshotStore {
         self.pins_dir().join(id).is_file()
     }
 
+    /// Applies the retention policy. Runs after every autosave, so it works
+    /// from filenames, the pins directory, and the current pointer only; it
+    /// never parses or re-hashes a snapshot body.
     pub fn prune(&self, config: &RetentionConfig) -> Result<Vec<String>> {
-        let summaries = self.list()?;
+        let entries = self.entries()?;
+        let current_id = self.read_pointer().map(|pointer| pointer.snapshot_id);
         let now = Utc::now();
         let mut keep = HashSet::new();
         let mut hourly = BTreeMap::new();
         let mut daily = BTreeMap::new();
 
-        for summary in summaries.iter().take(config.recent) {
-            keep.insert(summary.id.clone());
+        for entry in entries.iter().take(config.recent) {
+            keep.insert(entry.id.clone());
         }
-        for summary in &summaries {
-            if summary.pinned || summary.current {
-                keep.insert(summary.id.clone());
+        for entry in &entries {
+            if self.is_pinned(&entry.id) || current_id.as_deref() == Some(entry.id.as_str()) {
+                keep.insert(entry.id.clone());
                 continue;
             }
-            let age = now.signed_duration_since(summary.created_at);
+            let age = now.signed_duration_since(entry.created_at);
             if age <= Duration::days(config.hourly_days) {
                 let key = (
-                    summary.created_at.year(),
-                    summary.created_at.ordinal(),
-                    summary.created_at.hour(),
+                    entry.created_at.year(),
+                    entry.created_at.ordinal(),
+                    entry.created_at.hour(),
                 );
-                hourly.entry(key).or_insert_with(|| summary.id.clone());
+                hourly.entry(key).or_insert_with(|| entry.id.clone());
             } else if age <= Duration::days(config.daily_days) {
-                let key = (summary.created_at.year(), summary.created_at.ordinal());
-                daily.entry(key).or_insert_with(|| summary.id.clone());
+                let key = (entry.created_at.year(), entry.created_at.ordinal());
+                daily.entry(key).or_insert_with(|| entry.id.clone());
             }
         }
         keep.extend(hourly.into_values());
         keep.extend(daily.into_values());
 
         let mut removed = Vec::new();
-        for summary in summaries {
-            if keep.contains(&summary.id) {
+        for entry in entries {
+            if keep.contains(&entry.id) {
                 continue;
             }
-            fs::remove_file(&summary.path)?;
-            removed.push(summary.id);
+            fs::remove_file(&entry.path)?;
+            removed.push(entry.id);
         }
         if !removed.is_empty() {
             sync_directory(&self.snapshots_dir())?;
@@ -314,14 +385,40 @@ impl SnapshotStore {
     }
 }
 
+/// Extracts the snapshot id from a `<id>.json` / `<id>.json.zst` filename.
+fn snapshot_id_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let name = name
+        .strip_suffix(".json.zst")
+        .or_else(|| name.strip_suffix(".json"))?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Parses the leading `%Y%m%dT%H%M%S%.6fZ` timestamp out of a snapshot id
+/// (`Snapshot::new` formats it that way, followed by `-<hash prefix>`).
+fn created_at_from_id(id: &str) -> Option<DateTime<Utc>> {
+    let timestamp = id.split('-').next()?;
+    // The id embeds a naive UTC timestamp with a literal trailing "Z" (see
+    // `Snapshot::new`), not an offset `chrono` can parse via `DateTime`.
+    chrono::NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%.fZ")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("atomic write target has no parent")?;
     fs::create_dir_all(parent)?;
     let file_name = path
         .file_name()
         .context("atomic write target has no name")?;
+    // A PID-only suffix would collide forever if a process died mid-write and
+    // its PID was later reused, since `create_new` would keep failing against
+    // the orphaned temp file. A random suffix makes every attempt distinct.
+    let nonce: u64 = std::iter::repeat_with(rand_byte)
+        .take(8)
+        .fold(0, |acc, byte| (acc << 8) | u64::from(byte));
     let temp_path = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{nonce:016x}.tmp",
         file_name.to_string_lossy(),
         std::process::id()
     ));
@@ -337,6 +434,19 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_directory(parent)
 }
 
+fn rand_byte() -> u8 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // No crypto dependency needed for a filename disambiguator; a coarse
+    // mix of the clock and this stack address is enough entropy to avoid a
+    // collision with a previous attempt from the same or another process.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or_default();
+    let address = &nanos as *const u32 as u64;
+    (nanos as u64 ^ address) as u8
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all().map_err(Into::into)
 }
@@ -350,6 +460,7 @@ pub fn read_all(mut reader: impl Read) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use crate::model::{Origin, SnapshotSource, TmuxState};
+    use chrono::SubsecRound;
     use tempfile::tempdir;
 
     use super::*;
@@ -429,5 +540,31 @@ mod tests {
             store.load_current().unwrap().semantic_hash,
             snapshot.semantic_hash
         );
+    }
+
+    #[test]
+    fn snapshot_id_from_path_strips_known_suffixes_only() {
+        let plain = Path::new("/store/20260807T145233.123456Z-abcdef0123456789.json");
+        let compressed = Path::new("/store/20260807T145233.123456Z-abcdef0123456789.json.zst");
+        let id = "20260807T145233.123456Z-abcdef0123456789";
+        assert_eq!(snapshot_id_from_path(plain), Some(id.to_owned()));
+        assert_eq!(snapshot_id_from_path(compressed), Some(id.to_owned()));
+        // Suffix stripping alone can't distinguish "current.json" from a
+        // snapshot file; entries() only ever calls this on the snapshots
+        // directory listing, where current.json does not live.
+        assert_eq!(snapshot_id_from_path(Path::new("/store/notes.txt")), None);
+        assert_eq!(snapshot_id_from_path(Path::new("/store/.json")), None);
+    }
+
+    #[test]
+    fn created_at_from_id_recovers_the_embedded_timestamp() {
+        let snapshot = snapshot("timestamped");
+        let recovered = created_at_from_id(&snapshot.id).expect("id carries a parseable prefix");
+        // The id truncates to microseconds, so compare at that resolution.
+        assert_eq!(
+            recovered.trunc_subsecs(6),
+            snapshot.created_at.trunc_subsecs(6)
+        );
+        assert_eq!(created_at_from_id("not-a-timestamp"), None);
     }
 }

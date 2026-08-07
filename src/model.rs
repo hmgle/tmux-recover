@@ -81,37 +81,39 @@ impl PaneCwd {
                 error: Some("tmux did not provide pane_current_path".to_owned()),
             };
         };
-        let result = encoded.to_path_buf().and_then(|path| {
-            std::fs::metadata(&path)
-                .with_context(|| format!("could not stat {}", path.display()))
-                .map(|metadata| (path, metadata))
-        });
-        match result {
-            Ok((_, metadata)) if metadata.is_dir() => Self {
+        // Decode once and stat once: capture runs for every pane on every poll, and a
+        // hanging network mount must not be probed twice per pane.
+        let decoded = match encoded.to_path_buf() {
+            Ok(path) => path,
+            Err(error) => {
+                return Self {
+                    path: Some(encoded),
+                    status: PathStatus::Unknown,
+                    error: Some(format!("{error:#}")),
+                };
+            }
+        };
+        match std::fs::metadata(&decoded) {
+            Ok(metadata) if metadata.is_dir() => Self {
                 path: Some(encoded),
                 status: PathStatus::Exists,
                 error: None,
             },
-            Ok((path, _)) => Self {
+            Ok(_) => Self {
                 path: Some(encoded),
                 status: PathStatus::Missing,
-                error: Some(format!("{} is not a directory", path.display())),
+                error: Some(format!("{} is not a directory", decoded.display())),
             },
             Err(error) => {
-                let status = encoded
-                    .to_path_buf()
-                    .ok()
-                    .and_then(|path| std::fs::metadata(path).err())
-                    .map(|error| match error.kind() {
-                        std::io::ErrorKind::NotFound => PathStatus::Missing,
-                        std::io::ErrorKind::PermissionDenied => PathStatus::Inaccessible,
-                        _ => PathStatus::Unknown,
-                    })
-                    .unwrap_or(PathStatus::Unknown);
+                let status = match error.kind() {
+                    std::io::ErrorKind::NotFound => PathStatus::Missing,
+                    std::io::ErrorKind::PermissionDenied => PathStatus::Inaccessible,
+                    _ => PathStatus::Unknown,
+                };
                 Self {
                     path: Some(encoded),
                     status,
-                    error: Some(format!("{error:#}")),
+                    error: Some(format!("could not stat {}: {error}", decoded.display())),
                 }
             }
         }
@@ -248,6 +250,62 @@ impl TmuxState {
             .to_string())
     }
 
+    /// Hash of only the state a restore can actually reproduce.
+    ///
+    /// `semantic_hash` covers every captured field, including ones that change
+    /// whenever a pane runs a command (`current_command`, `pid`, `tty`,
+    /// `restart`) or whose text is OS- and locale-dependent (`cwd.error`).
+    /// Deduplicating on it makes an idle server produce a new snapshot every
+    /// poll, so autosave dedup uses this projection instead.
+    pub fn structural_hash(&self) -> Result<String> {
+        Ok(blake3::hash(&serde_json::to_vec(&self.structural_view())?)
+            .to_hex()
+            .to_string())
+    }
+
+    fn structural_view(&self) -> StructuralState<'_> {
+        StructuralState {
+            sessions: self
+                .sessions
+                .iter()
+                .map(|session| StructuralSession {
+                    id: &session.id,
+                    name: &session.name,
+                    group: session.group.as_deref(),
+                    active_window_id: session.active_window_id.as_deref(),
+                    last_window_id: session.last_window_id.as_deref(),
+                    windows: &session.windows,
+                })
+                .collect(),
+            windows: self
+                .windows
+                .iter()
+                .map(|window| StructuralWindow {
+                    id: &window.id,
+                    name: &window.name,
+                    layout: &window.layout,
+                    width: window.width,
+                    height: window.height,
+                    zoomed: window.zoomed,
+                    automatic_rename: window.automatic_rename,
+                    active_pane_id: window.active_pane_id.as_deref(),
+                    panes: window
+                        .panes
+                        .iter()
+                        .map(|pane| StructuralPane {
+                            id: &pane.id,
+                            index: pane.index,
+                            title: pane.title.as_deref(),
+                            cwd: pane.cwd.path.as_ref(),
+                            start_command: pane.start_command.as_deref(),
+                            dead: pane.dead,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         use std::collections::HashSet;
 
@@ -284,6 +342,48 @@ impl TmuxState {
         }
         Ok(())
     }
+}
+
+/// Borrowed projection of [`TmuxState`] used only to compute
+/// [`TmuxState::structural_hash`]. Field order and names are part of the hash,
+/// so changing them changes every structural hash.
+#[derive(Serialize)]
+struct StructuralState<'a> {
+    sessions: Vec<StructuralSession<'a>>,
+    windows: Vec<StructuralWindow<'a>>,
+}
+
+#[derive(Serialize)]
+struct StructuralSession<'a> {
+    id: &'a str,
+    name: &'a str,
+    group: Option<&'a str>,
+    active_window_id: Option<&'a str>,
+    last_window_id: Option<&'a str>,
+    windows: &'a [WindowLink],
+}
+
+#[derive(Serialize)]
+struct StructuralWindow<'a> {
+    id: &'a str,
+    name: &'a str,
+    layout: &'a str,
+    width: u32,
+    height: u32,
+    zoomed: bool,
+    automatic_rename: Option<bool>,
+    active_pane_id: Option<&'a str>,
+    panes: Vec<StructuralPane<'a>>,
+}
+
+#[derive(Serialize)]
+struct StructuralPane<'a> {
+    id: &'a str,
+    index: i32,
+    title: Option<&'a str>,
+    cwd: Option<&'a EncodedPath>,
+    start_command: Option<&'a str>,
+    dead: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
