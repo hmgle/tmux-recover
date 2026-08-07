@@ -1,0 +1,12 @@
+[Unit]
+Description=tmux-recover daemon for %I
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tmux-recover daemon --socket "%I"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
