@@ -65,6 +65,10 @@ tmux-recover save --socket /tmp/tmux-1000/other
 tmux-recover daemon --socket /tmp/tmux-1000/default
 ```
 
+无参数的 `save` 在结构未变化时会去重，输出 `unchanged`。`--label` 携带了当前
+快照没有的信息，因此总会写入一条历史记录。`--pin` 是已存快照的属性：结构未变化
+时它直接 pin 当前快照，而不是复制一份。
+
 ### 恢复
 
 先执行 dry-run：

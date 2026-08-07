@@ -334,7 +334,17 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         captured.state,
         captured.diagnostics,
     )?;
-    match store.commit(&snapshot, true)? {
+    // A label is information the current snapshot does not already carry, so
+    // structural dedup would silently discard it. `--pin` is different: it is a
+    // property of a stored snapshot, so an unchanged save can pin the current
+    // one instead of duplicating it. A plain save keeps deduping.
+    let labelled = snapshot.label.is_some();
+    let outcome = if labelled {
+        store.commit_always(&snapshot, true)?
+    } else {
+        store.commit(&snapshot, true)?
+    };
+    match outcome {
         CommitOutcome::Written => {
             if args.pin {
                 store.pin(&snapshot.id)?;
@@ -345,7 +355,16 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
                 println!("pruned {} old snapshots", removed.len());
             }
         }
-        CommitOutcome::Unchanged => println!("unchanged {}", snapshot.semantic_hash),
+        CommitOutcome::Unchanged => {
+            println!("unchanged {}", snapshot.semantic_hash);
+            if args.pin {
+                let current = store
+                    .current_snapshot_id()
+                    .context("--pin found no current snapshot to pin")?;
+                store.pin(&current)?;
+                println!("pinned {current}");
+            }
+        }
     }
     Ok(())
 }
