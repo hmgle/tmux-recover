@@ -9,7 +9,7 @@ use crate::{
         WindowLink,
     },
     process::collect_restart_specs,
-    util::{hostname, require_tmux_37, uid},
+    util::{canonical_socket_path, hostname, require_tmux_37, uid},
 };
 
 use super::control::ControlClient;
@@ -138,12 +138,14 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
     require_tmux_37(&tmux_version)?;
     let socket_bytes = field(&metadata, 4)?;
     let socket_path = encoded_path(socket_bytes);
-    let socket_for_key = socket_path
-        .to_path_buf()
-        .unwrap_or_else(|_| requested_socket.into());
     let hostname = hostname()?;
     let uid = uid();
-    let socket = SocketIdentity::new(&socket_for_key, &hostname, uid)?;
+    // tmux reports the path it was started with, which may be a filesystem
+    // alias such as macOS /var for /private/var. The requested path identifies
+    // the socket we actually connected to and is canonicalized by every other
+    // store lookup, so derive the key from that same identity while preserving
+    // tmux's original spelling in the snapshot metadata below.
+    let socket = SocketIdentity::new(&canonical_socket_path(requested_socket)?, &hostname, uid)?;
     let state = TmuxState {
         sessions: sessions.into_values().collect(),
         windows: windows.into_values().collect(),
@@ -382,6 +384,11 @@ fn field_u32(fields: &[Vec<u8>], index: usize) -> Result<Option<u32>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -399,5 +406,25 @@ mod tests {
         let format = escaped_format("pane_current_path");
         assert!(!format.contains('\n'));
         assert!(format.contains("\\012"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_keys_temporary_socket_aliases_by_canonical_path() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("tmux.sock");
+        let alias = directory.path().join("tmux-alias.sock");
+        std::fs::write(&socket, b"").unwrap();
+        symlink(&socket, &alias).unwrap();
+
+        let metadata = format!("M|tmux 3.7b|123|456|{}|/bin/sh", alias.to_string_lossy());
+        let captured = parse_capture(vec![metadata.into_bytes()], &socket).unwrap();
+        let identity = captured.origin.socket.unwrap();
+
+        assert_eq!(identity.path.to_path_buf().unwrap(), alias);
+        assert_eq!(
+            identity.key,
+            crate::util::socket_identity(&socket).unwrap().key
+        );
     }
 }

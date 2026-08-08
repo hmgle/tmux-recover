@@ -257,6 +257,10 @@ async fn save_if_changed(
     config: &Config,
     reason: &str,
 ) -> Result<CommitOutcome> {
+    // Capture order must be mutation order. Taking this after capture allows a
+    // stale daemon capture to wait behind a newer CLI save and then overwrite
+    // its `current` pointer.
+    let _mutation_lock = store.acquire_mutation_lock()?;
     let captured = capture(client, socket).await?;
     let checkpoint_origin = ProcessCheckpointOrigin {
         socket_key: captured
@@ -276,7 +280,6 @@ async fn save_if_changed(
         captured.state,
         captured.diagnostics,
     )?;
-    let _mutation_lock = store.acquire_mutation_lock()?;
     let outcome = store.commit(&snapshot, true)?;
     match outcome {
         CommitOutcome::Written => {

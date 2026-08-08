@@ -320,16 +320,14 @@ fn confirm_replace() -> Result<()> {
 
 async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     let socket = resolve_socket(args.socket.as_deref()).await?;
+    let identity = socket_identity(&socket)?;
+    let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
+    // Serialize capture as well as publication. Otherwise a writer that
+    // captured an older server state could wait behind a newer writer and then
+    // move `current` backwards when it finally acquired the lock.
+    let _mutation_lock = store.acquire_mutation_lock()?;
     let mut client = ControlClient::connect(&socket).await?;
     let captured = capture(&mut client, &socket).await?;
-    let key = captured
-        .origin
-        .socket
-        .as_ref()
-        .context("capture did not return a socket identity")?
-        .key
-        .clone();
-    let store = SnapshotStore::for_socket(data_dir, &key, &config.storage);
     let snapshot = Snapshot::new(
         args.label,
         SnapshotSource::Native {
@@ -339,7 +337,6 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         captured.state,
         captured.diagnostics,
     )?;
-    let _mutation_lock = store.acquire_mutation_lock()?;
     // A label is information the current snapshot does not already carry, so
     // structural dedup would silently discard it. `--pin` is different: it is a
     // property of a stored snapshot, so an unchanged save can pin the current
@@ -390,7 +387,7 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
             base_snapshot_id,
             snapshot.state.structural_hash()?,
             ProcessCheckpointOrigin {
-                socket_key: key,
+                socket_key: identity.key,
                 server_started_at: snapshot.origin.server_started_at,
             },
             &snapshot.state,

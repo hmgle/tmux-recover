@@ -1,9 +1,10 @@
 //! CLI-level cover for `save`'s dedup semantics, which live in main.rs and so
 //! are not reachable from a library test.
 
-use std::process::Command;
+use std::{process::Command, time::Duration};
 
 use tempfile::TempDir;
+use tmux_recover::{config::StorageConfig, storage::SnapshotStore, util::socket_identity};
 
 struct Server {
     /// Held so the socket outlives the server.
@@ -329,4 +330,44 @@ fn socket_aliases_share_one_store_identity() {
             socket.display()
         );
     }
+}
+
+#[test]
+fn save_captures_after_waiting_for_the_mutation_lock() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &StorageConfig::default());
+    let lock = store.acquire_mutation_lock().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(["save", "--socket"])
+        .arg(&server.socket)
+        .spawn()
+        .unwrap();
+
+    // The child has to resolve its socket and reach the held lock before the
+    // state changes. It cannot connect to tmux until the lock is released.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        Command::new("tmux")
+            .args(["-S"])
+            .arg(&server.socket)
+            .args(["rename-window", "-t", "work:0", "after-lock"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    drop(lock);
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        store.load_current().unwrap().state.windows[0].name,
+        "after-lock"
+    );
 }
