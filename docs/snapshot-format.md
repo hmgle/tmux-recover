@@ -85,11 +85,15 @@ what lets a restore report that it ignored one.
 
 Snapshots enforce the same uniqueness. Session, window, and server-global pane
 ids must be unique; window and pane indexes cannot be reused within their
-owners; active/last references must point to linked objects; and every window
-must have an owning session. A snapshot repeating a pane id across two windows
-is rejected because `pane_cwds`, `restart_specs`, the old-to-new pane mapping,
-and this sidecar's pane-set comparison all key on the bare id and would silently
-drop an entry rather than fail.
+owners; window indexes must be non-negative; and each window's pane list must
+be an ascending contiguous index range. Its first pane index must fit tmux's
+`pane-base-index` range (`0..=65535` on supported tmux versions), although later
+indexes in a multi-pane window may be higher because tmux allocates them
+sequentially. Active/last references must point to linked objects, and every
+window must have an owning session. A snapshot repeating a pane id across two
+windows is rejected because `pane_cwds`, `restart_specs`, the old-to-new pane
+mapping, and this sidecar's pane-set comparison all key on the bare id and would
+silently drop an entry rather than fail.
 
 Resurrect files are import inputs, never native storage. The importer records
 the source path, BLAKE3 digest, detected v3/v4 version, and per-pane repair

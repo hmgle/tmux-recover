@@ -10,8 +10,10 @@
 - 通过单个持久 tmux control-mode 连接抓取完整 server 状态；
 - 保存 session、linked/grouped window、pane、cwd、title、layout、active 和 zoom；
 - 结构变化由 tmux hooks 触发，cwd、title 和进程变化由低频轮询发现；
-- canonicalize socket 路径，使 symlink、相对路径和真实路径共享同一个 store 与锁；
-- daemon 和 CLI 之间串行化跨文件写事务，同时保持快照和指针的原子发布；
+- 使用 canonical connection path 计算 socket identity，使 symlink、相对路径以及
+  macOS 的 `/var` 与 `/private/var` 别名共享同一个 store 与锁，即使 tmux 回报原始拼写；
+- 在 daemon 和 CLI 之间串行化 capture 与跨文件发布，避免延迟的旧 capture 把
+  `current` 回退到新 save 之前；
 - JSON 区分空字符串、`null` 和缺失值，并保留非 UTF-8 Unix 路径；
 - 恢复前执行 preflight，可逆阶段保留旧 session，并写入持久 restore report；
 - 使用独立 checkpoint sidecar 跟踪 pane 当前运行的程序；
@@ -92,9 +94,9 @@ tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
-preflight 会在重命名任何 session 前校验 snapshot identity、状态图所有权、tmux
-index 唯一性、cwd 可用性和 layout checksum。dead pane 当前会被明确拒绝，因为
-把它恢复成 live shell 会静默改变原状态。
+preflight 会在重命名任何 session 前校验 snapshot identity、状态图所有权、非负
+window index、可重建的连续 pane index、cwd 可用性和 layout checksum。dead pane
+当前会被明确拒绝，因为把它恢复成 live shell 会静默改变原状态。
 
 恢复分为可逆阶段和 commit cleanup 阶段。commit 前失败会删除新建 session，恢复
 备份名称和普通客户端附着。新状态完整建立且客户端完成切换后，删除旧备份是不可逆
@@ -176,7 +178,10 @@ process_checkpoint_interval = 300
 safety_snapshots = 10
 ```
 
-如果 `hook_slot` 已被其他命令占用，daemon 会拒绝覆盖并提示选择另一个 indexed slot。
+daemon 只有在完整 hook 命令符合自身 event command 结构时才认定 ownership；如果
+`hook_slot` 已被其他命令占用则拒绝覆盖。安装前会立即复查、安装后会验证，退出时只
+删除指向自身 control client 的 entry。tmux 没有 conditional hook update，因此另一
+进程若在同一瞬间写入完全相同的 indexed slot，仍可能产生极窄竞争；应使用专用 slot。
 
 Linux 默认数据目录是 `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`：
 

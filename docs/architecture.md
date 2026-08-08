@@ -18,21 +18,35 @@ atomic snapshot file ---> atomic current.json pointer
 preflight ---> transactional restore ---> durable restore report
 ```
 
-Each socket identity is the hash of hostname, uid, and canonical socket path.
-Resolving symlinks before computing the identity keeps aliases on one store and
-one daemon singleton lock. Snapshots, the current pointer, user pins, bounded
-safety markers, locks, and restore reports live in that isolated directory.
-The long-lived daemon lock prevents duplicate watchers. A separate short-lived
-mutation lock serializes snapshot + pointer + checkpoint + prune transactions
-across daemon and CLI processes, including the complete duration of a restore.
+Each socket identity is the hash of hostname, uid, and canonical connection
+path. Capture deliberately does not key storage from tmux's raw
+`#{socket_path}`: tmux preserves the spelling it was started with, so on macOS
+that could be `/var/...` while filesystem canonicalization returns
+`/private/var/...`. The raw path remains in origin metadata, but every store and
+lock uses the canonical identity. Snapshots, the current pointer, user pins,
+bounded safety markers, locks, and restore reports live in that isolated
+directory.
+
+The long-lived daemon lock prevents duplicate watchers. A separate mutation
+lock covers daemon and manual capture as well as publication of snapshots,
+pointers, checkpoints, and pruning. It remains held for the mutating duration
+of a restore.
+Capturing inside the lock is intentional: if an older capture waited for the
+lock after a newer save, publishing it afterwards would move `current`
+backwards even though every individual file write was atomic.
 
 The daemon installs indexed hook entries in `autosave.hook_slot` (default 901)
-and never writes `status-right`. It removes entries carrying tmux-recover's own
-marker, which repairs stale hooks from a crashed predecessor, but refuses to
-overwrite another command in the configured slot. Shutdown likewise removes
-only entries that still carry the marker. Structure events are debounced. cwd
-and pane title changes are found by a low-frequency poll. A capture is committed
-only when its structural hash (topology, layout, cwd, titles; excludes
+and never writes `status-right`. Ownership requires the complete
+`display-message -c <client> tmux-recover:state-changed` command shape, not a
+marker substring. Startup can therefore remove a precisely recognized stale
+entry from a crashed predecessor without deleting an unrelated command that
+merely mentions the event text. Installation rechecks each slot immediately
+before writing and verifies it afterwards; shutdown removes only entries owned
+by the current control client. tmux exposes no conditional hook update, so a
+final narrow check-versus-set race remains if another process writes the exact
+indexed slot concurrently. Structure events are debounced. cwd and pane title
+changes are found by a low-frequency poll. A capture is committed only when its
+structural hash (topology, layout, cwd, titles; excludes
 pid/tty/current_command/dead_status) differs from the current snapshot, so an
 idle server does not produce a new snapshot on every poll.
 
@@ -46,7 +60,11 @@ server. Comparing `origin` costs at most one extra snapshot when the tool or
 tmux version changes, which is a real history boundary.
 
 Restore first validates schema, snapshot id, hash, origin, graph ownership,
-unique tmux indexes, layout checksum, cwd policy, and optional process policy.
+non-negative window indexes, ascending contiguous pane indexes, layout
+checksum, cwd policy, and optional process policy. The pane range must start at
+a value tmux accepts for `pane-base-index`; later pane indexes may exceed that
+base limit as tmux creates them sequentially. Restore bookkeeping chooses a
+genuinely unused window index instead of arithmetic above the saved maximum.
 Dead panes are rejected before mutation until their state can be reproduced
 faithfully. Existing sessions are renamed to collision-free temporary backup
 names, and new sessions are built while those backups remain live.

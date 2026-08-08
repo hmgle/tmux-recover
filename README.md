@@ -14,10 +14,11 @@ modify `status-right`.
   active selections, and zoom state.
 - Uses tmux hooks for structural changes and low-frequency polling for cwd,
   title, and process changes.
-- Canonicalizes socket paths so symlink aliases, relative paths, and real paths
-  share one store and one daemon lock.
-- Serializes multi-file store mutations across the daemon and CLI while keeping
-  snapshot files and pointers atomically published.
+- Derives socket identity from the canonical connection path, so symlinks,
+  relative paths, and macOS aliases such as `/var` and `/private/var` share one
+  store and one daemon lock even when tmux reports its original spelling.
+- Serializes capture and multi-file publication across the daemon and CLI, so a
+  delayed older capture cannot move `current` behind a newer save.
 - Preserves non-UTF-8 Unix paths and distinguishes empty strings, `null`, and
   missing values in JSON.
 - Runs restore preflight before mutation, retains old sessions during the
@@ -103,10 +104,11 @@ tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
-Preflight validates snapshot identity, graph ownership, unique tmux indexes,
-cwd availability, and the tmux layout checksum before any session is renamed.
-Dead panes are currently rejected because restoring them as live shells would
-silently change their state.
+Preflight validates snapshot identity, graph ownership, non-negative window
+indexes, restorable contiguous pane indexes, cwd availability, and the tmux
+layout checksum before any session is renamed. Dead panes are currently
+rejected because restoring them as live shells would silently change their
+state.
 
 Restore has a reversible phase and a commit cleanup phase. Before commit, a
 failure removes newly created sessions and restores backup names and client
@@ -200,8 +202,12 @@ process_checkpoint_interval = 300
 safety_snapshots = 10
 ```
 
-The daemon refuses to overwrite a non-tmux-recover command already installed
-in `hook_slot`; select another indexed slot in that case.
+The daemon recognizes ownership only when the complete hook command matches its
+event command shape. It refuses to overwrite another command in `hook_slot`,
+rechecks immediately before installation, verifies the installed value, and on
+shutdown removes only entries targeting its own control client. tmux has no
+conditional hook update, so another process writing the exact indexed slot at
+the same instant can still race; use a dedicated slot.
 
 Linux data defaults to `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`:
 
