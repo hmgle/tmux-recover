@@ -817,8 +817,7 @@ async fn build_snapshot(
             quote(&window.name),
             quote_path(cwd)?
         );
-        command.push(' ');
-        command.push_str(&quote(HOLD_COMMAND));
+        append_hold_command(&mut command, first_pane, plan);
         let output = client.execute(&command).await?;
         let fields = output_fields(&output)?;
         let new_window = fields[0].clone();
@@ -874,8 +873,7 @@ async fn build_snapshot(
                 quote(&split_target),
                 quote_path(cwd)?
             );
-            command.push(' ');
-            command.push_str(&quote(HOLD_COMMAND));
+            append_hold_command(&mut command, pane, plan);
             let output = client.execute(&command).await?;
             let fields = output_fields(&output)?;
             let new_pane = fields[0].clone();
@@ -953,6 +951,20 @@ async fn build_snapshot(
     })
 }
 
+fn append_hold_command(command: &mut String, pane: &Pane, plan: &RestorePlan) {
+    // Panes without a restart spec must be created without a command. tmux
+    // then starts its default-shell and leaves pane_start_command empty. If a
+    // hold command were used here, a later commandless respawn would restart
+    // that hold command rather than the shell.
+    //
+    // Keep the quiet holding process for panes that will be replaced with an
+    // explicitly restored process after the layout has been assembled.
+    if plan.restart_specs.contains_key(&pane.id) {
+        command.push(' ');
+        command.push_str(&quote(HOLD_COMMAND));
+    }
+}
+
 async fn start_panes(
     client: &mut ControlClient,
     state: &TmuxState,
@@ -961,22 +973,24 @@ async fn start_panes(
 ) -> Result<usize> {
     let mut restored_processes = 0;
     for pane in state.windows.iter().flat_map(|window| &window.panes) {
+        let Some(launch) = pane_launch(pane, plan)? else {
+            // This pane was created without a command and is already running
+            // the target tmux server's default-shell in the restored cwd.
+            continue;
+        };
         let new_pane = pane_ids.get(&pane.id).context("missing restored pane")?;
         let cwd = plan
             .pane_cwds
             .get(&pane.id)
             .context("pane cwd is missing from plan")?;
-        let mut command = format!(
-            "respawn-pane -k -t {} -c {}",
+        let command = format!(
+            "respawn-pane -k -t {} -c {} {}",
             quote(new_pane),
-            quote_path(cwd)?
+            quote_path(cwd)?,
+            quote(&launch)
         );
-        if let Some(launch) = pane_launch(pane, plan)? {
-            command.push(' ');
-            command.push_str(&quote(&launch));
-            restored_processes += 1;
-        }
         execute_empty(client, &command).await?;
+        restored_processes += 1;
     }
     Ok(restored_processes)
 }

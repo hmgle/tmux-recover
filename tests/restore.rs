@@ -243,6 +243,130 @@ async fn restores_special_fields_active_pane_and_zoom() {
     assert_eq!(cwd(&auxiliary.panes[0]), cwd_one);
 }
 
+#[tokio::test]
+async fn restores_default_shell_panes_without_a_hold_command() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    let cwd = server.directory.path();
+
+    let first_pane = output(
+        server
+            .tmux()
+            .args([
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                "shells",
+                "-n",
+                "main",
+                "-c",
+            ])
+            .arg(cwd),
+    );
+    for _ in 0..2 {
+        output(
+            server
+                .tmux()
+                .args(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t"])
+                .arg(first_pane.trim())
+                .arg("-c")
+                .arg(cwd),
+        );
+    }
+    success(server.tmux().args([
+        "set-window-option",
+        "-t",
+        first_pane.trim(),
+        "automatic-rename",
+        "off",
+    ]));
+
+    let source = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    let snapshot = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        source.origin,
+        source.state,
+        source.diagnostics,
+    )
+    .unwrap();
+
+    server.stop();
+    success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
+    let mut client = ControlClient::connect(&server.socket).await.unwrap();
+    let target = capture(&mut client, &server.socket).await.unwrap();
+    let default_shell = target.default_shell.as_deref().unwrap();
+    let expected_command = std::path::Path::new(default_shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    let config = RestoreConfig::default();
+    let options = restore_config_options(&config, false, false, None, false, None);
+    let plan = preflight(&snapshot, &target, &options).unwrap();
+    assert_eq!(plan.process_restarts, 0);
+    let report = apply(&mut client, &snapshot, &target, &plan).await;
+    assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    drop(client);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let restored = loop {
+        let restored = {
+            let mut client = ControlClient::connect(&server.socket).await.unwrap();
+            capture(&mut client, &server.socket).await.unwrap()
+        };
+        let panes: Vec<_> = restored
+            .state
+            .windows
+            .iter()
+            .flat_map(|window| &window.panes)
+            .collect();
+        if panes.len() == 3
+            && panes
+                .iter()
+                .all(|pane| pane.current_command.as_deref() == Some(&expected_command))
+        {
+            break restored;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restored panes did not enter {expected_command}: {:#?}",
+            panes
+                .iter()
+                .map(|pane| (&pane.current_command, &pane.start_command))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let panes: Vec<_> = restored
+        .state
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .collect();
+    assert_eq!(panes.len(), 3);
+    assert!(
+        panes.iter().all(|pane| pane.start_command.is_none()),
+        "restore polluted pane_start_command: {:#?}",
+        panes
+            .iter()
+            .map(|pane| &pane.start_command)
+            .collect::<Vec<_>>()
+    );
+}
+
 fn output(command: &mut Command) -> String {
     let output = command.output().unwrap();
     assert!(
