@@ -6,11 +6,17 @@ poll_interval = 60
 # unchanged. Only used by --restore-processes; it overwrites one file in place
 # rather than adding to snapshot history.
 process_checkpoint_interval = 300
+# Indexed tmux hook slot. The daemon refuses to overwrite another command in
+# this slot; choose a different value if another plugin already uses it.
+hook_slot = 901
 
 [retention]
 recent = 100
 hourly_days = 30
 daily_days = 180
+# Keep this many pre-restore safety snapshots. User-pinned snapshots are
+# separate and remain exempt from pruning until explicitly unpinned.
+safety_snapshots = 10
 
 [restore]
 auto = false

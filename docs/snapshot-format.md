@@ -13,6 +13,12 @@ The top-level object contains:
   optional import status;
 - structured diagnostics.
 
+The snapshot id is not an arbitrary label. Validation recomputes it from the
+six-digit UTC creation timestamp and the first 16 hexadecimal characters of the
+semantic hash. This keeps ids and every artifact filename derived from them to
+one safe path component. `current.json` likewise accepts only the exact
+`<snapshot-id>.json` or `<snapshot-id>.json.zst` filename.
+
 `EncodedPath` is tagged as either `utf8` or `base64`, so Unix paths are not
 silently made lossy. JSON distinguishes `""`, `null`, and an absent field and
 escapes Tab, newline, Unicode, colons, and other control characters.
@@ -22,6 +28,11 @@ and followed by a directory `fsync`. The `current.json` pointer is updated only
 after the complete snapshot is durable. A failed capture therefore cannot
 replace the last valid current snapshot. Orphaned completed snapshots remain
 visible to `list` and are safe to inspect or prune.
+
+Restore reports remain `schema_version = 1` and now include a default-empty
+`warnings` array. A successful report can carry cleanup warnings when restored
+state reached the commit point but one or more old backup sessions could not be
+removed. This is distinct from `error`, which is reserved for a failed restore.
 
 ## Process checkpoint sidecar
 
@@ -72,11 +83,13 @@ reaches the disk rather than only for the ones this crate's capture path
 produces. A read distinguishes an absent sidecar from an unusable one, which is
 what lets a restore report that it ignored one.
 
-Snapshots enforce the same uniqueness. tmux pane ids are unique per server, so
-a snapshot repeating one across two windows is rejected: `pane_cwds`,
-`restart_specs`, the old-to-new pane mapping, and this sidecar's pane-set
-comparison all key on the bare id, and would silently drop an entry rather
-than fail.
+Snapshots enforce the same uniqueness. Session, window, and server-global pane
+ids must be unique; window and pane indexes cannot be reused within their
+owners; active/last references must point to linked objects; and every window
+must have an owning session. A snapshot repeating a pane id across two windows
+is rejected because `pane_cwds`, `restart_specs`, the old-to-new pane mapping,
+and this sidecar's pane-set comparison all key on the bare id and would silently
+drop an entry rather than fail.
 
 Resurrect files are import inputs, never native storage. The importer records
 the source path, BLAKE3 digest, detected v3/v4 version, and per-pane repair

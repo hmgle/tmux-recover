@@ -18,19 +18,23 @@ atomic snapshot file ---> atomic current.json pointer
 preflight ---> transactional restore ---> durable restore report
 ```
 
-Each socket identity is the hash of hostname, uid, and absolute socket path.
-Its snapshots, current pointer, pins, daemon lock, and restore reports live in
-an isolated directory. A daemon lock prevents two writers for one socket;
-different socket directories can be watched concurrently.
+Each socket identity is the hash of hostname, uid, and canonical socket path.
+Resolving symlinks before computing the identity keeps aliases on one store and
+one daemon singleton lock. Snapshots, the current pointer, user pins, bounded
+safety markers, locks, and restore reports live in that isolated directory.
+The long-lived daemon lock prevents duplicate watchers. A separate short-lived
+mutation lock serializes snapshot + pointer + checkpoint + prune transactions
+across daemon and CLI processes, including the complete duration of a restore.
 
-The daemon installs indexed hook entries (slot 901, a fixed constant) and never
-writes `status-right`. On startup it first clears that slot so a crashed
-predecessor cannot leave a stale hook pointed at a dead client. Structure
-events are debounced. cwd and pane title changes are found by a low-frequency
-poll. A capture is committed only when its structural hash (topology, layout,
-cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
-current snapshot, so an idle server does not produce a new snapshot on every
-poll.
+The daemon installs indexed hook entries in `autosave.hook_slot` (default 901)
+and never writes `status-right`. It removes entries carrying tmux-recover's own
+marker, which repairs stale hooks from a crashed predecessor, but refuses to
+overwrite another command in the configured slot. Shutdown likewise removes
+only entries that still carry the marker. Structure events are debounced. cwd
+and pane title changes are found by a low-frequency poll. A capture is committed
+only when its structural hash (topology, layout, cwd, titles; excludes
+pid/tty/current_command/dead_status) differs from the current snapshot, so an
+idle server does not produce a new snapshot on every poll.
 
 Dedup also requires the capture's `origin` to match, not just the structural
 hash. A restore reproduces tmux ids deterministically, so a fresh server
@@ -41,16 +45,19 @@ carry the new generation and be rejected as mismatched for the life of that
 server. Comparing `origin` costs at most one extra snapshot when the tool or
 tmux version changes, which is a real history boundary.
 
-Known limitation: the fixed hook slot is a shared namespace. If another tool
-also binds `set-hook -g '<name>[901]'`, one daemon's startup cleanup or shutdown
-removal will delete the other's hook. A future version should make the slot
-configurable or save and restore whatever was already bound there.
+Restore first validates schema, snapshot id, hash, origin, graph ownership,
+unique tmux indexes, layout checksum, cwd policy, and optional process policy.
+Dead panes are rejected before mutation until their state can be reproduced
+faithfully. Existing sessions are renamed to collision-free temporary backup
+names, and new sessions are built while those backups remain live.
 
-Restore first validates schema, hash, origin, graph references, cwd policy,
-and optional process policy. Existing sessions are renamed to temporary backup
-names. New sessions are built while the backups remain live. Only after pane
-properties and client targets are ready are backups deleted. Failure invokes a
-rollback and always produces a report.
+The point after pane properties are complete and ordinary clients have switched
+is the restore commit point. Before it, failure switches clients back, deletes
+new sessions, and restores backup names. After it, backup deletion is
+irreversible: a cleanup failure keeps the restored state live and is reported as
+a warning instead of attempting a rollback that could discard both old and new
+state. A pre-restore safety snapshot is marked separately from user pins and is
+retained by the bounded `retention.safety_snapshots` policy.
 
 Process restart metadata is collected from `/proc` on Linux. It is never
 executed unless `--restore-processes` is present and the executable basename is

@@ -1,30 +1,40 @@
 # tmux-recover
 
-`tmux-recover` 是一个用 Rust 实现的 tmux 会话快照、恢复和持续保存工具。
-它不依赖 tmux-resurrect 或 tmux-continuum，也不修改 `status-right`。
+[简体中文](README.zh-CN.md)
 
-核心特性：
+`tmux-recover` is a Rust-based tmux session snapshot, restore, and continuous
+save tool. It does not depend on tmux-resurrect or tmux-continuum and does not
+modify `status-right`.
 
-- 通过单个持久 tmux control-mode 连接抓取完整 server 状态；
-- 保存 session、linked/grouped window、pane、cwd、title、layout、active 和 zoom；
-- 结构变化由 tmux hooks 触发，cwd/title 由低频轮询发现；
-- 每个 socket 独立存储和加锁，多个 tmux server 不会互相覆盖；
-- JSON schema 区分空字符串、`null` 和缺失值，并支持非 UTF-8 Unix 路径；
-- 快照文件和 `current.json` 指针均原子写入，失败时保留上一份有效快照；
-- 独立的进程 checkpoint sidecar 跟踪 pane 当前运行的程序，不污染历史快照；
-- 恢复前执行 preflight，恢复过程中保留旧 session，失败后回滚并写报告；
-- 导入 tmux-resurrect v3/v4，并修复可确定的 v4 空 pane title 字段错位。
+## Features
 
-当前要求 tmux 3.7 或更新版本以及 Rust 1.85 或更新版本。支持 Linux 和
-macOS；Linux 额外支持从 `/proc` 采集可选的进程重启元数据。
+- Captures the complete server state through one persistent tmux control-mode
+  connection.
+- Saves sessions, linked and grouped windows, panes, cwd, titles, layout,
+  active selections, and zoom state.
+- Uses tmux hooks for structural changes and low-frequency polling for cwd,
+  title, and process changes.
+- Canonicalizes socket paths so symlink aliases, relative paths, and real paths
+  share one store and one daemon lock.
+- Serializes multi-file store mutations across the daemon and CLI while keeping
+  snapshot files and pointers atomically published.
+- Preserves non-UTF-8 Unix paths and distinguishes empty strings, `null`, and
+  missing values in JSON.
+- Runs restore preflight before mutation, retains old sessions during the
+  reversible phase, and writes a durable restore report.
+- Tracks current process restart metadata in a separate checkpoint sidecar.
+- Imports tmux-resurrect v3/v4 without trusting imported command text.
 
-## 安装
+tmux 3.7+ and Rust 1.85+ are required. Linux and macOS are supported. Optional
+process restart metadata is currently collected on Linux through `/proc`.
+
+## Installation
 
 ```sh
 cargo install --path . --locked
 ```
 
-也可以安装到 `~/.local/bin`：
+To install into `~/.local/bin`:
 
 ```sh
 ./scripts/install.sh
@@ -35,113 +45,113 @@ cargo install --path . --locked
 ```tmux
 set -g @plugin 'gle/tmux-recover'
 
-# 可选；默认 C-s 保存、C-r 安全恢复。
+# Optional; defaults are C-s for save and C-r for safe restore.
 set -g @tmux-recover-save-key 'C-s'
 set -g @tmux-recover-restore-key 'C-r'
 
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-TPM 加载脚本会为当前 tmux socket 启动一个后台 daemon。每个 server 都有
-自己的 daemon 和锁；重复启动会立即退出。若 binary 不在 `PATH`，在启动
-tmux 前设置 `TMUX_RECOVER_BIN`，或构建仓库内的 `target/release/tmux-recover`。
+The TPM entry point starts one background daemon for the current canonical tmux
+socket. Repeated starts exit after failing the daemon singleton lock. Set
+`TMUX_RECOVER_BIN` before starting tmux when the binary is not in `PATH`.
 
-daemon 不依赖 status bar，也不要求存在普通 attached client。TPM 日志位于
-`${XDG_STATE_HOME:-~/.local/state}/tmux-recover/tpm.log`。
+TPM logs are written to
+`${XDG_STATE_HOME:-~/.local/state}/tmux-recover/tpm.log`.
 
 ## CLI
 
 ```sh
-# 当前 TMUX socket，或默认 socket
+# Current TMUX socket, or the default socket.
 tmux-recover save
 tmux-recover list
 tmux-recover show current --json
 tmux-recover validate current
 
-# 明确指定另一个 server
+# Explicit server. Socket aliases are canonicalized.
 tmux-recover save --socket /tmp/tmux-1000/other
 
-# 前台运行持续保存，适合 systemd/launchd
+# Foreground daemon, suitable for systemd or launchd.
 tmux-recover daemon --socket /tmp/tmux-1000/default
 ```
 
-无参数的 `save` 在结构未变化时会去重，输出 `unchanged`。`--label` 携带了当前
-快照没有的信息，因此总会写入一条历史记录。`--pin` 是已存快照的属性：结构未变化
-时它直接 pin 当前快照，而不是复制一份。
+An unlabeled `save` deduplicates unchanged structure and prints `unchanged`.
+`--label` always records a history entry. `--pin` pins the stored current
+snapshot when structure is unchanged instead of writing a duplicate.
 
-### 恢复
+### Restore
 
-先执行 dry-run：
+Start with a dry run:
 
 ```sh
 tmux-recover restore 20260801T212922 --dry-run
 ```
 
-默认只允许替换一个无显式启动命令的 1 session / 1 window / 1 pane
-bootstrap。已有工作状态必须明确确认：
+By default, restore only replaces a 1 session / 1 window / 1 pane bootstrap
+whose pane has no explicit start command. Replacing real work requires explicit
+review and confirmation:
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --replace
 tmux-recover restore SNAPSHOT --replace --yes
 ```
 
-cwd 不存在时 preflight 默认失败，不会静默使用 `$HOME`。需要回退时显式指定：
+Missing cwd values fail preflight. A fallback must be explicit:
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
-进程默认不恢复。只有显式传入 `--restore-processes`，且 native snapshot 中的
-进程可信、可执行文件 basename 位于 allowlist 时才会启动。导入的 resurrect
-命令永远不会执行。
+Preflight validates snapshot identity, graph ownership, unique tmux indexes,
+cwd availability, and the tmux layout checksum before any session is renamed.
+Dead panes are currently rejected because restoring them as live shells would
+silently change their state.
 
-恢复的程序运行在固定的 `/bin/sh` supervisor 中，程序本身在重置 SIGINT/SIGQUIT
-的子 shell 里 exec。这样 C-c 只结束该程序并把 pane 交还给 tmux 配置的
-`default-shell`，而不会连 wrapper 一起杀掉、导致 pane（乃至最后一个 pane 所属的
-session 与 server）消失。进入 `default-shell` 前会再次重置信号，后续命令仍可正常
-响应 C-c。已知限制：C-z 会暂停该程序而 supervisor 仍在等待，pane 会卡住但不会
-消失。
+Restore has a reversible phase and a commit cleanup phase. Before commit, a
+failure removes newly created sessions and restores backup names and client
+attachments. After the restored state is complete and clients have switched,
+old backup deletion is irreversible. Cleanup failures therefore leave the new
+state live and are recorded as warnings in the restore report instead of
+triggering an unsafe rollback.
 
-#### 进程 checkpoint sidecar
+Every non-dry-run restore records a pre-restore safety snapshot. Safety
+snapshots have a separate bounded retention policy and are marked with `!` in
+`list`; user pins are marked with `+` and remain until explicitly unpinned.
+Safety snapshots created by older versions as ordinary pins remain pinned and
+can be released with `tmux-recover unpin SNAPSHOT`.
 
-结构去重让历史保持精简，但也意味着快照只记录布局最后一次变化时正在运行的
-进程。在已有 pane 里启动 `nvim` 不会产生新快照，`--restore-processes` 因此
-可能恢复成一小时前的 shell。
+### Process restore
 
-daemon 用一个独立的 `process-current.json` 补上这个缺口：它与
-`current.json` 并列，每次原子覆盖而不追加历史，只记录每个 pane 的
-`pane_id`、`current_command` 和 `restart`。结构未变时最多每
-`autosave.process_checkpoint_interval`（默认 300 秒）刷新一次，且仅在
-`process_hash` 真正变化时才写；结构提交则立即刷新。
+Processes are not restored by default. `--restore-processes` only launches
+trusted native restart metadata whose executable basename is in
+`restore.process_allowlist`. Imported resurrect command strings are never
+executed.
 
-手工执行 `save` 总会立即刷新 sidecar，不受该 interval 限制：这次捕获记录的
-就是此刻运行的进程，而且是用户显式要求的。结构未变时 sidecar 锚定在现有
-`current` 上，写入新快照时锚定到新 ID。
+Restored programs run under a fixed `/bin/sh` supervisor. SIGINT and SIGQUIT
+are reset for the program, and tmux's captured `default-shell` is entered after
+the program exits. This keeps `C-c` from destroying the pane. Known limitation:
+`C-z` can stop the program while the supervisor waits, leaving the pane stuck.
 
-sidecar 描述的是"现在"，所以只有全部条件成立时恢复才会使用它：传入了
-`--restore-processes`、恢复目标是本 socket store 的 `current`（历史 ID 和
-`--from-imports` 都不行）、sidecar 自身 schema 与 hash 校验通过、
-`base_snapshot_id` 与 `structural_hash` 与该快照一致、socket 与 server 代次
-匹配、覆盖的 pane 集合与快照完全相同。任一条件不成立就回退到快照自带的
-`restart` 元数据并在计划中给出 warning，session/window/pane 的恢复不受影响。
-因此恢复历史 ID 永远不会把当前进程套到过去的布局上。
+#### Process checkpoint sidecar
 
-一旦 sidecar 通过校验，它对覆盖的**每个** pane 都是权威来源。`restart: null`
-表示该 pane 当前没有可恢复的前台进程（进程已退出，或 `/proc` 读取失败），
-此时会压制快照中更旧的 `restart`，而不是回退去复活那个陈旧命令。`trusted`
-与 allowlist 检查始终生效。
+Structural dedup means a history snapshot may predate the program currently
+running in a pane. `process-current.json` fills that gap without appending
+history. It tracks `pane_id`, `current_command`, and `restart`, is refreshed on
+a separate interval, and is atomically overwritten only when relevant process
+state changes.
 
-dry-run 和 `--json` 会输出 `process_metadata_source`（`disabled`/`snapshot`/
-`checkpoint`）与 checkpoint 捕获时间，便于审计这次 best-effort 进程恢复实际
-用了哪份元数据、有多旧：
+The sidecar is only eligible when restoring `current` from the same socket
+store with `--restore-processes`, and only when its snapshot ID, structural
+hash, socket identity, server generation, and complete pane set all match.
+Otherwise restore falls back to the snapshot's own metadata and reports a
+warning. A sidecar `restart: null` is authoritative and suppresses older
+snapshot restart metadata for that pane.
 
-```text
-  process restarts: 1 (from checkpoint)
-  checkpoint age:   5s (captured 2026-08-07T12:00:29.105801375+00:00)
-```
+Dry runs and JSON plans expose `process_metadata_source` and checkpoint capture
+time.
 
-### resurrect 导入
+### tmux-resurrect import
 
 ```sh
 tmux-recover import-resurrect \
@@ -152,16 +162,14 @@ tmux-recover show --imports current --json
 tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 ```
 
-导入快照保存在独立的 `imports` store。v4 空 title 错位只有在字段签名明确时
-才会修复；修复状态和丢失信息会写入 snapshot diagnostics。
+Imports are kept in a separate store and are never structurally deduplicated.
+The importer recognizes v3/v4 and repairs the known v4 empty-title field shift
+only when its signature is unambiguous. Diagnostics record repaired, ambiguous,
+and lossy rows.
 
-导入不做结构去重：两份 resurrect 文件可能布局相同但来源不同（source path、
-digest、label 都不在结构 hash 内），因此每次导入都会记录一份，重复导入同一
-文件也会产生新条目。
+## Automatic restore
 
-## 自动恢复
-
-自动恢复默认关闭。在配置中启用：
+Automatic restore is disabled by default:
 
 ```toml
 [restore]
@@ -169,21 +177,33 @@ auto = true
 auto_bootstrap_max_age_seconds = 30
 ```
 
-daemon 仅在 server 足够新、拓扑严格为 1/1/1、pane 没有显式启动命令且当前
-进程等于 server `default-shell` 时自动恢复。任何 preflight 或恢复失败都会
-停止 daemon 启动，不会先把 bootstrap 写成新的 current。
+The daemon only auto-restores a young 1/1/1 bootstrap whose pane is running the
+server's `default-shell` and has no explicit start command. Preflight failures
+leave the server untouched and the daemon continues watching.
 
-## 配置与数据
+## Configuration and data
 
-默认配置路径：
+Default configuration locations:
 
 - Linux: `${XDG_CONFIG_HOME:-~/.config}/tmux-recover/config.toml`
 - macOS: `~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
 
-完整配置见 [config.example.toml](config.example.toml)。时间间隔单位均为秒。
+See [config.example.toml](config.example.toml) for every option. Important
+storage and daemon controls include:
 
-Linux 默认数据目录是
-`${XDG_DATA_HOME:-~/.local/share}/tmux-recover`。每个 socket 的目录包含：
+```toml
+[autosave]
+hook_slot = 901
+process_checkpoint_interval = 300
+
+[retention]
+safety_snapshots = 10
+```
+
+The daemon refuses to overwrite a non-tmux-recover command already installed
+in `hook_slot`; select another indexed slot in that case.
+
+Linux data defaults to `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`:
 
 ```text
 sockets/<socket-key>/
@@ -191,36 +211,43 @@ sockets/<socket-key>/
   current.json
   process-current.json
   pins/
+  safety/
   restores/*.json
   daemon.lock
+  mutation.lock
 imports/
 ```
 
-保留策略默认保留最新 100 份、30 天内每小时一份、180 天内每天一份；pin 和
-current 不会被清理。`storage.zstd = true` 可启用 zstd。
+The default retention policy keeps the latest 100 snapshots, one per hour for
+30 days, one per day for 180 days, and the latest 10 safety snapshots. Current
+and user-pinned snapshots are exempt. `storage.zstd = true` enables compressed
+snapshot envelopes.
 
-systemd user service 模板位于
-[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。实例名必须是
-socket 路径经 `systemd-escape` 转义后的结果：
+The systemd user service template is
+[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service).
+Its instance must be the `systemd-escape` result of the socket path:
 
 ```sh
 instance="$(systemd-escape '/tmp/tmux-1000/default')"
 systemctl --user enable --now "tmux-recover@${instance}.service"
 ```
 
-TPM 是 Linux/macOS 上推荐的 server 生命周期集成方式。
+TPM remains the recommended server-lifecycle integration on Linux and macOS.
 
-## 设计与限制
+## Design and limitations
 
-- [架构与恢复事务](docs/architecture.md)
-- [schema 与原子存储](docs/snapshot-format.md)
-- v1 不保存 scrollback 或 pane contents。
-- pane title 可能在恢复后被 shell 或程序通过 OSC 再次合法更新。
-- macOS 当前保存结构状态，但不采集进程重启元数据。
-- resurrect 的未转义 Tab/换行可能无法无损消歧；导入器会标记而不是猜测为
-  可执行命令。
+- [Architecture and restore transaction](docs/architecture.md)
+- [Snapshot schema and atomic storage](docs/snapshot-format.md)
+- Scrollback and pane contents are not saved in v1.
+- Dead panes are captured but restore currently rejects them before mutation.
+- Pane titles may later be legitimately changed by shells or programs through
+  OSC sequences.
+- macOS captures structural state but does not currently collect restart
+  metadata.
+- Unescaped tabs or newlines in resurrect files may be inherently ambiguous;
+  the importer records diagnostics instead of guessing executable commands.
 
-## 开发
+## Development
 
 ```sh
 cargo fmt --all -- --check
@@ -228,5 +255,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-tmux 3.7+ 可用时，测试会启动隔离的真实 server，覆盖特殊 cwd、空 title、
-transactional restore、hook/poll autosave 和安全自动恢复。
+tmux-backed tests use dedicated temporary `tmux -S` sockets and never mutate
+the ambient server.
