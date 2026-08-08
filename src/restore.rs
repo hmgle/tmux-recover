@@ -834,13 +834,7 @@ async fn build_snapshot(
         .collect();
     let mut session_ids = HashMap::new();
     let mut placeholders = HashMap::new();
-    let placeholder_index = state
-        .sessions
-        .iter()
-        .flat_map(|session| session.windows.iter().map(|link| link.index))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1000);
+    let placeholder_index = unused_window_index(state)?;
 
     for session in &state.sessions {
         if deferred.contains(session.id.as_str()) {
@@ -1356,6 +1350,17 @@ fn link_signature(session: &Session) -> BTreeSet<(String, i32)> {
         .iter()
         .map(|link| (link.window_id.clone(), link.index))
         .collect()
+}
+
+fn unused_window_index(state: &TmuxState) -> Result<i32> {
+    let used: HashSet<i32> = state
+        .sessions
+        .iter()
+        .flat_map(|session| session.windows.iter().map(|link| link.index))
+        .collect();
+    (0..=i32::MAX)
+        .find(|index| !used.contains(index))
+        .context("snapshot uses every representable tmux window index")
 }
 
 fn window_owners(state: &TmuxState) -> HashMap<String, Vec<(String, i32)>> {
@@ -2045,6 +2050,23 @@ mod tests {
         assert!(validate_layout(layout, 3).is_err());
         assert!(validate_layout("not-a-layout", 1).is_err());
         validate_layout("tiled", 9).unwrap();
+    }
+
+    #[test]
+    fn placeholder_window_index_uses_a_real_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let mut state = state(cwd, vec![pane("%0", 0, cwd, None)]);
+
+        state.sessions[0].windows[0].index = i32::MAX;
+        assert_eq!(unused_window_index(&state).unwrap(), 0);
+
+        state.sessions[0].windows[0].index = 0;
+        state.sessions[0].windows.push(WindowLink {
+            window_id: "@1".to_owned(),
+            index: 2,
+        });
+        assert_eq!(unused_window_index(&state).unwrap(), 1);
     }
 
     #[test]

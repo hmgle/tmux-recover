@@ -12,6 +12,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// can gain fields or be reformatted without forcing every snapshot on disk
 /// to be migrated too.
 pub const PROCESS_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const TMUX_PANE_BASE_INDEX_MAX: i32 = u16::MAX as i32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "encoding", rename_all = "snake_case")]
@@ -340,6 +341,13 @@ impl TmuxState {
             let mut linked_ids = HashSet::new();
             let mut linked_indices = HashSet::new();
             for link in &session.windows {
+                if link.index < 0 {
+                    bail!(
+                        "session {} has negative window index {}",
+                        session.name,
+                        link.index
+                    );
+                }
                 if !window_ids.contains(link.window_id.as_str()) {
                     bail!(
                         "session {} references missing window {}",
@@ -404,6 +412,31 @@ impl TmuxState {
             let pane_indices: HashSet<i32> = window.panes.iter().map(|item| item.index).collect();
             if pane_indices.len() != window.panes.len() {
                 bail!("window {} contains duplicate pane indexes", window.name);
+            }
+            if let Some(negative) = window.panes.iter().find(|pane| pane.index < 0) {
+                bail!(
+                    "window {} has negative pane index {}",
+                    window.name,
+                    negative.index
+                );
+            }
+            if let Some(first) = window.panes.first() {
+                if first.index > TMUX_PANE_BASE_INDEX_MAX {
+                    bail!(
+                        "window {} pane index range starts at {}, above tmux pane-base-index maximum {}",
+                        window.name,
+                        first.index,
+                        TMUX_PANE_BASE_INDEX_MAX
+                    );
+                }
+                for pair in window.panes.windows(2) {
+                    if pair[0].index.checked_add(1) != Some(pair[1].index) {
+                        bail!(
+                            "window {} pane indexes must be a contiguous ascending range",
+                            window.name
+                        );
+                    }
+                }
             }
             for pane in &window.panes {
                 if !seen_panes.insert(pane.id.as_str()) {
@@ -885,5 +918,88 @@ mod tests {
         };
         let error = format!("{:#}", state.validate().unwrap_err());
         assert!(error.contains("does not link"), "{error}");
+    }
+
+    #[test]
+    fn invalid_tmux_indexes_are_rejected() {
+        let pane = |id: &str, index: i32| Pane {
+            id: id.to_owned(),
+            index,
+            title: None,
+            cwd: PaneCwd::inspect(None),
+            current_command: None,
+            start_command: None,
+            start_path: None,
+            pid: None,
+            tty: None,
+            dead: false,
+            dead_status: None,
+            restart: None,
+            import_status: None,
+        };
+        let state = |window_index: i32, panes: Vec<Pane>| TmuxState {
+            sessions: vec![Session {
+                id: "$0".to_owned(),
+                name: "work".to_owned(),
+                group: None,
+                created_at: None,
+                active_window_id: Some("@0".to_owned()),
+                last_window_id: None,
+                windows: vec![WindowLink {
+                    window_id: "@0".to_owned(),
+                    index: window_index,
+                }],
+            }],
+            windows: vec![Window {
+                id: "@0".to_owned(),
+                name: "main".to_owned(),
+                layout: "tiled".to_owned(),
+                visible_layout: None,
+                width: 80,
+                height: 24,
+                zoomed: false,
+                automatic_rename: None,
+                active_pane_id: panes.first().map(|pane| pane.id.clone()),
+                panes,
+            }],
+        };
+
+        let error = format!(
+            "{:#}",
+            state(-1, vec![pane("%0", 0)]).validate().unwrap_err()
+        );
+        assert!(error.contains("negative window index"), "{error}");
+
+        let error = format!(
+            "{:#}",
+            state(0, vec![pane("%0", -1)]).validate().unwrap_err()
+        );
+        assert!(error.contains("negative pane index"), "{error}");
+
+        let error = format!(
+            "{:#}",
+            state(0, vec![pane("%0", 0), pane("%1", 2)])
+                .validate()
+                .unwrap_err()
+        );
+        assert!(error.contains("contiguous ascending range"), "{error}");
+
+        let error = format!(
+            "{:#}",
+            state(0, vec![pane("%0", TMUX_PANE_BASE_INDEX_MAX + 1)])
+                .validate()
+                .unwrap_err()
+        );
+        assert!(error.contains("pane-base-index maximum"), "{error}");
+
+        state(
+            i32::MAX,
+            vec![
+                pane("%0", TMUX_PANE_BASE_INDEX_MAX),
+                pane("%1", TMUX_PANE_BASE_INDEX_MAX + 1),
+            ],
+        )
+        .validate()
+        .unwrap();
     }
 }
