@@ -83,7 +83,12 @@ async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
     assert!(
         server
             .tmux()
-            .args(["set-hook", "-g", &hook, "display-message external-hook"])
+            .args([
+                "set-hook",
+                "-g",
+                &hook,
+                "display-message external-tmux-recover:state-changed-hook",
+            ])
             .status()
             .unwrap()
             .success()
@@ -104,7 +109,10 @@ async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("external-hook"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("external-tmux-recover:state-changed-hook")
+    );
 }
 
 #[tokio::test]

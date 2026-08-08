@@ -387,15 +387,11 @@ fn maybe_refresh_process_checkpoint(
 
 async fn install_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
     let client_name = client.client_name().await?;
-    let hook_command = format!(
-        "display-message -c {} {}",
-        quote(&client_name),
-        quote(EVENT_MESSAGE)
-    );
+    let hook_command = hook_command(&client_name);
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
         if let Some(existing) = hook_value(client, &name).await? {
-            if existing.contains(EVENT_MESSAGE) {
+            if owned_hook_client(&existing).is_some() {
                 client
                     .execute(&format!("set-hook -gu {}", quote(&name)))
                     .await
@@ -409,6 +405,16 @@ async fn install_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()>
     }
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
+        // Recheck immediately before writing. tmux has no conditional set-hook
+        // operation, so this cannot remove the final instruction-sized race,
+        // but it prevents an entry claimed since the cleanup pass from being
+        // overwritten after an arbitrarily long series of other hook checks.
+        if hook_value(client, &name).await?.is_some() {
+            let _ = remove_hooks(client, hook_slot).await;
+            bail!(
+                "tmux hook {name} became occupied during installation; choose another autosave.hook_slot"
+            );
+        }
         if let Err(error) = client
             .execute(&format!(
                 "set-hook -g {} {}",
@@ -421,16 +427,28 @@ async fn install_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()>
             let _ = remove_hooks(client, hook_slot).await;
             return Err(error);
         }
+        if hook_value(client, &name)
+            .await?
+            .as_deref()
+            .and_then(owned_hook_client)
+            != Some(client_name.as_str())
+        {
+            let _ = remove_hooks(client, hook_slot).await;
+            bail!("tmux hook {name} changed while it was being installed");
+        }
     }
     Ok(())
 }
 
 async fn remove_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
+    let client_name = client.client_name().await?;
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
         if hook_value(client, &name)
             .await?
-            .is_some_and(|value| value.contains(EVENT_MESSAGE))
+            .as_deref()
+            .and_then(owned_hook_client)
+            == Some(client_name.as_str())
         {
             client
                 .execute(&format!("set-hook -gu {}", quote(&name)))
@@ -439,6 +457,21 @@ async fn remove_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn hook_command(client_name: &str) -> String {
+    format!(
+        "display-message -c {} {}",
+        quote(client_name),
+        quote(EVENT_MESSAGE)
+    )
+}
+
+fn owned_hook_client(command: &str) -> Option<&str> {
+    let client = command
+        .strip_prefix("display-message -c ")?
+        .strip_suffix(&format!(" {EVENT_MESSAGE}"))?;
+    (!client.is_empty() && !client.chars().any(char::is_whitespace)).then_some(client)
 }
 
 async fn hook_value(client: &mut ControlClient, name: &str) -> Result<Option<String>> {
@@ -488,6 +521,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn hook_ownership_requires_the_complete_command_shape() {
+        assert_eq!(
+            owned_hook_client("display-message -c /dev/pts/4 tmux-recover:state-changed"),
+            Some("/dev/pts/4")
+        );
+        assert_eq!(
+            owned_hook_client("display-message -c client tmux-recover:state-changed trailing"),
+            None
+        );
+        assert_eq!(
+            owned_hook_client("display-message external-tmux-recover:state-changed-hook"),
+            None
+        );
+    }
 
     const SOCKET_KEY: &str = "socket-key";
 
