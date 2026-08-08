@@ -367,6 +367,117 @@ async fn restores_default_shell_panes_without_a_hold_command() {
     );
 }
 
+#[tokio::test]
+async fn backup_cleanup_failure_keeps_the_committed_restore_live() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    let cwd = server.directory.path();
+    success(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "restored", "-c"])
+            .arg(cwd),
+    );
+    let active_pane = output(server.tmux().args([
+        "split-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "restored",
+    ]));
+    success(
+        server
+            .tmux()
+            .args(["select-pane", "-t", active_pane.trim()]),
+    );
+    for index in 1..=8 {
+        success(
+            server
+                .tmux()
+                .args(["new-window", "-d", "-t"])
+                .arg(format!("restored:{index}"))
+                .arg("-c")
+                .arg(cwd),
+        );
+    }
+    let source = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    let snapshot = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        source.origin,
+        source.state,
+        source.diagnostics,
+    )
+    .unwrap();
+
+    server.stop();
+    success(server.tmux().args(["new-session", "-d", "-s", "old-one"]));
+    success(server.tmux().args(["new-session", "-d", "-s", "old-two"]));
+    let backup_name = format!("__tmux_recover_backup_{}_1", &snapshot.semantic_hash[..8]);
+    let killer_socket = server.socket.clone();
+    let killer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = Command::new("tmux")
+                .args(["-S"])
+                .arg(&killer_socket)
+                .args(["list-sessions", "-F", "#{session_name}"])
+                .output()
+                .unwrap();
+            let sessions = String::from_utf8_lossy(&output.stdout);
+            if sessions.lines().any(|name| name == "restored")
+                && sessions.lines().any(|name| name == backup_name)
+            {
+                let status = Command::new("tmux")
+                    .args(["-S"])
+                    .arg(&killer_socket)
+                    .args(["kill-session", "-t"])
+                    .arg(&backup_name)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore never exposed the new session and second backup together"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let mut client = ControlClient::connect_to(&server.socket, Some("old-one"))
+        .await
+        .unwrap();
+    let target = capture(&mut client, &server.socket).await.unwrap();
+    let config = RestoreConfig::default();
+    let options = restore_config_options(&config, true, false, None, false, None);
+    let plan = preflight(&snapshot, &target, &options).unwrap();
+    let report = apply(&mut client, &snapshot, &target, &plan).await;
+    killer.join().unwrap();
+    assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    assert_eq!(report.warnings.len(), 1, "{report:#?}");
+    assert!(report.warnings[0].contains("old-two"));
+    drop(client);
+
+    let restored = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    assert_eq!(restored.state.sessions.len(), 1);
+    assert_eq!(restored.state.sessions[0].name, "restored");
+}
+
 fn output(command: &mut Command) -> String {
     let output = command.output().unwrap();
     assert!(

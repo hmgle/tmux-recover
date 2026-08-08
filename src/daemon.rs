@@ -13,7 +13,6 @@ use crate::{
     util::socket_identity,
 };
 
-const HOOK_SLOT: u16 = 901;
 const EVENT_MESSAGE: &str = "tmux-recover:state-changed";
 const STRUCTURE_HOOKS: &[&str] = &[
     "after-kill-pane",
@@ -74,13 +73,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
     }
 
-    // Clear any hooks a crashed predecessor left behind before installing
-    // fresh ones, so a leftover set-hook doesn't linger pointed at a dead
-    // client once this daemon exits.
-    if let Err(error) = remove_hooks(&mut client).await {
-        tracing::debug!(error = %format!("{error:#}"), "no stale daemon hooks to remove");
-    }
-    install_hooks(&mut client).await?;
+    install_hooks(&mut client, config.autosave.hook_slot).await?;
     client.take_notifications();
     save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
@@ -127,7 +120,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
                         // longer be read reliably. Replace it and reinstall the
                         // hooks that were bound to the old client name.
                         if client.is_poisoned() {
-                            match reconnect(socket).await {
+                            match reconnect(socket, config.autosave.hook_slot).await {
                                 Ok(fresh) => {
                                     client = fresh;
                                     tracing::warn!("replaced a desynced control connection");
@@ -148,7 +141,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
     }
 
-    if let Err(error) = remove_hooks(&mut client).await {
+    if let Err(error) = remove_hooks(&mut client, config.autosave.hook_slot).await {
         tracing::warn!(error = %format!("{error:#}"), "failed to remove daemon hooks");
     }
     tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
@@ -176,6 +169,7 @@ async fn auto_restore(
     let options = restore_config_options(&config.restore, false, false, None, false, None);
     let plan =
         preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;
+    let _mutation_lock = store.acquire_mutation_lock()?;
     let safety = Snapshot::new(
         Some(format!("pre-auto-restore {}", snapshot.id)),
         SnapshotSource::Native {
@@ -186,7 +180,8 @@ async fn auto_restore(
         target.diagnostics.clone(),
     )?;
     store.commit(&safety, false)?;
-    store.pin(&safety.id)?;
+    store.mark_safety(&safety.id)?;
+    store.prune(&config.retention)?;
 
     let report = apply(client, &snapshot, target, &plan).await;
     let report_path = store.write_restore_report(&report)?;
@@ -200,6 +195,9 @@ async fn auto_restore(
             report_path.display(),
             report.error.as_deref().unwrap_or("unknown error")
         )));
+    }
+    for warning in &report.warnings {
+        tracing::warn!(warning, "automatic restore completed with cleanup warning");
     }
     tracing::info!(snapshot = %snapshot.id, report = %report_path.display(), "automatically restored snapshot");
     Ok(true)
@@ -223,11 +221,11 @@ impl From<anyhow::Error> for AutoRestoreError {
 
 /// Opens a replacement control connection and rebinds the hooks, which name the
 /// client they notify and so do not survive the old connection.
-async fn reconnect(socket: &Path) -> Result<ControlClient> {
+async fn reconnect(socket: &Path, hook_slot: u16) -> Result<ControlClient> {
     let mut client = ControlClient::connect(socket)
         .await
         .context("failed to reopen the tmux control connection")?;
-    install_hooks(&mut client).await?;
+    install_hooks(&mut client, hook_slot).await?;
     client.take_notifications();
     Ok(client)
 }
@@ -278,6 +276,7 @@ async fn save_if_changed(
         captured.state,
         captured.diagnostics,
     )?;
+    let _mutation_lock = store.acquire_mutation_lock()?;
     let outcome = store.commit(&snapshot, true)?;
     match outcome {
         CommitOutcome::Written => {
@@ -383,7 +382,7 @@ fn maybe_refresh_process_checkpoint(
     store.write_process_checkpoint(&checkpoint)
 }
 
-async fn install_hooks(client: &mut ControlClient) -> Result<()> {
+async fn install_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
     let client_name = client.client_name().await?;
     let hook_command = format!(
         "display-message -c {} {}",
@@ -391,28 +390,69 @@ async fn install_hooks(client: &mut ControlClient) -> Result<()> {
         quote(EVENT_MESSAGE)
     );
     for hook in STRUCTURE_HOOKS {
-        let name = format!("{hook}[{HOOK_SLOT}]");
-        client
+        let name = format!("{hook}[{hook_slot}]");
+        if let Some(existing) = hook_value(client, &name).await? {
+            if existing.contains(EVENT_MESSAGE) {
+                client
+                    .execute(&format!("set-hook -gu {}", quote(&name)))
+                    .await
+                    .with_context(|| format!("failed to remove stale tmux hook {name}"))?;
+            } else {
+                bail!(
+                    "tmux hook {name} is already occupied; set autosave.hook_slot to a free index instead of overwriting it"
+                );
+            }
+        }
+    }
+    for hook in STRUCTURE_HOOKS {
+        let name = format!("{hook}[{hook_slot}]");
+        if let Err(error) = client
             .execute(&format!(
                 "set-hook -g {} {}",
                 quote(&name),
                 quote(&hook_command)
             ))
             .await
-            .with_context(|| format!("failed to install tmux hook {hook}"))?;
+            .with_context(|| format!("failed to install tmux hook {hook}"))
+        {
+            let _ = remove_hooks(client, hook_slot).await;
+            return Err(error);
+        }
     }
     Ok(())
 }
 
-async fn remove_hooks(client: &mut ControlClient) -> Result<()> {
+async fn remove_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
     for hook in STRUCTURE_HOOKS {
-        let name = format!("{hook}[{HOOK_SLOT}]");
-        client
-            .execute(&format!("set-hook -gu {}", quote(&name)))
-            .await
-            .with_context(|| format!("failed to remove tmux hook {hook}"))?;
+        let name = format!("{hook}[{hook_slot}]");
+        if hook_value(client, &name)
+            .await?
+            .is_some_and(|value| value.contains(EVENT_MESSAGE))
+        {
+            client
+                .execute(&format!("set-hook -gu {}", quote(&name)))
+                .await
+                .with_context(|| format!("failed to remove tmux hook {hook}"))?;
+        }
     }
     Ok(())
+}
+
+async fn hook_value(client: &mut ControlClient, name: &str) -> Result<Option<String>> {
+    let output = client
+        .execute(&format!("show-hooks -g {}", quote(name)))
+        .await?;
+    if output.len() != 1 {
+        bail!(
+            "tmux returned {} records for hook {name}, expected one",
+            output.len()
+        );
+    }
+    let line = String::from_utf8(output[0].clone()).context("tmux returned a non-UTF-8 hook")?;
+    let value = line
+        .strip_prefix(&format!("{name} "))
+        .with_context(|| format!("tmux returned an invalid hook record for {name}"))?;
+    Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
 #[cfg(unix)]

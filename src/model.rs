@@ -185,6 +185,17 @@ impl Snapshot {
                 actual
             );
         }
+        let expected_id = format!(
+            "{}-{}",
+            self.created_at.format("%Y%m%dT%H%M%S%.6fZ"),
+            &actual[..16]
+        );
+        if self.id != expected_id {
+            bail!(
+                "snapshot id does not match its timestamp and semantic hash: expected {expected_id}, got {}",
+                self.id
+            );
+        }
         Ok(())
     }
 }
@@ -315,11 +326,19 @@ impl TmuxState {
     pub fn validate(&self) -> Result<()> {
         use std::collections::HashSet;
 
+        let session_ids: HashSet<&str> =
+            self.sessions.iter().map(|item| item.id.as_str()).collect();
+        if session_ids.len() != self.sessions.len() {
+            bail!("snapshot contains duplicate session IDs");
+        }
         let window_ids: HashSet<&str> = self.windows.iter().map(|item| item.id.as_str()).collect();
         if window_ids.len() != self.windows.len() {
             bail!("snapshot contains duplicate window IDs");
         }
+        let mut owned_window_ids = HashSet::new();
         for session in &self.sessions {
+            let mut linked_ids = HashSet::new();
+            let mut linked_indices = HashSet::new();
             for link in &session.windows {
                 if !window_ids.contains(link.window_id.as_str()) {
                     bail!(
@@ -328,6 +347,44 @@ impl TmuxState {
                         link.window_id
                     );
                 }
+                if !linked_ids.insert(link.window_id.as_str()) {
+                    bail!(
+                        "session {} links window {} more than once",
+                        session.name,
+                        link.window_id
+                    );
+                }
+                if !linked_indices.insert(link.index) {
+                    bail!(
+                        "session {} reuses window index {}",
+                        session.name,
+                        link.index
+                    );
+                }
+                owned_window_ids.insert(link.window_id.as_str());
+            }
+            if let Some(active) = &session.active_window_id
+                && !linked_ids.contains(active.as_str())
+            {
+                bail!(
+                    "session {} references active window {} that it does not link",
+                    session.name,
+                    active
+                );
+            }
+            if let Some(last) = &session.last_window_id
+                && !linked_ids.contains(last.as_str())
+            {
+                bail!(
+                    "session {} references last window {} that it does not link",
+                    session.name,
+                    last
+                );
+            }
+        }
+        for window in &self.windows {
+            if !owned_window_ids.contains(window.id.as_str()) {
+                bail!("window {} is not linked by any session", window.id);
             }
         }
         // tmux pane ids are unique per server, not per window, and consumers
@@ -343,6 +400,10 @@ impl TmuxState {
                 window.panes.iter().map(|item| item.id.as_str()).collect();
             if pane_ids.len() != window.panes.len() {
                 bail!("window {} contains duplicate pane IDs", window.name);
+            }
+            let pane_indices: HashSet<i32> = window.panes.iter().map(|item| item.index).collect();
+            if pane_indices.len() != window.panes.len() {
+                bail!("window {} contains duplicate pane indexes", window.name);
             }
             for pane in &window.panes {
                 if !seen_panes.insert(pane.id.as_str()) {
@@ -655,6 +716,8 @@ pub struct RestoreReport {
     pub replaced_existing: bool,
     pub cwd_fallbacks: Vec<CwdFallbackRecord>,
     pub restored_processes: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -747,11 +810,32 @@ mod tests {
             active_pane_id: Some(panes[0].id.clone()),
             panes,
         };
+        let session = |links: Vec<WindowLink>| Session {
+            id: "$0".to_owned(),
+            name: "work".to_owned(),
+            group: None,
+            created_at: None,
+            active_window_id: links.first().map(|link| link.window_id.clone()),
+            last_window_id: None,
+            windows: links,
+        };
+        let links = || {
+            vec![
+                WindowLink {
+                    window_id: "@0".to_owned(),
+                    index: 0,
+                },
+                WindowLink {
+                    window_id: "@1".to_owned(),
+                    index: 1,
+                },
+            ]
+        };
         // tmux pane ids are server-global. Two windows both claiming %0 would
         // silently collapse in every pane-keyed map a restore builds, so this
         // has to fail validation rather than validate and misbehave later.
         let state = TmuxState {
-            sessions: vec![],
+            sessions: vec![session(links())],
             windows: vec![
                 window("@0", vec![pane("%0")]),
                 window("@1", vec![pane("%0")]),
@@ -762,12 +846,44 @@ mod tests {
 
         // Distinct ids across windows stay valid.
         let state = TmuxState {
-            sessions: vec![],
+            sessions: vec![session(links())],
             windows: vec![
                 window("@0", vec![pane("%0")]),
                 window("@1", vec![pane("%1")]),
             ],
         };
         state.validate().unwrap();
+    }
+
+    #[test]
+    fn impossible_session_window_graphs_are_rejected() {
+        let state = TmuxState {
+            sessions: vec![Session {
+                id: "$0".to_owned(),
+                name: "work".to_owned(),
+                group: None,
+                created_at: None,
+                active_window_id: Some("@1".to_owned()),
+                last_window_id: None,
+                windows: vec![WindowLink {
+                    window_id: "@0".to_owned(),
+                    index: 0,
+                }],
+            }],
+            windows: vec![Window {
+                id: "@0".to_owned(),
+                name: "main".to_owned(),
+                layout: "tiled".to_owned(),
+                visible_layout: None,
+                width: 80,
+                height: 24,
+                zoomed: false,
+                automatic_rename: None,
+                active_pane_id: None,
+                panes: vec![],
+            }],
+        };
+        let error = format!("{:#}", state.validate().unwrap_err());
+        assert!(error.contains("does not link"), "{error}");
     }
 }

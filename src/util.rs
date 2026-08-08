@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -16,18 +19,36 @@ pub fn uid() -> u32 {
 }
 
 pub fn socket_from_tmux_env() -> Option<PathBuf> {
-    std::env::var_os("TMUX").and_then(|value| {
-        let value = value.to_string_lossy();
+    let value = std::env::var_os("TMUX")?;
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::OsString,
+            os::unix::ffi::{OsStrExt, OsStringExt},
+        };
+
+        let bytes = value.as_os_str().as_bytes();
+        let socket = bytes.split(|byte| *byte == b',').next()?;
+        (!socket.is_empty()).then(|| PathBuf::from(OsString::from_vec(socket.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
         value
+            .to_string_lossy()
             .split(',')
             .next()
             .filter(|part| !part.is_empty())
             .map(PathBuf::from)
-    })
+    }
+}
+
+pub fn canonical_socket_path(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path)
+        .with_context(|| format!("could not resolve tmux socket {}", path.display()))
 }
 
 pub fn socket_identity(path: &Path) -> Result<SocketIdentity> {
-    SocketIdentity::new(path, &hostname()?, uid())
+    SocketIdentity::new(&canonical_socket_path(path)?, &hostname()?, uid())
 }
 
 pub fn require_tmux_37(version: &str) -> Result<()> {
@@ -56,6 +77,9 @@ pub fn require_tmux_37(version: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use super::*;
 
     #[test]
@@ -63,5 +87,20 @@ mod tests {
         require_tmux_37("tmux 3.7b").unwrap();
         require_tmux_37("3.8").unwrap();
         assert!(require_tmux_37("tmux 3.6a").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_socket_paths_collapse_symlink_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("socket");
+        let alias = directory.path().join("alias");
+        std::fs::write(&socket, b"").unwrap();
+        symlink(&socket, &alias).unwrap();
+
+        assert_eq!(
+            canonical_socket_path(&alias).unwrap(),
+            canonical_socket_path(&socket).unwrap()
+        );
     }
 }

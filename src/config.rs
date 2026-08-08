@@ -68,6 +68,9 @@ impl Config {
         if self.retention.hourly_days < 0 || self.retention.daily_days < 0 {
             bail!("retention hourly_days and daily_days must not be negative");
         }
+        if self.retention.daily_days < self.retention.hourly_days {
+            bail!("retention daily_days must be greater than or equal to hourly_days");
+        }
         if self.restore.auto_bootstrap_max_age_seconds < 0 {
             bail!("restore auto_bootstrap_max_age_seconds must not be negative");
         }
@@ -91,6 +94,9 @@ pub struct AutosaveConfig {
     /// interval affordable at all.
     #[serde(with = "duration_seconds")]
     pub process_checkpoint_interval: Duration,
+    /// Indexed tmux hook slot used by the daemon. Existing hooks in this slot
+    /// are never overwritten unless they carry tmux-recover's own marker.
+    pub hook_slot: u16,
 }
 
 impl Default for AutosaveConfig {
@@ -100,6 +106,7 @@ impl Default for AutosaveConfig {
             min_interval: Duration::from_secs(30),
             poll_interval: Duration::from_secs(60),
             process_checkpoint_interval: Duration::from_secs(300),
+            hook_slot: 901,
         }
     }
 }
@@ -110,6 +117,7 @@ pub struct RetentionConfig {
     pub recent: usize,
     pub hourly_days: i64,
     pub daily_days: i64,
+    pub safety_snapshots: usize,
 }
 
 impl Default for RetentionConfig {
@@ -118,6 +126,7 @@ impl Default for RetentionConfig {
             recent: 100,
             hourly_days: 30,
             daily_days: 180,
+            safety_snapshots: 10,
         }
     }
 }
@@ -186,7 +195,9 @@ mod tests {
             config.autosave.process_checkpoint_interval,
             Duration::from_secs(300)
         );
+        assert_eq!(config.autosave.hook_slot, 901);
         assert_eq!(config.retention.recent, 100);
+        assert_eq!(config.retention.safety_snapshots, 10);
         assert!(!config.restore.auto);
         config.validate().unwrap();
     }
@@ -202,6 +213,14 @@ mod tests {
     fn rejects_zero_process_checkpoint_interval() {
         let mut config = Config::default();
         config.autosave.process_checkpoint_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_daily_retention_window_shorter_than_hourly() {
+        let mut config = Config::default();
+        config.retention.hourly_days = 31;
+        config.retention.daily_days = 30;
         assert!(config.validate().is_err());
     }
 

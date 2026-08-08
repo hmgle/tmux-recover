@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -31,6 +31,7 @@ pub struct SnapshotSummary {
     pub windows: usize,
     pub panes: usize,
     pub pinned: bool,
+    pub safety: bool,
     pub current: bool,
     pub path: PathBuf,
 }
@@ -73,6 +74,10 @@ enum Dedup {
 }
 
 pub struct DaemonLock {
+    _file: File,
+}
+
+pub struct MutationLock {
     _file: File,
 }
 
@@ -200,6 +205,13 @@ impl SnapshotStore {
                 pointer.schema_version
             );
         }
+        validate_path_component(&pointer.snapshot_id, "current snapshot id")?;
+        validate_path_component(&pointer.filename, "current snapshot filename")?;
+        let expected_json = format!("{}.json", pointer.snapshot_id);
+        let expected_zstd = format!("{}.json.zst", pointer.snapshot_id);
+        if pointer.filename != expected_json && pointer.filename != expected_zstd {
+            bail!("current snapshot filename does not match its snapshot id");
+        }
         let snapshot = self.load_path(&self.snapshots_dir().join(&pointer.filename))?;
         if snapshot.id != pointer.snapshot_id || snapshot.semantic_hash != pointer.semantic_hash {
             bail!("current snapshot pointer does not match its target");
@@ -270,6 +282,7 @@ impl SnapshotStore {
                     .map(|window| window.panes.len())
                     .sum(),
                 pinned: self.is_pinned(&snapshot.id),
+                safety: self.is_safety(&snapshot.id),
                 current: current_id.as_deref() == Some(snapshot.id.as_str()),
                 path,
             });
@@ -328,6 +341,16 @@ impl SnapshotStore {
         self.pins_dir().join(id).is_file()
     }
 
+    pub fn mark_safety(&self, id: &str) -> Result<()> {
+        let snapshot = self.load(id)?;
+        fs::create_dir_all(self.safety_dir())?;
+        atomic_write(&self.safety_dir().join(&snapshot.id), b"safety\n")
+    }
+
+    pub fn is_safety(&self, id: &str) -> bool {
+        self.safety_dir().join(id).is_file()
+    }
+
     /// Applies the retention policy. Runs after every autosave, so it works
     /// from filenames, the pins directory, and the current pointer only; it
     /// never parses or re-hashes a snapshot body.
@@ -338,6 +361,15 @@ impl SnapshotStore {
         let mut keep = HashSet::new();
         let mut hourly = BTreeMap::new();
         let mut daily = BTreeMap::new();
+
+        let safety_ids: Vec<String> = entries
+            .iter()
+            .filter(|entry| self.is_safety(&entry.id))
+            .map(|entry| entry.id.clone())
+            .collect();
+        keep.extend(safety_ids.iter().take(config.safety_snapshots).cloned());
+        let expired_safety_ids: Vec<&String> =
+            safety_ids.iter().skip(config.safety_snapshots).collect();
 
         for entry in entries.iter().take(config.recent) {
             keep.insert(entry.id.clone());
@@ -373,6 +405,12 @@ impl SnapshotStore {
         }
         if !removed.is_empty() {
             sync_directory(&self.snapshots_dir())?;
+        }
+        for id in &expired_safety_ids {
+            fs::remove_file(self.safety_dir().join(id))?;
+        }
+        if !expired_safety_ids.is_empty() {
+            sync_directory(&self.safety_dir())?;
         }
         Ok(removed)
     }
@@ -416,6 +454,7 @@ impl SnapshotStore {
     }
 
     pub fn write_restore_report(&self, report: &RestoreReport) -> Result<PathBuf> {
+        validate_path_component(&report.snapshot_id, "restore report snapshot id")?;
         let reports = self.root.join("restores");
         fs::create_dir_all(&reports)?;
         let path = reports.join(format!(
@@ -449,6 +488,25 @@ impl SnapshotStore {
         Ok(DaemonLock { _file: file })
     }
 
+    /// Serializes a complete store mutation across the daemon and short-lived
+    /// CLI processes. Individual files are atomically replaced, but operations
+    /// such as snapshot + current pointer + checkpoint span several files and
+    /// must not interleave.
+    pub fn acquire_mutation_lock(&self) -> Result<MutationLock> {
+        fs::create_dir_all(&self.root)?;
+        let path = self.root.join("mutation.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        FileExt::lock_exclusive(&file)
+            .with_context(|| format!("failed to lock {}", path.display()))?;
+        Ok(MutationLock { _file: file })
+    }
+
     fn snapshot_paths(&self) -> Result<Vec<PathBuf>> {
         if !self.snapshots_dir().exists() {
             return Ok(Vec::new());
@@ -472,6 +530,10 @@ impl SnapshotStore {
         self.root.join("pins")
     }
 
+    fn safety_dir(&self) -> PathBuf {
+        self.root.join("safety")
+    }
+
     fn current_path(&self) -> PathBuf {
         self.root.join("current.json")
     }
@@ -488,6 +550,14 @@ fn snapshot_id_from_path(path: &Path) -> Option<String> {
         .strip_suffix(".json.zst")
         .or_else(|| name.strip_suffix(".json"))?;
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn validate_path_component(value: &str, description: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("{description} must be a single relative path component");
+    }
+    Ok(())
 }
 
 /// Parses the leading `%Y%m%dT%H%M%S%.6fZ` timestamp out of a snapshot id
@@ -680,6 +750,69 @@ mod tests {
         assert!(store.is_pinned(&snapshot.id));
         store.unpin(&snapshot.id).unwrap();
         assert!(!store.is_pinned(&snapshot.id));
+    }
+
+    #[test]
+    fn safety_retention_is_bounded_and_separate_from_user_pins() {
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::imports(directory.path(), &StorageConfig::default());
+        let oldest = snapshot("oldest");
+        let middle = snapshot("middle");
+        let newest = snapshot("newest");
+        for item in [&oldest, &middle, &newest] {
+            store.commit(item, false).unwrap();
+            store.mark_safety(&item.id).unwrap();
+        }
+        store.pin(&oldest.id).unwrap();
+
+        let removed = store
+            .prune(&RetentionConfig {
+                recent: 0,
+                hourly_days: 0,
+                daily_days: 0,
+                safety_snapshots: 1,
+            })
+            .unwrap();
+        assert_eq!(removed, vec![middle.id.clone()]);
+        assert!(store.is_pinned(&oldest.id));
+        assert!(!store.is_safety(&oldest.id));
+        assert!(store.is_safety(&newest.id));
+        assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_ids_and_artifact_names_cannot_escape_the_store() {
+        let mut snapshot = snapshot("one");
+        snapshot.id = "/tmp/outside".to_owned();
+        assert!(snapshot.validate().is_err());
+        assert!(validate_path_component("../outside", "test").is_err());
+        assert!(validate_path_component("nested/outside", "test").is_err());
+        validate_path_component("snapshot.json", "test").unwrap();
+    }
+
+    #[test]
+    fn mutation_lock_serializes_writers() {
+        let directory = tempdir().unwrap();
+        let store = SnapshotStore::imports(directory.path(), &StorageConfig::default());
+        let first = store.acquire_mutation_lock().unwrap();
+        let other_store = store.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _second = other_store.acquire_mutation_lock().unwrap();
+            sender.send(()).unwrap();
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the second writer acquired the lock before the first released it"
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]

@@ -225,6 +225,7 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
         confirm_replace()?;
     }
 
+    let _mutation_lock = target_store.acquire_mutation_lock()?;
     let safety_snapshot = Snapshot::new(
         Some(format!("pre-restore {}", snapshot.id)),
         SnapshotSource::Native {
@@ -235,12 +236,16 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
         target.diagnostics.clone(),
     )?;
     target_store.commit(&safety_snapshot, false)?;
-    target_store.pin(&safety_snapshot.id)?;
+    target_store.mark_safety(&safety_snapshot.id)?;
+    target_store.prune(&config.retention)?;
     println!("safety snapshot: {}", safety_snapshot.id);
 
     let report = apply(&mut client, &snapshot, &target, &plan).await;
     let report_path = target_store.write_restore_report(&report)?;
     println!("restore report: {}", report_path.display());
+    for warning in &report.warnings {
+        eprintln!("tmux-recover: warning: {warning}");
+    }
     match report.status {
         RestoreStatus::Succeeded => {
             println!("restored {}", snapshot.id);
@@ -334,6 +339,7 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         captured.state,
         captured.diagnostics,
     )?;
+    let _mutation_lock = store.acquire_mutation_lock()?;
     // A label is information the current snapshot does not already carry, so
     // structural dedup would silently discard it. `--pin` is different: it is a
     // property of a stored snapshot, so an unchanged save can pin the current
@@ -405,9 +411,10 @@ async fn list(data_dir: &Path, config: &Config, args: StoreArgs) -> Result<()> {
     }
     for item in summaries {
         println!(
-            "{}{}{}  {}  {}s/{}w/{}p  {}",
+            "{}{}{}{}  {}  {}s/{}w/{}p  {}",
             if item.current { "*" } else { " " },
             if item.pinned { "+" } else { " " },
+            if item.safety { "!" } else { " " },
             item.id,
             item.created_at.to_rfc3339(),
             item.sessions,
@@ -470,6 +477,7 @@ async fn validate(data_dir: &Path, config: &Config, args: SnapshotArgs) -> Resul
 
 async fn pin(data_dir: &Path, config: &Config, args: SnapshotArgs, should_pin: bool) -> Result<()> {
     let store = selected_store(data_dir, config, args.socket.as_deref(), args.imports).await?;
+    let _mutation_lock = store.acquire_mutation_lock()?;
     if should_pin {
         store.pin(&args.snapshot)?;
         println!("pinned {}", args.snapshot);
@@ -486,6 +494,7 @@ fn import_resurrect(data_dir: &Path, config: &Config, args: ImportResurrectArgs)
         result.snapshot.label = Some(label);
     }
     let store = SnapshotStore::imports(data_dir, &config.storage);
+    let _mutation_lock = store.acquire_mutation_lock()?;
     // Structural dedup is wrong for an import. Two resurrect files can describe
     // the same layout and still be different history -- different source paths,
     // digests, and labels, none of which the structural hash covers. Deduping

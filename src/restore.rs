@@ -341,6 +341,12 @@ fn validate_state_for_restore(state: &TmuxState) -> Result<()> {
         if window.layout.is_empty() {
             bail!("window {} has no layout", window.name);
         }
+        if let Some(pane) = window.panes.iter().find(|pane| pane.dead) {
+            bail!(
+                "pane {} is dead; dead panes cannot currently be restored without changing their state",
+                pane.id
+            );
+        }
         validate_layout(&window.layout, window.panes.len())
             .with_context(|| format!("window {} has an invalid layout", window.name))?;
     }
@@ -439,6 +445,13 @@ fn validate_layout(layout: &str, expected_panes: usize) -> Result<()> {
     if bytes.len() < 6 || !bytes[..4].iter().all(u8::is_ascii_hexdigit) || bytes[4] != b',' {
         bail!("layout is neither a known name nor a checksummed layout tree");
     }
+    let expected_checksum = u16::from_str_radix(&layout[..4], 16)?;
+    let actual_checksum = tmux_layout_checksum(&bytes[5..]);
+    if actual_checksum != expected_checksum {
+        bail!(
+            "layout checksum mismatch: expected {expected_checksum:04x}, got {actual_checksum:04x}"
+        );
+    }
     let mut parser = LayoutParser {
         input: bytes,
         position: 5,
@@ -451,6 +464,12 @@ fn validate_layout(layout: &str, expected_panes: usize) -> Result<()> {
         bail!("layout contains {panes} panes, but the window contains {expected_panes}");
     }
     Ok(())
+}
+
+fn tmux_layout_checksum(layout: &[u8]) -> u16 {
+    layout.iter().fold(0u16, |checksum, byte| {
+        checksum.rotate_right(1).wrapping_add(u16::from(*byte))
+    })
 }
 
 struct LayoutParser<'a> {
@@ -566,7 +585,7 @@ pub async fn apply(
 ) -> RestoreReport {
     let started_at = Utc::now();
     match apply_inner(client, snapshot, target, plan).await {
-        Ok(restored_processes) => RestoreReport {
+        Ok(success) => RestoreReport {
             schema_version: 1,
             snapshot_id: snapshot.id.clone(),
             started_at,
@@ -574,7 +593,8 @@ pub async fn apply(
             status: RestoreStatus::Succeeded,
             replaced_existing: !plan.target_is_bootstrap,
             cwd_fallbacks: plan.cwd_fallbacks.clone(),
-            restored_processes,
+            restored_processes: success.restored_processes,
+            warnings: success.warnings,
             error: None,
         },
         Err(failure) => RestoreReport {
@@ -590,9 +610,15 @@ pub async fn apply(
             replaced_existing: !plan.target_is_bootstrap,
             cwd_fallbacks: plan.cwd_fallbacks.clone(),
             restored_processes: 0,
+            warnings: Vec::new(),
             error: Some(format!("{:#}", failure.error)),
         },
     }
+}
+
+struct ApplySuccess {
+    restored_processes: usize,
+    warnings: Vec<String>,
 }
 
 struct ApplyFailure {
@@ -605,23 +631,35 @@ async fn apply_inner(
     snapshot: &Snapshot,
     target: &CaptureResult,
     plan: &RestorePlan,
-) -> std::result::Result<usize, ApplyFailure> {
+) -> std::result::Result<ApplySuccess, ApplyFailure> {
     let token = snapshot.semantic_hash.get(..8).unwrap_or("restore");
-    let backups: Vec<BackupSession> = target
+    let mut reserved_names: HashSet<String> = target
         .state
         .sessions
         .iter()
-        .enumerate()
-        .map(|(index, session)| BackupSession {
+        .chain(&snapshot.state.sessions)
+        .map(|session| session.name.clone())
+        .collect();
+    let mut backups = Vec::with_capacity(target.state.sessions.len());
+    for (index, session) in target.state.sessions.iter().enumerate() {
+        let base = format!("__tmux_recover_backup_{token}_{index}");
+        let mut temporary_name = base.clone();
+        let mut suffix = 1usize;
+        while !reserved_names.insert(temporary_name.clone()) {
+            temporary_name = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        backups.push(BackupSession {
             id: session.id.clone(),
             original_name: session.name.clone(),
-            temporary_name: format!("__tmux_recover_backup_{token}_{index}"),
-        })
-        .collect();
+            temporary_name,
+        });
+    }
     let mut renamed = Vec::new();
     let mut new_sessions = Vec::new();
+    let mut clients = Vec::new();
 
-    let result = async {
+    let reversible_result = async {
         for backup in &backups {
             execute_empty(
                 client,
@@ -635,7 +673,7 @@ async fn apply_inner(
             renamed.push(backup.clone());
         }
 
-        let clients = list_clients(client).await?;
+        clients = list_clients(client).await?;
         let built = build_snapshot(client, snapshot, plan, &mut new_sessions).await?;
         let first_session = snapshot
             .state
@@ -670,21 +708,62 @@ async fn apply_inner(
         restore_session_windows(&mut final_client, &snapshot.state, &built.sessions).await?;
         restore_pane_titles(&mut final_client, &snapshot.state, &built.panes).await?;
         switch_clients(&mut final_client, &clients, &backups, &built, snapshot).await?;
-        for backup in &backups {
-            execute_empty(
-                &mut final_client,
-                &format!("kill-session -t {}", quote(&backup.id)),
-            )
-            .await?;
-        }
-        Ok::<usize, anyhow::Error>(restored_processes)
+        Ok::<(usize, ControlClient), anyhow::Error>((restored_processes, final_client))
     }
     .await;
 
-    match result {
-        Ok(count) => Ok(count),
+    match reversible_result {
+        Ok((restored_processes, mut final_client)) => {
+            // Everything a user asked to restore now exists and ordinary clients
+            // have been switched to it. Deleting backups is the irreversible
+            // commit phase: once even one backup is gone, rolling back by deleting
+            // the new state would risk losing both versions. Cleanup errors are
+            // therefore reported as warnings while the restored state stays live.
+            let mut warnings = Vec::new();
+            for backup in &backups {
+                if let Err(error) = execute_empty(
+                    &mut final_client,
+                    &format!("kill-session -t {}", quote(&backup.id)),
+                )
+                .await
+                {
+                    warnings.push(format!(
+                        "restored state is live, but backup session {} ({}) could not be removed: {error:#}",
+                        backup.original_name, backup.id
+                    ));
+                }
+            }
+            Ok(ApplySuccess {
+                restored_processes,
+                warnings,
+            })
+        }
         Err(error) => {
             let mut rollback_complete = true;
+            for attachment in &clients {
+                if attachment.control {
+                    continue;
+                }
+                let Some(backup) = backups
+                    .iter()
+                    .find(|backup| backup.id == attachment.session_id)
+                else {
+                    continue;
+                };
+                if execute_empty(
+                    client,
+                    &format!(
+                        "switch-client -c {} -t {}",
+                        quote(&attachment.name),
+                        quote(&backup.id)
+                    ),
+                )
+                .await
+                .is_err()
+                {
+                    rollback_complete = false;
+                }
+            }
             for session_id in new_sessions.iter().rev() {
                 if execute_empty(client, &format!("kill-session -t {}", quote(session_id)))
                     .await
@@ -1408,7 +1487,7 @@ mod tests {
 
     use super::*;
 
-    const LAYOUT: &str = "abcd,80x24,0,0{40x24,0,0,0,39x24,41,0,1}";
+    const LAYOUT: &str = "tiled";
     const SOCKET_KEY: &str = "socket-key";
 
     fn restart(executable: &str, trusted: bool) -> RestartSpec {
@@ -1961,8 +2040,29 @@ mod tests {
     fn validates_layout_syntax_and_pane_count() {
         let layout = "8b77,159x43,0,0[159x21,0,0{79x21,0,0,302,79x21,80,0,306},159x21,0,22{79x21,0,22,303,79x21,80,22,305}]";
         validate_layout(layout, 4).unwrap();
+        let bad_checksum = format!("0{}", &layout[1..]);
+        assert!(validate_layout(&bad_checksum, 4).is_err());
         assert!(validate_layout(layout, 3).is_err());
         assert!(validate_layout("not-a-layout", 1).is_err());
         validate_layout("tiled", 9).unwrap();
+    }
+
+    #[test]
+    fn dead_panes_are_rejected_before_restore_mutates_tmux() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let mut snapshot = snapshot(cwd, vec![pane("%0", 0, cwd, None)], Some(1));
+        snapshot.state.windows[0].panes[0].dead = true;
+        snapshot = Snapshot::new(
+            snapshot.label,
+            snapshot.source,
+            snapshot.origin,
+            snapshot.state,
+            snapshot.diagnostics,
+        )
+        .unwrap();
+        let target = bootstrap_target(cwd);
+        let error = preflight(&snapshot, &target, &options(&[], None)).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot currently be restored"));
     }
 }

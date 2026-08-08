@@ -291,3 +291,42 @@ fn save_honours_label_and_pin_when_the_structure_is_unchanged() {
     );
     assert_eq!(pins(data.path()), vec![stored.id.clone()]);
 }
+
+#[cfg(unix)]
+#[test]
+fn socket_aliases_share_one_store_identity() {
+    use std::os::unix::fs::symlink;
+
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let alias = server._directory.path().join("tmux-alias.sock");
+    symlink(&server.socket, &alias).unwrap();
+
+    let output = save(data.path(), &alias, &[]);
+    assert!(output.starts_with("saved "), "{output}");
+    assert_eq!(
+        std::fs::read_dir(data.path().join("sockets"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    for socket in [&alias, &server.socket] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+            .arg("--data-dir")
+            .arg(data.path())
+            .args(["list", "--socket"])
+            .arg(socket)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1s/1w/1p"),
+            "list via {} missed the saved snapshot",
+            socket.display()
+        );
+    }
+}

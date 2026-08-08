@@ -72,6 +72,42 @@ impl TestServer {
 }
 
 #[tokio::test]
+async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let hook = format!("after-new-window[{}]", config.autosave.hook_slot);
+    assert!(
+        server
+            .tmux()
+            .args(["set-hook", "-g", &hook, "display-message external-hook"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tmux_recover::daemon::run(&server.socket, data.path(), &config),
+    )
+    .await
+    .expect("daemon hung while checking the occupied hook slot")
+    .unwrap_err();
+    assert!(format!("{result:#}").contains("already occupied"));
+
+    let output = server
+        .tmux()
+        .args(["show-hooks", "-g", &hook])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("external-hook"));
+}
+
+#[tokio::test]
 async fn polling_saves_cwd_changes_without_structure_hooks() {
     let Some(server) = TestServer::start_shell() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
@@ -448,6 +484,7 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
             min_interval: Duration::from_millis(50),
             poll_interval: Duration::from_millis(100),
             process_checkpoint_interval: Duration::from_millis(1),
+            hook_slot: AutosaveConfig::default().hook_slot,
         },
         restore: RestoreConfig {
             process_allowlist: vec!["sleep".to_owned()],
