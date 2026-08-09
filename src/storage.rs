@@ -140,6 +140,11 @@ pub enum CommitOutcome {
     Unchanged,
 }
 
+pub(crate) struct CommitResult {
+    pub outcome: CommitOutcome,
+    pub structural_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dedup {
     /// Skip the write when the current snapshot already holds this structure
@@ -185,6 +190,16 @@ impl SnapshotStore {
     }
 
     pub fn commit(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
+        Ok(self
+            .commit_with(snapshot, set_current, Dedup::OnUnchangedStructure)?
+            .outcome)
+    }
+
+    pub(crate) fn commit_with_structural_hash(
+        &self,
+        snapshot: &Snapshot,
+        set_current: bool,
+    ) -> Result<CommitResult> {
         self.commit_with(snapshot, set_current, Dedup::OnUnchangedStructure)
     }
 
@@ -193,7 +208,9 @@ impl SnapshotStore {
     /// not already hold -- a label, for instance -- where reporting `Unchanged`
     /// would silently discard what the user asked for.
     pub fn commit_always(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
-        self.commit_with(snapshot, set_current, Dedup::Never)
+        Ok(self
+            .commit_with(snapshot, set_current, Dedup::Never)?
+            .outcome)
     }
 
     fn commit_with(
@@ -201,7 +218,7 @@ impl SnapshotStore {
         snapshot: &Snapshot,
         set_current: bool,
         dedup: Dedup,
-    ) -> Result<CommitOutcome> {
+    ) -> Result<CommitResult> {
         snapshot.validate()?;
         fs::create_dir_all(self.snapshots_dir())?;
         fs::create_dir_all(self.pins_dir())?;
@@ -233,7 +250,10 @@ impl SnapshotStore {
             && current.origin == snapshot.origin
             && current.state.structural_hash()? == structural_hash
         {
-            return Ok(CommitOutcome::Unchanged);
+            return Ok(CommitResult {
+                outcome: CommitOutcome::Unchanged,
+                structural_hash,
+            });
         }
 
         let extension = if self.compression { "json.zst" } else { "json" };
@@ -256,7 +276,10 @@ impl SnapshotStore {
             };
             atomic_write(&self.current_path(), &serde_json::to_vec_pretty(&pointer)?)?;
         }
-        Ok(CommitOutcome::Written)
+        Ok(CommitResult {
+            outcome: CommitOutcome::Written,
+            structural_hash,
+        })
     }
 
     /// Reads and structurally validates the current pointer without touching
@@ -827,11 +850,18 @@ mod tests {
         let store =
             SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
         let first = snapshot("one");
-        assert_eq!(store.commit(&first, true).unwrap(), CommitOutcome::Written);
-        let duplicate = snapshot("one");
+        let first_commit = store.commit_with_structural_hash(&first, true).unwrap();
+        assert_eq!(first_commit.outcome, CommitOutcome::Written);
         assert_eq!(
-            store.commit(&duplicate, true).unwrap(),
-            CommitOutcome::Unchanged
+            first_commit.structural_hash,
+            first.state.structural_hash().unwrap()
+        );
+        let duplicate = snapshot("one");
+        let duplicate_commit = store.commit_with_structural_hash(&duplicate, true).unwrap();
+        assert_eq!(duplicate_commit.outcome, CommitOutcome::Unchanged);
+        assert_eq!(
+            duplicate_commit.structural_hash,
+            duplicate.state.structural_hash().unwrap()
         );
         assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(

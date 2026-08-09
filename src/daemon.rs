@@ -318,7 +318,8 @@ async fn save_if_changed(
         captured.state,
         captured.diagnostics,
     )?;
-    let outcome = store.commit(&snapshot, true)?;
+    let commit = store.commit_with_structural_hash(&snapshot, true)?;
+    let outcome = commit.outcome;
     match outcome {
         CommitOutcome::Written => {
             let removed = store.prune(&config.retention)?;
@@ -328,10 +329,9 @@ async fn save_if_changed(
             // unconditionally rather than waiting for the checkpoint
             // interval, since the processes were already captured for this
             // snapshot.
-            let structural_hash = snapshot.state.structural_hash()?;
             let checkpoint = ProcessCheckpoint::capture(
                 snapshot.id.clone(),
-                structural_hash,
+                commit.structural_hash,
                 checkpoint_origin,
                 &snapshot.state,
             )?;
@@ -340,9 +340,13 @@ async fn save_if_changed(
             }
         }
         CommitOutcome::Unchanged => {
-            if let Err(error) =
-                maybe_refresh_process_checkpoint(store, config, &snapshot, checkpoint_origin)
-            {
+            if let Err(error) = maybe_refresh_process_checkpoint(
+                store,
+                config,
+                &snapshot,
+                commit.structural_hash,
+                checkpoint_origin,
+            ) {
                 tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
             }
         }
@@ -361,6 +365,7 @@ fn maybe_refresh_process_checkpoint(
     store: &SnapshotStore,
     config: &Config,
     snapshot: &Snapshot,
+    structural_hash: String,
     origin: ProcessCheckpointOrigin,
 ) -> Result<()> {
     // `commit` already confirmed this snapshot's structural state matches
@@ -407,7 +412,6 @@ fn maybe_refresh_process_checkpoint(
         return Ok(());
     }
 
-    let structural_hash = snapshot.state.structural_hash()?;
     let checkpoint =
         ProcessCheckpoint::capture(base_snapshot_id, structural_hash, origin, &snapshot.state)?;
     // A future timestamp has to be replaced even when nothing else changed,
@@ -471,6 +475,17 @@ mod tests {
             socket_key: SOCKET_KEY.to_owned(),
             server_started_at: Some(1),
         }
+    }
+
+    fn refresh_process_checkpoint(store: &SnapshotStore, config: &Config, snapshot: &Snapshot) {
+        maybe_refresh_process_checkpoint(
+            store,
+            config,
+            snapshot,
+            snapshot.state.structural_hash().unwrap(),
+            origin(),
+        )
+        .unwrap();
     }
 
     /// Structurally identical snapshots that differ only in what the pane is
@@ -604,7 +619,7 @@ mod tests {
 
         let idle = snapshot(cwd, None);
         assert_eq!(store.commit(&idle, true).unwrap(), CommitOutcome::Written);
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
         let first = store.read_process_checkpoint().unwrap().unwrap();
         assert_eq!(
             first.base_snapshot_id,
@@ -620,7 +635,7 @@ mod tests {
             "a process-only change must not create a history snapshot"
         );
         std::thread::sleep(Duration::from_millis(2));
-        maybe_refresh_process_checkpoint(&store, &config, &busy, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &busy);
 
         let second = store.read_process_checkpoint().unwrap().unwrap();
         assert_ne!(second.process_hash, first.process_hash);
@@ -641,14 +656,14 @@ mod tests {
         store.commit(&idle, true).unwrap();
 
         let patient = config(Duration::from_secs(300));
-        maybe_refresh_process_checkpoint(&store, &patient, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &patient, &idle);
         let first = store.read_process_checkpoint().unwrap().unwrap();
 
         // The gate is measured against the sidecar's own captured_at, so this
         // holds even though the call below shares no in-memory state with the
         // one above: a daemon restart cannot force an extra write either.
         let busy = snapshot(cwd, Some("/usr/bin/nvim"));
-        maybe_refresh_process_checkpoint(&store, &patient, &busy, origin()).unwrap();
+        refresh_process_checkpoint(&store, &patient, &busy);
         assert_eq!(
             store.read_process_checkpoint().unwrap().unwrap(),
             first,
@@ -658,7 +673,7 @@ mod tests {
         // Once due, the same change is written.
         let eager = config(Duration::from_millis(1));
         std::thread::sleep(Duration::from_millis(2));
-        maybe_refresh_process_checkpoint(&store, &eager, &busy, origin()).unwrap();
+        refresh_process_checkpoint(&store, &eager, &busy);
         assert_ne!(
             store
                 .read_process_checkpoint()
@@ -679,10 +694,10 @@ mod tests {
         let idle = snapshot(cwd, None);
         store.commit(&idle, true).unwrap();
 
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
         let first = store.read_process_checkpoint().unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
 
         // captured_at would move if this had been rewritten, so comparing the
         // whole checkpoint proves the write was skipped rather than repeated.
@@ -698,7 +713,7 @@ mod tests {
         let config = config(Duration::from_secs(300));
         let idle = snapshot(cwd, None);
         store.commit(&idle, true).unwrap();
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
 
         // Stand in for the clock moving backwards (NTP correction, VM restore,
         // manual change): the sidecar's captured_at is now far in the future.
@@ -709,7 +724,7 @@ mod tests {
         // Elapsed time is negative, so a plain `>= interval` test would judge
         // this not-yet-due for the next 30 days. The process hash has not
         // changed either, so only the rollback check can force this write.
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
         let reanchored = store.read_process_checkpoint().unwrap().unwrap();
         assert!(
             reanchored.captured_at < stranded.captured_at,
@@ -730,7 +745,7 @@ mod tests {
         let config = config(Duration::from_secs(300));
         let idle = snapshot(cwd, None);
         store.commit(&idle, true).unwrap();
-        maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &idle);
         let first = store.read_process_checkpoint().unwrap().unwrap();
 
         // A structural change publishes a new current snapshot, which leaves
@@ -750,7 +765,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.commit(&moved, true).unwrap(), CommitOutcome::Written);
-        maybe_refresh_process_checkpoint(&store, &config, &moved, origin()).unwrap();
+        refresh_process_checkpoint(&store, &config, &moved);
 
         let second = store.read_process_checkpoint().unwrap().unwrap();
         assert_ne!(second.base_snapshot_id, first.base_snapshot_id);
