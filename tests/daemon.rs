@@ -67,9 +67,23 @@ impl TestServer {
         command
     }
 
-    fn stop(&self) {
-        let _ = self.tmux().arg("kill-server").status();
-        std::thread::sleep(Duration::from_millis(50));
+    fn stop(&self) -> bool {
+        let _ = self.tmux().arg("kill-server").output();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stopped = self
+                .tmux()
+                .arg("has-session")
+                .output()
+                .is_ok_and(|output| !output.status.success());
+            if stopped {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -228,12 +242,13 @@ async fn polling_saves_cwd_changes_without_structure_hooks() {
     wait_until(Duration::from_secs(15), || store.has_current()).await;
     let cwd = server.directory.path().join("poll cwd");
     std::fs::create_dir(&cwd).unwrap();
+    let expected_cwd = cwd.canonicalize().unwrap();
     let shell_command = format!("cd -- '{}'", cwd.display());
     // Keys sent before the shell reaches its first prompt are dropped, and
     // under load that prompt can be slow. Re-send until tmux reports the new
     // cwd, then let the poll notice it.
     let started = tokio::time::Instant::now();
-    while !pane_cwd(&server, "daemon:0.0").is_some_and(|path| path == cwd) {
+    while !pane_cwd(&server, "daemon:0.0").is_some_and(|path| path == expected_cwd) {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "shell never changed directory"
@@ -263,7 +278,7 @@ async fn polling_saves_cwd_changes_without_structure_hooks() {
                 .cwd
                 .path
                 .as_ref()
-                .is_some_and(|path| path.to_path_buf().is_ok_and(|path| path == cwd))
+                .is_some_and(|path| path.to_path_buf().is_ok_and(|path| path == expected_cwd))
         })
     })
     .await;
@@ -275,7 +290,7 @@ async fn polling_saves_cwd_changes_without_structure_hooks() {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -324,7 +339,7 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
     .unwrap();
     store.commit(&source, true).unwrap();
 
-    server.stop();
+    assert!(server.stop(), "source tmux server did not stop");
     // Auto-restore is a deliberate one-shot at daemon startup, and its gate
     // requires the pane's foreground command to equal the default shell. The
     // developer's interactive shell breaks that in two ways: `new-session -d`
@@ -471,7 +486,7 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
     .unwrap();
     store.commit(&source, true).unwrap();
 
-    server.stop();
+    assert!(server.stop(), "source tmux server did not stop");
     // This test needs auto-restore to be *attempted* so preflight can fail. A
     // bootstrap running the developer's interactive shell can be rejected by
     // the gate before that (see `auto_restore_only_replaces_a_young_shell_bootstrap`),
@@ -682,7 +697,7 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
 
     // Restore into a fresh bootstrap server on the same socket.
     let snapshot = store.load_current().unwrap();
-    server.stop();
+    assert!(server.stop(), "source tmux server did not stop");
     // tmux reports `start_time` in whole seconds, and a test restarts the
     // server far faster than a real crash-and-recover would. Step 7 below is
     // about behaviour across a generation boundary, so make the generations
@@ -976,6 +991,10 @@ async fn wait_for_default_shell_pane(server: &TestServer, pane: &str) {
         .unwrap_or_default()
         .to_owned();
     assert!(!expected.is_empty(), "tmux reported no default-shell");
+    let resolved = std::fs::canonicalize(&default_shell)
+        .ok()
+        .and_then(|path| path.file_name().map(ToOwned::to_owned))
+        .and_then(|name| name.to_str().map(ToOwned::to_owned));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -991,7 +1010,7 @@ async fn wait_for_default_shell_pane(server: &TestServer, pane: &str) {
             .output()
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        if current.as_deref() == Some(expected.as_str()) {
+        if current.as_deref() == Some(expected.as_str()) || current == resolved {
             return;
         }
         assert!(

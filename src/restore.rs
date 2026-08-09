@@ -385,10 +385,29 @@ pub fn target_is_auto_bootstrap(target: &CaptureResult) -> bool {
     let Some(default_shell) = target.default_shell.as_deref() else {
         return false;
     };
-    let expected = Path::new(default_shell)
+    pane.current_command
+        .as_deref()
+        .is_some_and(|current| default_shell_command_matches(default_shell, current))
+}
+
+fn default_shell_command_matches(default_shell: &str, current_command: &str) -> bool {
+    let configured_name = Path::new(default_shell)
         .file_name()
         .and_then(|name| name.to_str());
-    pane.current_command.as_deref() == expected
+    if configured_name == Some(current_command) {
+        return true;
+    }
+
+    // tmux reports the process name supplied by the platform. Most systems
+    // preserve the configured basename (`/bin/sh` -> `sh`), while macOS
+    // reports the resolved executable (`/bin/sh` -> `bash`). Accept either
+    // spelling without weakening the one-pane bootstrap gate.
+    std::fs::canonicalize(default_shell)
+        .ok()
+        .and_then(|path| path.file_name().map(ToOwned::to_owned))
+        .as_deref()
+        .and_then(|name| name.to_str())
+        == Some(current_command)
 }
 
 fn validate_fallback(path: &Path) -> Result<PathBuf> {
@@ -1652,6 +1671,24 @@ mod tests {
 
     fn allowlist() -> Vec<String> {
         vec!["vim".to_owned(), "nvim".to_owned()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_bootstrap_accepts_the_resolved_default_shell_name() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_shell = directory.path().join("real-shell");
+        let configured_shell = directory.path().join("configured-shell");
+        std::fs::write(&real_shell, b"").unwrap();
+        symlink(&real_shell, &configured_shell).unwrap();
+
+        let mut target = bootstrap_target(directory.path());
+        target.default_shell = Some(configured_shell.to_string_lossy().into_owned());
+        target.state.windows[0].panes[0].current_command = Some("real-shell".to_owned());
+
+        assert!(target_is_auto_bootstrap(&target));
     }
 
     /// A restored program has to be interruptible without destroying the pane.
