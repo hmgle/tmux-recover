@@ -1,8 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +21,9 @@ use crate::{
 pub struct SnapshotStore {
     root: PathBuf,
     compression: bool,
+    identity_cache: Arc<Mutex<HashMap<PathBuf, CachedSnapshotIdentity>>>,
+    #[cfg(test)]
+    identity_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +94,46 @@ struct StoredSnapshotIdentity {
     id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedSnapshotIdentity {
+    fingerprint: FileFingerprint,
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl FileFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Written,
@@ -114,16 +159,20 @@ pub struct MutationLock {
 
 impl SnapshotStore {
     pub fn for_socket(data_dir: &Path, socket_key: &str, config: &StorageConfig) -> Self {
-        Self {
-            root: data_dir.join("sockets").join(socket_key),
-            compression: config.zstd,
-        }
+        Self::new(data_dir.join("sockets").join(socket_key), config.zstd)
     }
 
     pub fn imports(data_dir: &Path, config: &StorageConfig) -> Self {
+        Self::new(data_dir.join("imports"), config.zstd)
+    }
+
+    fn new(root: PathBuf, compression: bool) -> Self {
         Self {
-            root: data_dir.join("imports"),
-            compression: config.zstd,
+            root,
+            compression,
+            identity_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            identity_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -327,6 +376,51 @@ impl SnapshotStore {
         Ok(summaries)
     }
 
+    fn cached_snapshot_identity(&self, path: &Path) -> Result<String> {
+        let before = fs::metadata(path)
+            .with_context(|| format!("failed to stat snapshot {}", path.display()))?;
+        let fingerprint = FileFingerprint::from_metadata(&before);
+        if let Some(cached) = self
+            .identity_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot identity cache is poisoned"))?
+            .get(path)
+            .filter(|cached| cached.fingerprint == fingerprint)
+        {
+            return Ok(cached.id.clone());
+        }
+
+        #[cfg(test)]
+        self.identity_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let identity = read_snapshot_identity(path)?;
+        let after = fs::metadata(path)
+            .with_context(|| format!("failed to restat snapshot {}", path.display()))?;
+        if fingerprint != FileFingerprint::from_metadata(&after) {
+            bail!(
+                "snapshot {} changed while its identity was read",
+                path.display()
+            );
+        }
+        self.identity_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot identity cache is poisoned"))?
+            .insert(
+                path.to_path_buf(),
+                CachedSnapshotIdentity {
+                    fingerprint,
+                    id: identity.id.clone(),
+                },
+            );
+        Ok(identity.id)
+    }
+
+    fn forget_snapshot_identity(&self, path: &Path) {
+        if let Ok(mut cache) = self.identity_cache.lock() {
+            cache.remove(path);
+        }
+    }
+
     /// Directory scan that reads only each body ID. Entries whose filename is
     /// not a recognisable snapshot id or does not match that content ID are
     /// omitted, which keeps them out of retention decisions entirely.
@@ -340,8 +434,8 @@ impl SnapshotStore {
                 );
                 continue;
             };
-            let content_id = match read_snapshot_identity(&path) {
-                Ok(identity) => identity.id,
+            let content_id = match self.cached_snapshot_identity(&path) {
+                Ok(id) => id,
                 Err(error) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -458,6 +552,7 @@ impl SnapshotStore {
                 continue;
             }
             fs::remove_file(&entry.path)?;
+            self.forget_snapshot_identity(&entry.path);
             removed.push(entry.id);
         }
         if !removed.is_empty() {
@@ -1150,6 +1245,34 @@ mod tests {
             .unwrap();
         assert!(removed.is_empty());
         assert!(renamed.is_file());
+    }
+
+    #[test]
+    fn retention_reuses_cached_identities_for_unchanged_history() {
+        use std::sync::atomic::Ordering;
+
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        store.commit(&snapshot("one"), false).unwrap();
+        store.commit(&snapshot("two"), false).unwrap();
+
+        store.entries().unwrap();
+        assert_eq!(store.identity_reads.load(Ordering::Relaxed), 2);
+        store.clone().entries().unwrap();
+        assert_eq!(
+            store.identity_reads.load(Ordering::Relaxed),
+            2,
+            "unchanged history should be served entirely from the shared cache"
+        );
+
+        store.commit(&snapshot("three"), false).unwrap();
+        store.entries().unwrap();
+        assert_eq!(
+            store.identity_reads.load(Ordering::Relaxed),
+            3,
+            "only a newly written snapshot should require another body read"
+        );
     }
 
     #[test]
