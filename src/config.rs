@@ -94,8 +94,9 @@ pub struct AutosaveConfig {
     /// interval affordable at all.
     #[serde(with = "duration_seconds")]
     pub process_checkpoint_interval: Duration,
-    /// Indexed tmux hook slot used by the daemon. Existing hooks in this slot
-    /// are never overwritten unless they carry tmux-recover's own marker.
+    /// Indexed tmux hook slot used by the daemon. The persistent event command
+    /// is installed atomically only when the slot is empty; an identical hook
+    /// from an earlier daemon is reused and every other command is preserved.
     pub hook_slot: u16,
 }
 

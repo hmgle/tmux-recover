@@ -7,33 +7,11 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::{
     config::Config,
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
-    restore::{apply, preflight, quote, restore_config_options, target_is_auto_bootstrap},
+    restore::{apply, preflight, restore_config_options, target_is_auto_bootstrap},
     storage::{CommitOutcome, SnapshotStore},
-    tmux::{capture::capture, control::ControlClient},
+    tmux::{capture::capture, control::ControlClient, hooks},
     util::socket_identity,
 };
-
-const EVENT_MESSAGE: &str = "tmux-recover:state-changed";
-const STRUCTURE_HOOKS: &[&str] = &[
-    "after-kill-pane",
-    "after-new-session",
-    "after-new-window",
-    "after-rename-session",
-    "after-rename-window",
-    "after-resize-pane",
-    "after-resize-window",
-    "after-select-layout",
-    "after-select-pane",
-    "after-select-window",
-    "after-split-window",
-    "client-session-changed",
-    "session-closed",
-    "session-created",
-    "session-renamed",
-    "session-window-changed",
-    "window-linked",
-    "window-unlinked",
-];
 
 pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> {
     config.validate()?;
@@ -73,7 +51,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
     }
 
-    install_hooks(&mut client, config.autosave.hook_slot).await?;
+    hooks::install(&mut client, config.autosave.hook_slot).await?;
     client.take_notifications();
     save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
@@ -83,6 +61,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
     poll.tick().await;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut hook_event = Box::pin(hooks::wait_for_event(socket));
 
     let mut pending = None;
     let mut last_write = Instant::now();
@@ -98,6 +77,15 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
                 if matches!(notification, crate::tmux::control::Notification::Exit(_)) {
                     bail!("tmux server closed its control connection");
                 }
+                let now = Instant::now();
+                pending = Some(max(
+                    now + config.autosave.debounce,
+                    last_write + config.autosave.min_interval,
+                ));
+            }
+            result = &mut hook_event => {
+                result?;
+                hook_event = Box::pin(hooks::wait_for_event(socket));
                 let now = Instant::now();
                 pending = Some(max(
                     now + config.autosave.debounce,
@@ -141,9 +129,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
     }
 
-    if let Err(error) = remove_hooks(&mut client, config.autosave.hook_slot).await {
-        tracing::warn!(error = %format!("{error:#}"), "failed to remove daemon hooks");
-    }
     tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
     Ok(())
 }
@@ -219,13 +204,12 @@ impl From<anyhow::Error> for AutoRestoreError {
     }
 }
 
-/// Opens a replacement control connection and rebinds the hooks, which name the
-/// client they notify and so do not survive the old connection.
+/// Opens a replacement control connection and verifies the persistent hooks.
 async fn reconnect(socket: &Path, hook_slot: u16) -> Result<ControlClient> {
     let mut client = ControlClient::connect(socket)
         .await
         .context("failed to reopen the tmux control connection")?;
-    install_hooks(&mut client, hook_slot).await?;
+    hooks::install(&mut client, hook_slot).await?;
     client.take_notifications();
     Ok(client)
 }
@@ -385,112 +369,6 @@ fn maybe_refresh_process_checkpoint(
     store.write_process_checkpoint(&checkpoint)
 }
 
-async fn install_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
-    let client_name = client.client_name().await?;
-    let hook_command = hook_command(&client_name);
-    for hook in STRUCTURE_HOOKS {
-        let name = format!("{hook}[{hook_slot}]");
-        if let Some(existing) = hook_value(client, &name).await? {
-            if owned_hook_client(&existing).is_some() {
-                client
-                    .execute(&format!("set-hook -gu {}", quote(&name)))
-                    .await
-                    .with_context(|| format!("failed to remove stale tmux hook {name}"))?;
-            } else {
-                bail!(
-                    "tmux hook {name} is already occupied; set autosave.hook_slot to a free index instead of overwriting it"
-                );
-            }
-        }
-    }
-    for hook in STRUCTURE_HOOKS {
-        let name = format!("{hook}[{hook_slot}]");
-        // Recheck immediately before writing. tmux has no conditional set-hook
-        // operation, so this cannot remove the final instruction-sized race,
-        // but it prevents an entry claimed since the cleanup pass from being
-        // overwritten after an arbitrarily long series of other hook checks.
-        if hook_value(client, &name).await?.is_some() {
-            let _ = remove_hooks(client, hook_slot).await;
-            bail!(
-                "tmux hook {name} became occupied during installation; choose another autosave.hook_slot"
-            );
-        }
-        if let Err(error) = client
-            .execute(&format!(
-                "set-hook -g {} {}",
-                quote(&name),
-                quote(&hook_command)
-            ))
-            .await
-            .with_context(|| format!("failed to install tmux hook {hook}"))
-        {
-            let _ = remove_hooks(client, hook_slot).await;
-            return Err(error);
-        }
-        if hook_value(client, &name)
-            .await?
-            .as_deref()
-            .and_then(owned_hook_client)
-            != Some(client_name.as_str())
-        {
-            let _ = remove_hooks(client, hook_slot).await;
-            bail!("tmux hook {name} changed while it was being installed");
-        }
-    }
-    Ok(())
-}
-
-async fn remove_hooks(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
-    let client_name = client.client_name().await?;
-    for hook in STRUCTURE_HOOKS {
-        let name = format!("{hook}[{hook_slot}]");
-        if hook_value(client, &name)
-            .await?
-            .as_deref()
-            .and_then(owned_hook_client)
-            == Some(client_name.as_str())
-        {
-            client
-                .execute(&format!("set-hook -gu {}", quote(&name)))
-                .await
-                .with_context(|| format!("failed to remove tmux hook {hook}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn hook_command(client_name: &str) -> String {
-    format!(
-        "display-message -c {} {}",
-        quote(client_name),
-        quote(EVENT_MESSAGE)
-    )
-}
-
-fn owned_hook_client(command: &str) -> Option<&str> {
-    let client = command
-        .strip_prefix("display-message -c ")?
-        .strip_suffix(&format!(" {EVENT_MESSAGE}"))?;
-    (!client.is_empty() && !client.chars().any(char::is_whitespace)).then_some(client)
-}
-
-async fn hook_value(client: &mut ControlClient, name: &str) -> Result<Option<String>> {
-    let output = client
-        .execute(&format!("show-hooks -g {}", quote(name)))
-        .await?;
-    if output.len() != 1 {
-        bail!(
-            "tmux returned {} records for hook {name}, expected one",
-            output.len()
-        );
-    }
-    let line = String::from_utf8(output[0].clone()).context("tmux returned a non-UTF-8 hook")?;
-    let value = line
-        .strip_prefix(&format!("{name} "))
-        .with_context(|| format!("tmux returned an invalid hook record for {name}"))?;
-    Ok((!value.is_empty()).then(|| value.to_owned()))
-}
-
 #[cfg(unix)]
 async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -521,22 +399,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn hook_ownership_requires_the_complete_command_shape() {
-        assert_eq!(
-            owned_hook_client("display-message -c /dev/pts/4 tmux-recover:state-changed"),
-            Some("/dev/pts/4")
-        );
-        assert_eq!(
-            owned_hook_client("display-message -c client tmux-recover:state-changed trailing"),
-            None
-        );
-        assert_eq!(
-            owned_hook_client("display-message external-tmux-recover:state-changed-hook"),
-            None
-        );
-    }
 
     const SOCKET_KEY: &str = "socket-key";
 
