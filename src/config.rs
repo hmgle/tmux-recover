@@ -97,6 +97,7 @@ pub struct AutosaveConfig {
     /// Indexed tmux hook slot used by the daemon. The persistent event command
     /// is installed atomically only when the slot is empty; an identical hook
     /// from an earlier daemon is reused and every other command is preserved.
+    /// An occupied third-party slot disables hook events but polling continues.
     pub hook_slot: u16,
 }
 

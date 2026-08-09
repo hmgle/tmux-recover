@@ -51,7 +51,12 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
     }
 
-    hooks::install(&mut client, config.autosave.hook_slot).await?;
+    let mut hook_events_enabled = install_hooks_or_fallback(
+        &mut client,
+        config.autosave.hook_slot,
+        config.autosave.poll_interval,
+    )
+    .await?;
     client.take_notifications();
     save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
@@ -61,7 +66,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
     poll.tick().await;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let mut hook_event = Box::pin(hooks::wait_for_event(socket));
+    let mut hook_event = Box::pin(wait_for_hook_event(socket, hook_events_enabled));
 
     let mut pending = None;
     let mut last_write = Instant::now();
@@ -85,7 +90,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
             }
             result = &mut hook_event => {
                 result?;
-                hook_event = Box::pin(hooks::wait_for_event(socket));
+                hook_event = Box::pin(wait_for_hook_event(socket, hook_events_enabled));
                 let now = Instant::now();
                 pending = Some(max(
                     now + config.autosave.debounce,
@@ -106,11 +111,23 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
                         // A command that failed partway through a sequence left
                         // blocks tmux will never send, so this connection can no
                         // longer be read reliably. Replace it and reinstall the
-                        // hooks that were bound to the old client name.
+                        // persistent hooks on the replacement connection.
                         if client.is_poisoned() {
-                            match reconnect(socket, config.autosave.hook_slot).await {
-                                Ok(fresh) => {
+                            match reconnect(
+                                socket,
+                                config.autosave.hook_slot,
+                                config.autosave.poll_interval,
+                                hook_events_enabled,
+                            ).await {
+                                Ok((fresh, fresh_hook_events_enabled)) => {
                                     client = fresh;
+                                    if fresh_hook_events_enabled != hook_events_enabled {
+                                        hook_events_enabled = fresh_hook_events_enabled;
+                                        hook_event = Box::pin(wait_for_hook_event(
+                                            socket,
+                                            hook_events_enabled,
+                                        ));
+                                    }
                                     tracing::warn!("replaced a desynced control connection");
                                 }
                                 Err(error) => {
@@ -204,14 +221,51 @@ impl From<anyhow::Error> for AutoRestoreError {
     }
 }
 
-/// Opens a replacement control connection and verifies the persistent hooks.
-async fn reconnect(socket: &Path, hook_slot: u16) -> Result<ControlClient> {
+async fn install_hooks_or_fallback(
+    client: &mut ControlClient,
+    hook_slot: u16,
+    poll_interval: Duration,
+) -> Result<bool> {
+    match hooks::install(client, hook_slot).await {
+        Ok(()) => Ok(true),
+        Err(error @ hooks::InstallError::Occupied { .. }) => {
+            tracing::warn!(
+                error = %error,
+                ?poll_interval,
+                "tmux hook slot is unavailable; continuing with polling only"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn wait_for_hook_event(socket: &Path, enabled: bool) -> Result<()> {
+    if enabled {
+        hooks::wait_for_event(socket).await
+    } else {
+        std::future::pending().await
+    }
+}
+
+/// Opens a replacement control connection and verifies persistent hooks when
+/// the daemon has not already fallen back to polling.
+async fn reconnect(
+    socket: &Path,
+    hook_slot: u16,
+    poll_interval: Duration,
+    hook_events_enabled: bool,
+) -> Result<(ControlClient, bool)> {
     let mut client = ControlClient::connect(socket)
         .await
         .context("failed to reopen the tmux control connection")?;
-    hooks::install(&mut client, hook_slot).await?;
+    let hook_events_enabled = if hook_events_enabled {
+        install_hooks_or_fallback(&mut client, hook_slot, poll_interval).await?
+    } else {
+        false
+    };
     client.take_notifications();
-    Ok(client)
+    Ok((client, hook_events_enabled))
 }
 
 fn server_is_young(target: &crate::tmux::capture::CaptureResult, config: &Config) -> bool {

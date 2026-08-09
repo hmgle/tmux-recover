@@ -204,9 +204,10 @@ safety_snapshots = 10
 
 The daemon installs a persistent `wait-for` event hook with tmux's atomic
 set-if-absent option update. An identical hook from an earlier daemon is reused;
-every other command in `hook_slot` is left untouched and causes startup to fail.
-The hook remains available across daemon reconnects and restarts, so shutdown
-never needs a racy check-and-remove operation. Use a dedicated slot.
+every other command in `hook_slot` is left untouched and makes the daemon warn
+and continue with low-frequency polling. The hook remains available across
+daemon reconnects and restarts, so shutdown never needs a racy check-and-remove
+operation. Use a dedicated slot when event-driven saves are important.
 
 Versions that predate the persistent hook used a client-specific
 `display-message -c ... tmux-recover:state-changed` command. If a crashed old

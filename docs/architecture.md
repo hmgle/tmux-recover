@@ -42,8 +42,9 @@ entry or rejects an occupied one without overwriting it. The static
 `wait-for -S tmux-recover:state-changed` command signals a latched channel that
 a separate waiter consumes. An identical entry from an earlier daemon is safe
 to reuse across control-client reconnects and daemon restarts. Other commands
-are preserved and abort startup. Persistent hooks are not removed on shutdown,
-which avoids creating a symmetric check-versus-unset race.
+are preserved; the daemon warns and continues with low-frequency polling.
+Persistent hooks are not removed on shutdown, which avoids creating a symmetric
+check-versus-unset race.
 
 Older releases installed client-specific
 `display-message -c ... tmux-recover:state-changed` entries. Startup recognizes

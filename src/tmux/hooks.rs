@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use thiserror::Error;
 use tokio::process::Command;
 
 use super::control::ControlClient;
@@ -29,29 +30,53 @@ const STRUCTURE_HOOKS: &[&str] = &[
     "window-unlinked",
 ];
 
+#[derive(Debug, Error)]
+pub enum InstallError {
+    #[error("{message}")]
+    Legacy { message: String },
+    #[error("{message}")]
+    Occupied { message: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 /// Installs persistent event hooks without ever replacing an occupied slot.
 ///
 /// Hooks are tmux array options, so `set-option -o` is an atomic set-if-absent
 /// operation inside the tmux server. An identical hook left by an earlier
 /// daemon is reusable because it signals a stable channel rather than naming
 /// an ephemeral control client.
-pub async fn install(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
+pub async fn install(
+    client: &mut ControlClient,
+    hook_slot: u16,
+) -> std::result::Result<(), InstallError> {
     let mut legacy = Vec::new();
+    let mut occupied = Vec::new();
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
-        if value(client, &name)
-            .await?
-            .as_deref()
-            .is_some_and(is_legacy_event_command)
-        {
-            legacy.push(name);
+        if let Some(command) = value(client, &name).await? {
+            if is_legacy_event_command(&command) {
+                legacy.push(name);
+            } else if command != EVENT_COMMAND {
+                occupied.push(name);
+            }
         }
     }
     if !legacy.is_empty() {
-        bail!(
-            "legacy tmux-recover hooks block migration: {}. Stop any old daemon, then explicitly unset only these entries on the target socket or choose another autosave.hook_slot; automatic removal is disabled so a concurrently replaced hook cannot be deleted",
-            legacy.join(", ")
-        );
+        return Err(InstallError::Legacy {
+            message: format!(
+                "legacy tmux-recover hooks block migration: {}. Stop any old daemon, then explicitly unset only these entries on the target socket or choose another autosave.hook_slot; automatic removal is disabled so a concurrently replaced hook cannot be deleted",
+                legacy.join(", ")
+            ),
+        });
+    }
+    if !occupied.is_empty() {
+        return Err(InstallError::Occupied {
+            message: format!(
+                "tmux hook slots are already occupied and were not overwritten: {}",
+                occupied.join(", ")
+            ),
+        });
     }
 
     for hook in STRUCTURE_HOOKS {
@@ -60,27 +85,62 @@ pub async fn install(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
         match client.execute(&command).await {
             Ok(output) if output.is_empty() => {}
             Ok(output) => {
-                bail!(
+                return Err(anyhow::anyhow!(
                     "tmux returned {} records while installing hook {name}, expected none",
                     output.len()
-                );
+                )
+                .into());
             }
             Err(set_error) => {
                 let existing = value(client, &name).await?;
-                if existing.as_deref().is_some_and(is_legacy_event_command) {
-                    bail!(
-                        "legacy tmux-recover hook {name} appeared during installation and was not removed; stop any old daemon, explicitly unset it on the target socket, or choose another autosave.hook_slot"
-                    );
-                } else if existing.as_deref() != Some(EVENT_COMMAND) {
-                    bail!(
-                        "tmux hook {name} is already occupied and was not overwritten: {set_error:#}"
-                    );
+                match existing.as_deref() {
+                    Some(command) if is_legacy_event_command(command) => {
+                        return Err(InstallError::Legacy {
+                            message: format!(
+                                "legacy tmux-recover hook {name} appeared during installation and was not removed; stop any old daemon, explicitly unset it on the target socket, or choose another autosave.hook_slot"
+                            ),
+                        });
+                    }
+                    Some(EVENT_COMMAND) => {}
+                    Some(_) => {
+                        return Err(InstallError::Occupied {
+                            message: format!(
+                                "tmux hook {name} is already occupied and was not overwritten: {set_error:#}"
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "failed to install tmux hook {name}, but its slot is still empty: {set_error:#}"
+                        )
+                        .into());
+                    }
                 }
             }
         }
 
-        if value(client, &name).await?.as_deref() != Some(EVENT_COMMAND) {
-            bail!("tmux hook {name} changed while installation was being verified");
+        match value(client, &name).await?.as_deref() {
+            Some(EVENT_COMMAND) => {}
+            Some(command) if is_legacy_event_command(command) => {
+                return Err(InstallError::Legacy {
+                    message: format!(
+                        "legacy tmux-recover hook {name} appeared while installation was being verified and was not removed; stop any old daemon, explicitly unset it on the target socket, or choose another autosave.hook_slot"
+                    ),
+                });
+            }
+            Some(_) => {
+                return Err(InstallError::Occupied {
+                    message: format!(
+                        "tmux hook {name} was occupied by another command while installation was being verified"
+                    ),
+                });
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "tmux hook {name} disappeared while installation was being verified"
+                )
+                .into());
+            }
         }
     }
     Ok(())

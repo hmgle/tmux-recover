@@ -72,13 +72,21 @@ impl TestServer {
 }
 
 #[tokio::test]
-async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
+async fn daemon_polls_when_an_existing_hook_slot_is_occupied() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
         return;
     };
     let data = tempfile::tempdir().unwrap();
-    let config = Config::default();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(20),
+            min_interval: Duration::from_millis(30),
+            poll_interval: Duration::from_millis(50),
+            ..AutosaveConfig::default()
+        },
+        ..Config::default()
+    };
     let hook = format!("after-new-window[{}]", config.autosave.hook_slot);
     assert!(
         server
@@ -94,14 +102,36 @@ async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
             .success()
     );
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        tmux_recover::daemon::run(&server.socket, data.path(), &config),
-    )
-    .await
-    .expect("daemon hung while checking the occupied hook slot")
-    .unwrap_err();
-    assert!(format!("{result:#}").contains("already occupied"));
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    wait_until(Duration::from_secs(5), || store.has_current()).await;
+    let original = store.load_current().unwrap();
+    let original_path = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|snapshot| snapshot.current)
+        .unwrap()
+        .path;
+
+    // Nothing in tmux changed and no hook can report this filesystem damage.
+    // Only a later poll can notice that dedup can no longer validate current
+    // and repair it by publishing the fresh capture.
+    std::fs::write(original_path, b"{broken").unwrap();
+    wait_until(Duration::from_secs(5), || {
+        store
+            .load_current()
+            .is_ok_and(|snapshot| snapshot.id != original.id)
+    })
+    .await;
+    assert!(!task.is_finished(), "daemon exited instead of polling");
 
     let output = server
         .tmux()
@@ -113,6 +143,20 @@ async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
         String::from_utf8_lossy(&output.stdout)
             .contains("external-tmux-recover:state-changed-hook")
     );
+    let unused_hook = format!("after-new-session[{}]", config.autosave.hook_slot);
+    let output = server
+        .tmux()
+        .args(["show-hooks", "-g", &unused_hook])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("wait-for -S tmux-recover:state-changed"),
+        "hook preflight installed a partial event hook set"
+    );
+
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]
