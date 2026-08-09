@@ -119,10 +119,29 @@ tmux-recover list
 tmux-recover show current
 tmux-recover show current --json
 tmux-recover validate current
+
+# 输出 JSON，便于筛选或脚本处理。
+tmux-recover list --json
 ```
 
 列表前缀中，`*` 表示当前快照，`+` 表示用户 pin，`!` 表示有数量上限的恢复前安全
 快照。下面示例里的 `SNAPSHOT` 可替换成 `list` 输出的 ID。
+
+`list` 的普通输出按以下格式显示：
+
+```text
+<当前><pin><安全快照><快照 ID>  <创建时间>  <session>s/<window>w/<pane>p  <标签>
+```
+
+前三个位置分别表示当前、用户 pin 和恢复前安全快照；没有对应标记时显示空格。
+创建时间使用 UTC，ID 中的 `Z` 和时间列中的 `+00:00` 都表示 UTC。快照 ID 由
+UTC 创建时间和状态语义哈希的前 16 个十六进制字符组成。`s/w/p` 分别是 session、
+window 和 pane 的数量。最后一列是通过 `save --label` 设置的标签，没有标签时为空。
+
+例如，`*  20260809T133813.912729Z-b45b6e7b2e326e7a  ...  1s/3w/5p` 表示当前
+快照包含 1 个 session、3 个 window 和 5 个 pane；`  !...  pre-auto-restore ...`
+表示恢复前自动创建的安全快照。恢复指定历史时，使用完整 ID 或不会产生歧义的 ID
+前缀；日期本身可能匹配多个快照，因此不能作为可靠的唯一选择器。
 
 ```sh
 tmux-recover pin SNAPSHOT
@@ -154,6 +173,19 @@ tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
+快照默认绑定原始 hostname、uid 和 canonical tmux socket。如果明确要把快照迁移到
+其他主机、用户或 socket，先仔细检查快照，再显式跳过来源身份校验：
+
+```sh
+tmux-recover restore SNAPSHOT --dry-run --replace --allow-origin-mismatch
+tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
+```
+
+只有确认快照来源和内容可信时才使用 `--allow-origin-mismatch`。工作目录、布局、schema
+等其他恢复校验仍然会执行。`list`、`show`、`validate`、`import-resurrect` 和
+`restore --dry-run` 支持 `--json`。真实恢复加上 `--json` 时，会先输出 JSON 预检计划，
+随后输出人类可读的安全快照和报告信息，因此整个 stdout 不是单个 JSON 文档。
+
 每次真实恢复都会先把目标 server 保存成安全快照。commit point 之前的失败会恢复
 原 session 名称和客户端附着状态，结果会写入 restore report。
 
@@ -167,8 +199,9 @@ tmux-recover restore current --restore-processes
 ```
 
 只有 native restart metadata 标记为 trusted，且可执行文件名位于 allowlist 时才会
-启动。可在配置中按需修改 `restore.process_allowlist`。导入的 tmux-resurrect 命令
-文本永远不会执行。
+启动。可在配置中按需修改 `restore.process_allowlist`。恢复历史快照时只使用该快照
+保存的进程元数据；只有从同一 socket 显式恢复 `current` 时才会考虑实时进程检查点。
+导入的 tmux-resurrect 命令文本永远不会执行。
 
 ### 启用自动恢复
 
@@ -187,7 +220,8 @@ watcher 只会恢复刚创建的空白 server；较旧或非空 server 保持不
 
 ```sh
 tmux-recover import-resurrect \
-  ~/.local/share/tmux/resurrect/tmux_resurrect_20260801T212922.txt
+  ~/.local/share/tmux/resurrect/tmux_resurrect_20260801T212922.txt \
+  --label before-migration --pin
 
 tmux-recover list --imports
 tmux-recover show --imports current --json
@@ -216,6 +250,16 @@ tmux-recover daemon --socket /tmp/tmux-1000/other
 
 - Linux：`${XDG_CONFIG_HOME:-$HOME/.config}/tmux-recover/config.toml`
 - macOS：`~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
+
+如需对单次命令或另一套存储单独指定路径，可覆盖默认发现结果：
+
+```sh
+tmux-recover --config /path/to/config.toml list
+tmux-recover --data-dir /path/to/tmux-recover-data list
+```
+
+`--data-dir` 也可以通过 `TMUX_RECOVER_DATA_DIR` 设置。列出、查看和恢复同一个快照时，
+应保持 data directory 和 socket 选择一致。
 
 默认保留最新 100 份快照、30 天内每小时一份、180 天内每天一份，以及最新 10 份
 恢复前安全快照。current 和用户 pin 不会被清理。设置 `storage.zstd = true` 可启用

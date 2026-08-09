@@ -31,6 +31,21 @@ tmux-recover restore current --cwd-fallback /known/safe/path
 The fallback is never selected silently because restoring into the wrong
 directory can change the meaning of commands and relative paths.
 
+## A restore reports an origin mismatch
+
+Native snapshots record the hostname, uid, and canonical tmux socket that
+created them. Restore rejects a mismatch by default so a snapshot is not applied
+to an unintended server. When moving a verified snapshot to another host, user,
+or socket, bypass only this check explicitly and still review the dry-run:
+
+```sh
+tmux-recover restore SNAPSHOT --dry-run --replace --allow-origin-mismatch
+tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
+```
+
+This option does not bypass snapshot schema, layout, working-directory, or
+process trust checks. Do not use it merely to silence an unexplained error.
+
 ## The restore key reports a non-empty bootstrap
 
 The restore key only replaces a newly created, one-session/one-window/one-pane

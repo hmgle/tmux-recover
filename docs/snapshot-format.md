@@ -14,10 +14,11 @@ The top-level object contains:
 - structured diagnostics.
 
 The snapshot id is not an arbitrary label. Validation recomputes it from the
-six-digit UTC creation timestamp and the first 16 hexadecimal characters of the
-semantic hash. This keeps ids and every artifact filename derived from them to
-one safe path component. `current.json` likewise accepts only the exact
-`<snapshot-id>.json` or `<snapshot-id>.json.zst` filename.
+UTC creation timestamp in `%Y%m%dT%H%M%S%.6fZ` format (microsecond precision)
+and the first 16 hexadecimal characters of the semantic hash. This keeps ids
+and every artifact filename derived from them to one safe path component.
+`current.json` likewise accepts only the exact `<snapshot-id>.json` or
+`<snapshot-id>.json.zst` filename.
 
 The basename of every history file is cross-checked against the `id` inside its
 JSON body. Renaming valid `A.json` to `B.json` does not make it addressable as

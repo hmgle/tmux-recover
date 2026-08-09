@@ -130,11 +130,33 @@ tmux-recover list
 tmux-recover show current
 tmux-recover show current --json
 tmux-recover validate current
+
+# List history as JSON for filtering or scripts.
+tmux-recover list --json
 ```
 
 The list prefix uses `*` for the current snapshot, `+` for a user pin, and `!`
 for a bounded pre-restore safety snapshot. Use an ID printed by `list` wherever
 the examples use `SNAPSHOT`.
+
+Human-readable `list` output uses this format:
+
+```text
+<current><pin><safety><snapshot-id>  <created-at>  <sessions>s/<windows>w/<panes>p  <label>
+```
+
+The first three positions mark the current snapshot, a user pin, and a
+pre-restore safety snapshot; an unmarked position is shown as a space. Creation
+times are in UTC: `Z` in the ID and `+00:00` in the time column both mean UTC.
+The snapshot ID combines the UTC creation time with the first 16 hexadecimal
+characters of the state's semantic hash. `s/w/p` are the session, window, and
+pane counts. The final column is the optional label from `save --label`.
+
+For example, `*  20260809T133813.912729Z-b45b6e7b2e326e7a  ...  1s/3w/5p`
+identifies the current snapshot with 1 session, 3 windows, and 5 panes. A line
+starting with `  !` is a bounded safety snapshot created before a restore. Use
+the full ID, or a unique ID prefix, to restore a historical snapshot; a date by
+itself may match multiple snapshots and is not a reliable selector.
 
 ```sh
 tmux-recover pin SNAPSHOT
@@ -168,6 +190,22 @@ tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
+A snapshot is normally bound to its original hostname, uid, and canonical tmux
+socket. If you intentionally move a snapshot to another host, user, or socket,
+review it carefully and explicitly bypass that identity check:
+
+```sh
+tmux-recover restore SNAPSHOT --dry-run --replace --allow-origin-mismatch
+tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
+```
+
+Use `--allow-origin-mismatch` only for a snapshot whose source and contents you
+have verified. The cwd, layout, schema, and other restore checks still apply.
+For automation, `list`, `show`, `validate`, `import-resurrect`, and
+`restore --dry-run` support `--json`. A real restore with `--json` prints the
+JSON preflight plan followed by human-readable safety/report lines, so its
+entire stdout is not one JSON document.
+
 Every real restore first captures the target server as a safety snapshot.
 Failures before the commit point restore the previous session names and client
 attachments; the result is recorded in a restore report.
@@ -183,7 +221,10 @@ tmux-recover restore current --restore-processes
 
 Only native restart metadata marked trusted and allowlisted by executable name
 is launched. Edit `restore.process_allowlist` in the configuration to match
-your needs. Imported tmux-resurrect command strings are never executed.
+your needs. A historical snapshot uses only the process metadata captured in
+that snapshot; the live process checkpoint is considered only for an explicit
+`current` restore from the same socket. Imported tmux-resurrect command strings
+are never executed.
 
 ### Enable automatic recovery
 
@@ -203,7 +244,8 @@ autosaves.
 
 ```sh
 tmux-recover import-resurrect \
-  ~/.local/share/tmux/resurrect/tmux_resurrect_20260801T212922.txt
+  ~/.local/share/tmux/resurrect/tmux_resurrect_20260801T212922.txt \
+  --label before-migration --pin
 
 tmux-recover list --imports
 tmux-recover show --imports current --json
@@ -234,6 +276,17 @@ path and change only the values you need:
 
 - Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/tmux-recover/config.toml`
 - macOS: `~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
+
+For one command or a separate storage tree, override the discovered paths:
+
+```sh
+tmux-recover --config /path/to/config.toml list
+tmux-recover --data-dir /path/to/tmux-recover-data list
+```
+
+`--data-dir` can also be set through `TMUX_RECOVER_DATA_DIR`. Keep the same data
+directory and socket selection when listing, inspecting, and restoring a
+snapshot.
 
 The default retention policy keeps the latest 100 snapshots, one per hour for
 30 days, one per day for 180 days, and the latest 10 pre-restore safety
