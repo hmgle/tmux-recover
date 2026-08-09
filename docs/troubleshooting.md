@@ -31,6 +31,22 @@ tmux-recover restore current --cwd-fallback /known/safe/path
 The fallback is never selected silently because restoring into the wrong
 directory can change the meaning of commands and relative paths.
 
+## The restore key reports a non-empty bootstrap
+
+The restore key only replaces a newly created, one-session/one-window/one-pane
+bootstrap. A manually created window makes the target server real work, so the
+binding refuses to replace it and explains the reason in tmux's status line.
+Choose the snapshot explicitly and review the replacement first:
+
+```sh
+tmux-recover restore SNAPSHOT --dry-run --replace
+tmux-recover restore SNAPSHOT --replace --yes
+```
+
+Use the snapshot ID from `tmux-recover list`, rather than `current`, when the
+continuous daemon has already saved the manually created window as the latest
+snapshot.
+
 ## Autosave reports an occupied hook slot
 
 Another tmux configuration entry is using the configured indexed hook slot.

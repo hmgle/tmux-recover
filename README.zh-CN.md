@@ -88,6 +88,10 @@ server 启动一个后台 watcher。`prefix` + <kbd>Ctrl-s</kbd> 立即保存；
 server 中，`prefix` + <kbd>Ctrl-r</kbd> 恢复最新快照。如果按键与现有配置冲突，
 请修改上面的两个 option。
 
+恢复快捷键会把最后结果显示在 tmux 状态栏。如果 server 中已有手动创建的窗口，
+提示会直接说明恢复被安全策略拦截；请先选择要恢复的快照，再使用下面的 dry-run
+和 `--replace` 命令。
+
 如果 tmux 的 `PATH` 找不到 binary，请在启动 tmux 前导出绝对路径：
 
 ```sh

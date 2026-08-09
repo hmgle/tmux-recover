@@ -97,6 +97,11 @@ Press `prefix` + <kbd>Ctrl-s</kbd> to save and `prefix` + <kbd>Ctrl-r</kbd> to
 restore the latest snapshot into an empty bootstrap server. Change the two
 options above if those bindings conflict with your configuration.
 
+The restore binding reports the final result in tmux's status line. It will
+explain when a manually populated server is protected from replacement; use
+the explicit dry-run and `--replace` commands below after choosing the snapshot
+you intend to restore.
+
 If the binary is not in tmux's `PATH`, export its absolute path before starting
 tmux:
 

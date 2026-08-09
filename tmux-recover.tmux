@@ -13,7 +13,8 @@ fi
 save_key="$(tmux_recover_option '@tmux-recover-save-key' 'C-s')"
 restore_key="$(tmux_recover_option '@tmux-recover-restore-key' 'C-r')"
 binary_q="$(tmux_recover_shell_quote "$binary")"
+restore_runner_q="$(tmux_recover_shell_quote "$TMUX_RECOVER_PLUGIN_DIR/scripts/restore-key.sh")"
 
 tmux bind-key "$save_key" run-shell -b "$binary_q save"
-tmux bind-key "$restore_key" run-shell -b "$binary_q restore"
+tmux bind-key "$restore_key" run-shell -b "$restore_runner_q"
 tmux run-shell -b "$TMUX_RECOVER_PLUGIN_DIR/scripts/start-daemon.sh"
