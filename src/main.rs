@@ -18,9 +18,20 @@ use tmux_recover::{
 #[derive(Debug, Parser)]
 #[command(name = "tmux-recover", version, about)]
 struct Cli {
-    #[arg(long, global = true, env = "TMUX_RECOVER_DATA_DIR")]
+    #[arg(
+        long,
+        global = true,
+        env = "TMUX_RECOVER_DATA_DIR",
+        value_name = "DIR",
+        help = "Override the platform data directory (also TMUX_RECOVER_DATA_DIR)"
+    )]
     data_dir: Option<PathBuf>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Use this TOML configuration file instead of the platform default"
+    )]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -51,74 +62,118 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct SaveArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        help = "Use this tmux socket instead of $TMUX or the default socket"
+    )]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "LABEL",
+        help = "Attach a label; labeled saves are recorded even when unchanged"
+    )]
     label: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Keep the saved snapshot from retention pruning")]
     pin: bool,
 }
 
 #[derive(Debug, Args)]
 struct StoreArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        help = "Use this tmux socket instead of $TMUX or the default socket"
+    )]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Print snapshot summaries as JSON")]
     json: bool,
-    #[arg(long)]
+    #[arg(long, help = "Read the separate tmux-resurrect import history")]
     imports: bool,
 }
 
 #[derive(Debug, Args)]
 struct SnapshotArgs {
-    #[arg(default_value = "current")]
+    #[arg(
+        value_name = "SNAPSHOT",
+        default_value = "current",
+        help = "Snapshot ID, unique ID prefix, or current"
+    )]
     snapshot: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        help = "Use this tmux socket instead of $TMUX or the default socket"
+    )]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Print the snapshot or validation result as JSON")]
     json: bool,
-    #[arg(long)]
+    #[arg(long, help = "Read the separate tmux-resurrect import history")]
     imports: bool,
 }
 
 #[derive(Debug, Args)]
 struct RestoreArgs {
-    #[arg(default_value = "current")]
+    #[arg(
+        value_name = "SNAPSHOT",
+        default_value = "current",
+        help = "Snapshot ID, unique ID prefix, or current"
+    )]
     snapshot: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        help = "Restore into this tmux socket instead of $TMUX or the default socket"
+    )]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Only validate and print the restore plan")]
     dry_run: bool,
-    #[arg(long)]
+    #[arg(long, help = "Allow replacing a non-empty target server")]
     replace: bool,
-    #[arg(long)]
+    #[arg(long, help = "Skip the confirmation prompt required by --replace")]
     yes: bool,
-    #[arg(long, value_name = "HOME|PATH")]
+    #[arg(
+        long,
+        value_name = "HOME|PATH",
+        help = "Use HOME or PATH when a saved pane working directory is unavailable"
+    )]
     cwd_fallback: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Attempt trusted, allowlisted process restarts")]
     restore_processes: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Allow a verified restore across host, uid, or socket identity"
+    )]
     allow_origin_mismatch: bool,
-    #[arg(long)]
+    #[arg(long, help = "Print the preflight restore plan as JSON")]
     json: bool,
-    #[arg(long)]
+    #[arg(long, help = "Read the snapshot from the separate import history")]
     from_imports: bool,
 }
 
 #[derive(Debug, Args)]
 struct DaemonArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SOCKET",
+        help = "Watch this tmux socket instead of $TMUX or the default socket"
+    )]
     socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct ImportResurrectArgs {
+    #[arg(help = "Path to a tmux-resurrect v3 or v4 snapshot file")]
     path: PathBuf,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "LABEL",
+        help = "Attach a label to the imported snapshot"
+    )]
     label: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Keep the imported snapshot from retention pruning")]
     pin: bool,
-    #[arg(long)]
+    #[arg(long, help = "Print the import result as JSON")]
     json: bool,
 }
 

@@ -135,6 +135,14 @@ tmux-recover validate current
 tmux-recover list --json
 ```
 
+Use `--help` to see the available commands and the options for any command:
+
+```sh
+tmux-recover --help
+tmux-recover save --help
+tmux-recover restore --help
+```
+
 The list prefix uses `*` for the current snapshot, `+` for a user pin, and `!`
 for a bounded pre-restore safety snapshot. Use an ID printed by `list` wherever
 the examples use `SNAPSHOT`.

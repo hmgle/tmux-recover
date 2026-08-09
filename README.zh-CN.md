@@ -124,6 +124,14 @@ tmux-recover validate current
 tmux-recover list --json
 ```
 
+使用 `--help` 可以查看全部命令以及某个命令的参数说明：
+
+```sh
+tmux-recover --help
+tmux-recover save --help
+tmux-recover restore --help
+```
+
 列表前缀中，`*` 表示当前快照，`+` 表示用户 pin，`!` 表示有数量上限的恢复前安全
 快照。下面示例里的 `SNAPSHOT` 可替换成 `list` 输出的 ID。
 
