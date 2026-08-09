@@ -35,20 +35,21 @@ Capturing inside the lock is intentional: if an older capture waited for the
 lock after a newer save, publishing it afterwards would move `current`
 backwards even though every individual file write was atomic.
 
-The daemon installs indexed hook entries in `autosave.hook_slot` (default 901)
-and never writes `status-right`. Ownership requires the complete
-`display-message -c <client> tmux-recover:state-changed` command shape, not a
-marker substring. Startup can therefore remove a precisely recognized stale
-entry from a crashed predecessor without deleting an unrelated command that
-merely mentions the event text. Installation rechecks each slot immediately
-before writing and verifies it afterwards; shutdown removes only entries owned
-by the current control client. tmux exposes no conditional hook update, so a
-final narrow check-versus-set race remains if another process writes the exact
-indexed slot concurrently. Structure events are debounced. cwd and pane title
-changes are found by a low-frequency poll. A capture is committed only when its
-structural hash (topology, layout, cwd, titles; excludes
-pid/tty/current_command/dead_status) differs from the current snapshot, so an
-idle server does not produce a new snapshot on every poll.
+The daemon installs persistent indexed hook entries in `autosave.hook_slot`
+(default 901) and never writes `status-right`. Hooks are tmux array options, so
+installation uses `set-option -o`: the tmux server atomically sets an empty
+entry or rejects an occupied one without overwriting it. The static
+`wait-for -S tmux-recover:state-changed` command signals a latched channel that
+a separate waiter consumes. An identical entry from an earlier daemon is safe
+to reuse across control-client reconnects and daemon restarts. Other commands
+are preserved and abort startup. Persistent hooks are not removed on shutdown,
+which avoids creating a symmetric check-versus-unset race.
+
+Structure events are debounced. cwd and pane title changes are found by a
+low-frequency poll. A capture is committed only when its structural hash
+(topology, layout, cwd, titles; excludes pid/tty/current_command/dead_status)
+differs from the current snapshot, so an idle server does not produce a new
+snapshot on every poll.
 
 Dedup also requires the capture's `origin` to match, not just the structural
 hash. A restore reproduces tmux ids deterministically, so a fresh server

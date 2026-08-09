@@ -19,6 +19,11 @@ semantic hash. This keeps ids and every artifact filename derived from them to
 one safe path component. `current.json` likewise accepts only the exact
 `<snapshot-id>.json` or `<snapshot-id>.json.zst` filename.
 
+The basename of every history file is cross-checked against the `id` inside its
+JSON body. Renaming valid `A.json` to `B.json` does not make it addressable as
+snapshot B: direct loads and pinning reject it, `list` warns and skips it, and
+retention reads the content ID separately, warns, and leaves the file untouched.
+
 `EncodedPath` is tagged as either `utf8` or `base64`, so Unix paths are not
 silently made lossy. JSON distinguishes `""`, `null`, and an absent field and
 escapes Tab, newline, Unicode, colons, and other control characters.

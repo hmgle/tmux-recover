@@ -6,8 +6,9 @@ poll_interval = 60
 # unchanged. Only used by --restore-processes; it overwrites one file in place
 # rather than adding to snapshot history.
 process_checkpoint_interval = 300
-# Indexed tmux hook slot. The daemon refuses to overwrite another command in
-# this slot; choose a different value if another plugin already uses it.
+# Persistent indexed tmux hook slot. Installation is atomic and set-only: an
+# identical tmux-recover hook is reused, while every other command is preserved
+# and makes daemon startup fail. Choose a slot dedicated to tmux-recover.
 hook_slot = 901
 
 [retention]

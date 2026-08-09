@@ -178,10 +178,10 @@ process_checkpoint_interval = 300
 safety_snapshots = 10
 ```
 
-daemon 只有在完整 hook 命令符合自身 event command 结构时才认定 ownership；如果
-`hook_slot` 已被其他命令占用则拒绝覆盖。安装前会立即复查、安装后会验证，退出时只
-删除指向自身 control client 的 entry。tmux 没有 conditional hook update，因此另一
-进程若在同一瞬间写入完全相同的 indexed slot，仍可能产生极窄竞争；应使用专用 slot。
+daemon 使用 tmux 原子的 set-if-absent option update 安装持久 `wait-for` event hook。
+之前 daemon 留下的相同 hook 会被复用；`hook_slot` 中的其他命令会保持不变，并使启动
+失败。hook 可跨 control connection 重连和 daemon 重启继续使用，因此 shutdown 不再
+执行存在竞态的 check-and-remove。应使用专用 slot。
 
 Linux 默认数据目录是 `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`：
 
@@ -200,6 +200,9 @@ imports/
 
 默认保留最新 100 份、30 天内每小时一份、180 天内每天一份，以及最新 10 份 safety
 snapshot。current 和用户 pin 不会被清理。`storage.zstd = true` 可启用压缩快照。
+
+每个历史文件名必须严格为 `<snapshot.id>.json` 或 `<snapshot.id>.json.zst`。直接读取
+和 pin 会拒绝不一致文件；`list` 会跳过，retention 会记录 warning 并保留原文件。
 
 systemd user service 模板位于
 [contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。实例名必须

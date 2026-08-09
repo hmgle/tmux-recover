@@ -202,12 +202,11 @@ process_checkpoint_interval = 300
 safety_snapshots = 10
 ```
 
-The daemon recognizes ownership only when the complete hook command matches its
-event command shape. It refuses to overwrite another command in `hook_slot`,
-rechecks immediately before installation, verifies the installed value, and on
-shutdown removes only entries targeting its own control client. tmux has no
-conditional hook update, so another process writing the exact indexed slot at
-the same instant can still race; use a dedicated slot.
+The daemon installs a persistent `wait-for` event hook with tmux's atomic
+set-if-absent option update. An identical hook from an earlier daemon is reused;
+every other command in `hook_slot` is left untouched and causes startup to fail.
+The hook remains available across daemon reconnects and restarts, so shutdown
+never needs a racy check-and-remove operation. Use a dedicated slot.
 
 Linux data defaults to `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`:
 
@@ -228,6 +227,10 @@ The default retention policy keeps the latest 100 snapshots, one per hour for
 30 days, one per day for 180 days, and the latest 10 safety snapshots. Current
 and user-pinned snapshots are exempt. `storage.zstd = true` enables compressed
 snapshot envelopes.
+
+Every history filename must be exactly `<snapshot.id>.json` or
+`<snapshot.id>.json.zst`. Direct reads and pinning reject a mismatch; `list`
+skips it, and retention logs a warning and leaves the file untouched.
 
 The systemd user service template is
 [contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service).
