@@ -362,7 +362,9 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
             .unwrap()
             .success()
     );
-    wait_for_default_shell_pane(&server, "bootstrap:0.0").await;
+    // Wait on the same full capture predicate the daemon uses. Checking only
+    // the foreground command can race the rest of tmux's pane metadata.
+    let _ = wait_for_auto_bootstrap_capture(&server).await;
     let daemon_socket = server.socket.clone();
     let daemon_data = data.path().to_path_buf();
     let daemon_config = config.clone();
@@ -503,18 +505,11 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
             .unwrap()
             .success()
     );
-    wait_for_default_shell_pane(&server, "bootstrap:0.0").await;
-
     // Pin both preconditions, since a gate rejection and a preflight failure
     // leave the same observable end state and would be indistinguishable
     // below: the daemon must get past the gate, and preflight must then fail.
     {
-        let mut client = ControlClient::connect(&server.socket).await.unwrap();
-        let target = capture(&mut client, &server.socket).await.unwrap();
-        assert!(
-            tmux_recover::restore::target_is_auto_bootstrap(&target),
-            "auto-restore would be declined before preflight, making this test vacuous"
-        );
+        let target = wait_for_auto_bootstrap_capture(&server).await;
         let options = tmux_recover::restore::restore_config_options(
             &config.restore,
             false,
@@ -1018,6 +1013,53 @@ async fn wait_for_default_shell_pane(server: &TestServer, pane: &str) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "pane {pane} never reached the default shell {expected:?} (saw {current:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Waits for a capture that satisfies the daemon's complete auto-restore gate.
+/// A direct capture also keeps the test synchronized with pane metadata that a
+/// one-field `display-message` probe cannot observe.
+async fn wait_for_auto_bootstrap_capture(
+    server: &TestServer,
+) -> tmux_recover::tmux::capture::CaptureResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last_state = "no capture completed".to_owned();
+    loop {
+        if let Ok(mut client) = ControlClient::connect(&server.socket).await {
+            match capture(&mut client, &server.socket).await {
+                Ok(target) if tmux_recover::restore::target_is_auto_bootstrap(&target) => {
+                    return target;
+                }
+                Ok(target) => {
+                    let pane = target
+                        .state
+                        .windows
+                        .first()
+                        .and_then(|window| window.panes.first());
+                    last_state = format!(
+                        "sessions={}, windows={}, panes={}, default_shell={:?}, current={:?}, start={:?}, dead={:?}, os={}",
+                        target.state.sessions.len(),
+                        target.state.windows.len(),
+                        target
+                            .state
+                            .windows
+                            .first()
+                            .map_or(0, |window| window.panes.len()),
+                        target.default_shell,
+                        pane.and_then(|pane| pane.current_command.as_deref()),
+                        pane.and_then(|pane| pane.start_command.as_deref()),
+                        pane.map(|pane| pane.dead),
+                        target.origin.os,
+                    );
+                }
+                Err(error) => last_state = format!("capture failed: {error:#}"),
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "auto-restore bootstrap gate was never satisfied ({last_state})"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

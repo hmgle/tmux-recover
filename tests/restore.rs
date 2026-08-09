@@ -215,7 +215,13 @@ async fn restores_special_fields_active_pane_and_zoom() {
     };
     let options = restore_config_options(&config, false, false, None, true, None);
     let plan = preflight(&snapshot, &target, &options).unwrap();
+    #[cfg(target_os = "linux")]
     assert_eq!(plan.process_restarts, 5);
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        plan.process_restarts, 0,
+        "process restart metadata is collected from Linux procfs"
+    );
     let report = apply(&mut client, &snapshot, &target, &plan).await;
     assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
     drop(client);
