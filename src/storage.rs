@@ -49,6 +49,30 @@ struct CurrentPointer {
     semantic_hash: String,
 }
 
+impl CurrentPointer {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            bail!("unsupported current pointer schema {}", self.schema_version);
+        }
+        validate_path_component(&self.snapshot_id, "current snapshot id")?;
+        validate_path_component(&self.filename, "current snapshot filename")?;
+        let expected_json = format!("{}.json", self.snapshot_id);
+        let expected_zstd = format!("{}.json.zst", self.snapshot_id);
+        if self.filename != expected_json && self.filename != expected_zstd {
+            bail!("current snapshot filename does not match its snapshot id");
+        }
+        if self.semantic_hash.len() != 64
+            || !self
+                .semantic_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("current snapshot semantic hash is not 64 hexadecimal characters");
+        }
+        Ok(())
+    }
+}
+
 /// Cheap directory listing entry. Deriving the timestamp from the filename lets
 /// `prune` decide what to keep without hashing complete snapshot bodies. It
 /// still reads each body ID so a renamed file cannot enter retention under the
@@ -186,39 +210,32 @@ impl SnapshotStore {
         Ok(CommitOutcome::Written)
     }
 
-    /// Reads the current pointer without touching the snapshot it names.
-    fn read_pointer(&self) -> Option<CurrentPointer> {
-        let bytes = fs::read(self.current_path()).ok()?;
-        let pointer: CurrentPointer = serde_json::from_slice(&bytes).ok()?;
-        (pointer.schema_version == 1).then_some(pointer)
+    /// Reads and structurally validates the current pointer without touching
+    /// the snapshot it names.
+    fn read_pointer(&self) -> Result<Option<CurrentPointer>> {
+        let bytes = match fs::read(self.current_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("failed to read current snapshot pointer"),
+        };
+        let pointer: CurrentPointer =
+            serde_json::from_slice(&bytes).context("current snapshot pointer is invalid")?;
+        pointer.validate()?;
+        Ok(Some(pointer))
     }
 
     /// The snapshot id the current pointer names, without reading the
     /// snapshot body it points at. Process checkpoint bookkeeping only needs
     /// the id to pin itself to; callers that need the validated snapshot
     /// should use [`Self::load_current`] instead.
-    pub fn current_snapshot_id(&self) -> Option<String> {
-        self.read_pointer().map(|pointer| pointer.snapshot_id)
+    pub fn current_snapshot_id(&self) -> Result<Option<String>> {
+        Ok(self.read_pointer()?.map(|pointer| pointer.snapshot_id))
     }
 
     pub fn load_current(&self) -> Result<Snapshot> {
-        let pointer: CurrentPointer = serde_json::from_slice(
-            &fs::read(self.current_path()).context("failed to read current snapshot pointer")?,
-        )
-        .context("current snapshot pointer is invalid")?;
-        if pointer.schema_version != 1 {
-            bail!(
-                "unsupported current pointer schema {}",
-                pointer.schema_version
-            );
-        }
-        validate_path_component(&pointer.snapshot_id, "current snapshot id")?;
-        validate_path_component(&pointer.filename, "current snapshot filename")?;
-        let expected_json = format!("{}.json", pointer.snapshot_id);
-        let expected_zstd = format!("{}.json.zst", pointer.snapshot_id);
-        if pointer.filename != expected_json && pointer.filename != expected_zstd {
-            bail!("current snapshot filename does not match its snapshot id");
-        }
+        let pointer = self
+            .read_pointer()?
+            .context("current snapshot pointer does not exist")?;
         let snapshot = self.load_path(&self.snapshots_dir().join(&pointer.filename))?;
         if snapshot.id != pointer.snapshot_id || snapshot.semantic_hash != pointer.semantic_hash {
             bail!("current snapshot pointer does not match its target");
@@ -264,7 +281,16 @@ impl SnapshotStore {
     /// and skipped rather than failing the whole listing, so one corrupt or
     /// future-schema file cannot hide every other snapshot.
     pub fn list(&self) -> Result<Vec<SnapshotSummary>> {
-        let current_id = self.read_pointer().map(|pointer| pointer.snapshot_id);
+        let current_id = match self.read_pointer() {
+            Ok(pointer) => pointer.map(|pointer| pointer.snapshot_id),
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "current snapshot pointer is invalid; list will not mark a current snapshot"
+                );
+                None
+            }
+        };
         let mut summaries = Vec::new();
         for path in self.snapshot_paths()? {
             let snapshot = match self.load_path(&path) {
@@ -386,8 +412,8 @@ impl SnapshotStore {
     /// enough snapshot JSON to cross-check each content ID and never re-hashes
     /// the full state.
     pub fn prune(&self, config: &RetentionConfig) -> Result<Vec<String>> {
+        let current_id = self.read_pointer()?.map(|pointer| pointer.snapshot_id);
         let entries = self.entries()?;
-        let current_id = self.read_pointer().map(|pointer| pointer.snapshot_id);
         let now = Utc::now();
         let mut keep = HashSet::new();
         let mut hourly = BTreeMap::new();
@@ -717,6 +743,43 @@ mod tests {
             store.load_current().unwrap().semantic_hash,
             first.semantic_hash
         );
+    }
+
+    #[test]
+    fn invalid_current_pointer_is_never_used_by_lightweight_readers() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let snapshot = snapshot("current");
+        store.commit(&snapshot, true).unwrap();
+        let files_before = store.snapshot_paths().unwrap().len();
+
+        let pointer = CurrentPointer {
+            schema_version: 1,
+            snapshot_id: snapshot.id.clone(),
+            filename: "different-id.json".to_owned(),
+            semantic_hash: snapshot.semantic_hash.clone(),
+        };
+        fs::write(
+            store.current_path(),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
+
+        assert!(store.current_snapshot_id().is_err());
+        assert!(store.load_current().is_err());
+        assert!(store.list().unwrap().iter().all(|item| !item.current));
+        assert!(
+            store
+                .prune(&RetentionConfig {
+                    recent: 0,
+                    hourly_days: 0,
+                    daily_days: 0,
+                    safety_snapshots: 0,
+                })
+                .is_err()
+        );
+        assert_eq!(store.snapshot_paths().unwrap().len(), files_before);
     }
 
     #[test]

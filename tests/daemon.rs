@@ -581,7 +581,7 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
     let first = store.read_process_checkpoint().unwrap().unwrap();
     assert_eq!(
         first.base_snapshot_id,
-        store.current_snapshot_id().unwrap(),
+        store.current_snapshot_id().unwrap().unwrap(),
         "the sidecar must be pinned to the current snapshot"
     );
 

@@ -312,7 +312,7 @@ fn maybe_refresh_process_checkpoint(
     // `commit` already confirmed this snapshot's structural state matches
     // the persisted current snapshot, so the pointer's id is what a restore
     // will actually check the sidecar's `base_snapshot_id` against.
-    let Some(base_snapshot_id) = store.current_snapshot_id() else {
+    let Some(base_snapshot_id) = store.current_snapshot_id()? else {
         return Ok(());
     };
     // An unreadable sidecar is treated as absent here, which makes the write
@@ -552,7 +552,10 @@ mod tests {
         assert_eq!(store.commit(&idle, true).unwrap(), CommitOutcome::Written);
         maybe_refresh_process_checkpoint(&store, &config, &idle, origin()).unwrap();
         let first = store.read_process_checkpoint().unwrap().unwrap();
-        assert_eq!(first.base_snapshot_id, store.current_snapshot_id().unwrap());
+        assert_eq!(
+            first.base_snapshot_id,
+            store.current_snapshot_id().unwrap().unwrap()
+        );
 
         // Same layout, different program: structurally unchanged, so no new
         // history snapshot, but the sidecar must follow the process.
@@ -699,7 +702,7 @@ mod tests {
         assert_ne!(second.base_snapshot_id, first.base_snapshot_id);
         assert_eq!(
             second.base_snapshot_id,
-            store.current_snapshot_id().unwrap()
+            store.current_snapshot_id().unwrap().unwrap()
         );
         assert_eq!(
             second.structural_hash,

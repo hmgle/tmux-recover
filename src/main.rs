@@ -351,7 +351,7 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     // one was written, otherwise whatever `current` still points at.
     let base_snapshot_id = match outcome {
         CommitOutcome::Written => Some(snapshot.id.clone()),
-        CommitOutcome::Unchanged => store.current_snapshot_id(),
+        CommitOutcome::Unchanged => store.current_snapshot_id()?,
     };
     match outcome {
         CommitOutcome::Written => {
