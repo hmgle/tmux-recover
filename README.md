@@ -208,6 +208,20 @@ every other command in `hook_slot` is left untouched and causes startup to fail.
 The hook remains available across daemon reconnects and restarts, so shutdown
 never needs a racy check-and-remove operation. Use a dedicated slot.
 
+Versions that predate the persistent hook used a client-specific
+`display-message -c ... tmux-recover:state-changed` command. If a crashed old
+daemon left those entries behind, startup reports every exact legacy hook and
+does not remove it automatically: the entry could have been replaced between
+inspection and removal. Stop any old daemon, then unset only the reported
+entries on the explicit target socket, for example:
+
+```sh
+tmux -S /tmp/tmux-1000/default set-hook -gu 'after-new-window[901]'
+```
+
+Repeat that command for each hook named in the error, then restart the daemon.
+Choosing another dedicated `autosave.hook_slot` is also safe.
+
 Linux data defaults to `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`:
 
 ```text
@@ -231,6 +245,15 @@ snapshot envelopes.
 Every history filename must be exactly `<snapshot.id>.json` or
 `<snapshot.id>.json.zst`. Direct reads and pinning reject a mismatch; `list`
 skips it, and retention logs a warning and leaves the file untouched.
+Retention still cross-checks the filename against the body ID, but a long-lived
+daemon caches that validated ID while the file's metadata fingerprint remains
+unchanged. The first prune after process startup is a cold scan; later prunes
+read and decompress only new or externally changed history files.
+
+All `current.json` readers validate its schema, safe ID and filename components,
+the exact ID-to-filename relationship, and the semantic hash shape. A malformed
+pointer is never used to mark or retain a current snapshot: `list` warns and
+marks none as current, while `prune` fails before deleting history.
 
 The systemd user service template is
 [contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service).

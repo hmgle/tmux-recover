@@ -24,6 +24,13 @@ JSON body. Renaming valid `A.json` to `B.json` does not make it addressable as
 snapshot B: direct loads and pinning reject it, `list` warns and skips it, and
 retention reads the content ID separately, warns, and leaves the file untouched.
 
+Every `current.json` read uses the same structural validation: schema 1, one
+safe path component each for `snapshot_id` and `filename`, an exact
+`<snapshot_id>.json[.zst]` relationship, and a 64-character hexadecimal
+`semantic_hash`. Restore additionally loads the target and verifies that its ID
+and semantic hash match the pointer. A malformed pointer makes pruning fail
+before deletion; listing warns and treats the store as having no current entry.
+
 `EncodedPath` is tagged as either `utf8` or `base64`, so Unix paths are not
 silently made lossy. JSON distinguishes `""`, `null`, and an absent field and
 escapes Tab, newline, Unicode, colons, and other control characters.

@@ -45,11 +45,27 @@ to reuse across control-client reconnects and daemon restarts. Other commands
 are preserved and abort startup. Persistent hooks are not removed on shutdown,
 which avoids creating a symmetric check-versus-unset race.
 
+Older releases installed client-specific
+`display-message -c ... tmux-recover:state-changed` entries. Startup recognizes
+only that complete legacy command shape, reports every affected hook, and
+preserves them. Migration is deliberately manual: after stopping the old
+daemon, the operator unsets the reported entries on the explicit socket or
+selects another dedicated slot. An automatic check-then-unset would recreate
+the same race by deleting a hook that another process installed in between.
+
 Structure events are debounced. cwd and pane title changes are found by a
 low-frequency poll. A capture is committed only when its structural hash
 (topology, layout, cwd, titles; excludes pid/tty/current_command/dead_status)
 differs from the current snapshot, so an idle server does not produce a new
 snapshot on every poll.
+
+Retention independently cross-checks each history filename against the ID in
+its snapshot body. A store shared by the daemon and its clones caches that body
+ID behind a metadata fingerprint (size and modification time, plus device,
+inode, and change time on Unix). The first scan in a process reads every body;
+later scans stat every entry but only read and decompress new or changed files.
+The fingerprint is checked again after a cache miss so a file changed during
+the read is never cached under an older identity.
 
 Dedup also requires the capture's `origin` to match, not just the structural
 hash. A restore reproduces tmux ids deterministically, so a fresh server

@@ -8,7 +8,9 @@ poll_interval = 60
 process_checkpoint_interval = 300
 # Persistent indexed tmux hook slot. Installation is atomic and set-only: an
 # identical tmux-recover hook is reused, while every other command is preserved
-# and makes daemon startup fail. Choose a slot dedicated to tmux-recover.
+# and makes daemon startup fail. Legacy client-specific tmux-recover hooks are
+# reported for explicit removal after the old daemon is stopped; they are never
+# removed automatically. Choose a slot dedicated to tmux-recover.
 hook_slot = 901
 
 [retention]

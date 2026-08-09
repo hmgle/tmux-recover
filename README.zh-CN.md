@@ -183,6 +183,19 @@ daemon 使用 tmux 原子的 set-if-absent option update 安装持久 `wait-for`
 失败。hook 可跨 control connection 重连和 daemon 重启继续使用，因此 shutdown 不再
 执行存在竞态的 check-and-remove。应使用专用 slot。
 
+更早版本使用绑定 client 的
+`display-message -c ... tmux-recover:state-changed` 命令。如果旧 daemon 崩溃后留下
+这类 entry，新版本启动时会列出所有严格匹配的 legacy hook，但不会自动删除：检查后
+到删除前，该 entry 可能已被其他进程替换。请先停止所有旧 daemon，再在明确指定的
+目标 socket 上只清除错误中列出的 entry，例如：
+
+```sh
+tmux -S /tmp/tmux-1000/default set-hook -gu 'after-new-window[901]'
+```
+
+对错误中列出的每个 hook 重复该命令，然后重启 daemon；改用另一个专用的
+`autosave.hook_slot` 也同样安全。
+
 Linux 默认数据目录是 `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`：
 
 ```text
@@ -203,6 +216,13 @@ snapshot。current 和用户 pin 不会被清理。`storage.zstd = true` 可启�
 
 每个历史文件名必须严格为 `<snapshot.id>.json` 或 `<snapshot.id>.json.zst`。直接读取
 和 pin 会拒绝不一致文件；`list` 会跳过，retention 会记录 warning 并保留原文件。
+retention 仍会交叉校验文件名与内容 ID，但长驻 daemon 会在文件 metadata fingerprint
+未变化时复用已验证 ID。进程启动后的第一次 prune 是冷扫描；后续 prune 只读取并解压
+新增或被外部修改的历史文件。
+
+所有 `current.json` reader 都会校验 schema、安全的 ID 与 filename component、两者的
+严格对应关系及 semantic hash 格式。损坏的 pointer 不会再用于标记或保留 current：
+`list` 会 warning 并且不标记任何 current，`prune` 会在删除历史前失败。
 
 systemd user service 模板位于
 [contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。实例名必须
