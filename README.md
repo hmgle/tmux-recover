@@ -207,6 +207,9 @@ tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 
 Imports live in a separate history. Ambiguous or lossy legacy rows are reported
 instead of being guessed, and imported command text remains non-executable.
+See [Migrating from tmux-resurrect and
+tmux-continuum](docs/migrating-from-resurrect.md) for a complete cutover,
+verification, and rollback checklist.
 
 ### Work with more than one tmux server
 

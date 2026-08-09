@@ -192,6 +192,8 @@ tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 
 导入记录保存在单独的历史中。遇到有歧义或有损的旧格式行时会报告问题而不是猜测，
 导入的命令文本始终不可执行。
+完整的切换、验证和回退步骤见
+[从 tmux-resurrect 与 tmux-continuum 迁移](docs/migrating-from-resurrect.zh-CN.md)。
 
 ### 使用多个 tmux server
 
