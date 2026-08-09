@@ -116,6 +116,45 @@ async fn daemon_refuses_to_overwrite_an_existing_hook_slot() {
 }
 
 #[tokio::test]
+async fn daemon_reports_legacy_hooks_without_removing_them() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let hook = format!("after-new-window[{}]", config.autosave.hook_slot);
+    let legacy = "display-message -c /dev/pts/legacy tmux-recover:state-changed";
+    assert!(
+        server
+            .tmux()
+            .args(["set-hook", "-g", &hook, legacy])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tmux_recover::daemon::run(&server.socket, data.path(), &config),
+    )
+    .await
+    .expect("daemon hung while reporting the legacy hook")
+    .unwrap_err();
+    let error = format!("{result:#}");
+    assert!(error.contains("legacy tmux-recover hooks"), "{error}");
+    assert!(error.contains(&hook), "{error}");
+
+    let output = server
+        .tmux()
+        .args(["show-hooks", "-g", &hook])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(legacy));
+}
+
+#[tokio::test]
 async fn polling_saves_cwd_changes_without_structure_hooks() {
     let Some(server) = TestServer::start_shell() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");

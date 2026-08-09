@@ -36,6 +36,24 @@ const STRUCTURE_HOOKS: &[&str] = &[
 /// daemon is reusable because it signals a stable channel rather than naming
 /// an ephemeral control client.
 pub async fn install(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
+    let mut legacy = Vec::new();
+    for hook in STRUCTURE_HOOKS {
+        let name = format!("{hook}[{hook_slot}]");
+        if value(client, &name)
+            .await?
+            .as_deref()
+            .is_some_and(is_legacy_event_command)
+        {
+            legacy.push(name);
+        }
+    }
+    if !legacy.is_empty() {
+        bail!(
+            "legacy tmux-recover hooks block migration: {}. Stop any old daemon, then explicitly unset only these entries on the target socket or choose another autosave.hook_slot; automatic removal is disabled so a concurrently replaced hook cannot be deleted",
+            legacy.join(", ")
+        );
+    }
+
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
         let command = format!("set-option -go {name} \"{EVENT_COMMAND}\"");
@@ -49,7 +67,11 @@ pub async fn install(client: &mut ControlClient, hook_slot: u16) -> Result<()> {
             }
             Err(set_error) => {
                 let existing = value(client, &name).await?;
-                if existing.as_deref() != Some(EVENT_COMMAND) {
+                if existing.as_deref().is_some_and(is_legacy_event_command) {
+                    bail!(
+                        "legacy tmux-recover hook {name} appeared during installation and was not removed; stop any old daemon, explicitly unset it on the target socket, or choose another autosave.hook_slot"
+                    );
+                } else if existing.as_deref() != Some(EVENT_COMMAND) {
                     bail!(
                         "tmux hook {name} is already occupied and was not overwritten: {set_error:#}"
                     );
@@ -105,6 +127,16 @@ fn parse_value(name: &str, line: &[u8]) -> Result<Option<String>> {
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
+fn is_legacy_event_command(command: &str) -> bool {
+    let Some(client) = command
+        .strip_prefix("display-message -c ")
+        .and_then(|command| command.strip_suffix(" tmux-recover:state-changed"))
+    else {
+        return false;
+    };
+    !client.is_empty() && !client.chars().any(char::is_whitespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +163,18 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn recognizes_only_the_complete_legacy_event_command() {
+        assert!(is_legacy_event_command(
+            "display-message -c /dev/pts/4 tmux-recover:state-changed"
+        ));
+        assert!(!is_legacy_event_command(
+            "display-message external-tmux-recover:state-changed-hook"
+        ));
+        assert!(!is_legacy_event_command(
+            "display-message -c client tmux-recover:state-changed trailing"
+        ));
     }
 }
