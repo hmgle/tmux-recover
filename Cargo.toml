@@ -5,7 +5,12 @@ edition = "2024"
 rust-version = "1.85"
 description = "Reliable tmux session snapshots, restore, and continuous saving"
 license = "MIT"
-repository = "https://github.com/gle/tmux-recover"
+repository = "https://github.com/hmgle/tmux-recover"
+homepage = "https://github.com/hmgle/tmux-recover"
+documentation = "https://github.com/hmgle/tmux-recover/tree/main/docs"
+readme = "README.md"
+keywords = ["tmux", "session", "backup", "restore", "terminal"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"
