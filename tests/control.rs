@@ -123,3 +123,45 @@ async fn trailing_error_leaves_the_client_usable() {
     assert_eq!(output.len(), 1);
     assert_eq!(String::from_utf8_lossy(&output[0]), "after-error");
 }
+
+/// A persistent hook runs as an unflagged control-mode command and emits its
+/// own empty output block after the command that triggered it. That block must
+/// not become the result of the next command sent by the client.
+#[tokio::test]
+async fn hook_output_blocks_do_not_desynchronize_command_results() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let status = server
+        .tmux()
+        .args([
+            "set-option",
+            "-g",
+            "after-new-window[901]",
+            "wait-for -S tmux-recover:state-changed",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut client = ControlClient::connect(&server.socket).await.unwrap();
+    let created = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.execute(r##"new-window -d -P -F "#{window_id}|#{pane_id}" -t control -n created"##),
+    )
+    .await
+    .expect("new-window hung")
+    .unwrap();
+    assert_eq!(created.len(), 1, "new-window output was misclassified");
+    assert!(String::from_utf8_lossy(&created[0]).starts_with('@'));
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.execute("display-message -p after-hook"),
+    )
+    .await
+    .expect("the command after the hook hung")
+    .unwrap();
+    assert_eq!(output, vec![b"after-hook".to_vec()]);
+}

@@ -317,6 +317,18 @@ async fn restores_default_shell_panes_without_a_hold_command() {
     success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
     let target = capture(&mut client, &server.socket).await.unwrap();
+    for hook in [
+        "after-new-session[901]",
+        "session-created[901]",
+        "after-new-window[901]",
+    ] {
+        success(server.tmux().args([
+            "set-option",
+            "-g",
+            hook,
+            "wait-for -S tmux-recover:state-changed",
+        ]));
+    }
     let default_shell = target.default_shell.as_deref().unwrap();
     let expected_command = std::path::Path::new(default_shell)
         .file_name()

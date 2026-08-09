@@ -107,31 +107,45 @@ impl ControlClient {
 
         let mut blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(block_count);
         for index in 0..block_count {
-            loop {
-                let line = self.read_line().await?;
-                if line.starts_with(b"%begin ") {
-                    break;
-                }
-                self.record_notification(line)?;
-            }
+            'response: loop {
+                let header = loop {
+                    let line = self.read_line().await?;
+                    if let Some(header) = parse_block_header(&line)? {
+                        break header;
+                    }
+                    self.record_notification(line)?;
+                };
 
-            let mut output: Vec<Vec<u8>> = Vec::new();
-            loop {
-                let line = self.read_line().await?;
-                if line.starts_with(b"%end ") {
-                    tracing::debug!(
-                        target: "tmux_recover::control",
-                        lines = output.len(),
-                        output = ?output
-                            .iter()
-                            .map(|line| String::from_utf8_lossy(line).into_owned())
-                            .collect::<Vec<_>>(),
-                        "tmux command completed"
-                    );
-                    blocks.push(output);
-                    break;
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let mut error = None;
+                loop {
+                    let line = self.read_line().await?;
+                    if line.starts_with(b"%end ") {
+                        break;
+                    }
+                    if line.starts_with(b"%error ") {
+                        error = Some(line);
+                        break;
+                    }
+                    if line.starts_with(b"%exit") {
+                        bail!(
+                            "tmux control client exited while a command was pending: {}",
+                            text_lossy(&line)
+                        );
+                    }
+                    output.push(line);
                 }
-                if line.starts_with(b"%error ") {
+
+                // Hook commands run in the same tmux command queue but are not
+                // marked as responses to input received from this client. They
+                // still emit complete control-mode blocks, so ignoring only
+                // notifications is not enough to keep subsequent responses
+                // aligned.
+                if header.flags == 0 {
+                    continue 'response;
+                }
+
+                if let Some(line) = error {
                     // tmux abandons the rest of a semicolon-separated sequence
                     // at the first failure, so the blocks we have not read yet
                     // will never arrive: waiting for them would hang forever.
@@ -156,13 +170,18 @@ impl ControlClient {
                         index + 1
                     );
                 }
-                if line.starts_with(b"%exit") {
-                    bail!(
-                        "tmux control client exited while a command was pending: {}",
-                        text_lossy(&line)
-                    );
-                }
-                output.push(line);
+
+                tracing::debug!(
+                    target: "tmux_recover::control",
+                    lines = output.len(),
+                    output = ?output
+                        .iter()
+                        .map(|line| String::from_utf8_lossy(line).into_owned())
+                        .collect::<Vec<_>>(),
+                    "tmux command completed"
+                );
+                blocks.push(output);
+                break 'response;
             }
         }
         Ok(blocks)
@@ -262,6 +281,37 @@ fn parse_notification(line: &[u8]) -> Option<Notification> {
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockHeader {
+    flags: i32,
+}
+
+fn parse_block_header(line: &[u8]) -> Result<Option<BlockHeader>> {
+    if !line.starts_with(b"%begin ") {
+        return Ok(None);
+    }
+    let fields: Vec<_> = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    if fields.len() != 4 || fields[0] != b"%begin" {
+        bail!("invalid tmux control block header: {}", text_lossy(line));
+    }
+    std::str::from_utf8(fields[1])
+        .context("invalid UTF-8 in tmux control block timestamp")?
+        .parse::<i64>()
+        .context("invalid tmux control block timestamp")?;
+    std::str::from_utf8(fields[2])
+        .context("invalid UTF-8 in tmux control block command number")?
+        .parse::<u32>()
+        .context("invalid tmux control block command number")?;
+    let flags = std::str::from_utf8(fields[3])
+        .context("invalid UTF-8 in tmux control block flags")?
+        .parse::<i32>()
+        .context("invalid tmux control block flags")?;
+    Ok(Some(BlockHeader { flags }))
 }
 
 fn text_lossy(bytes: &[u8]) -> String {
