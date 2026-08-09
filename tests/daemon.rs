@@ -4,11 +4,13 @@ use tempfile::TempDir;
 use tmux_recover::{
     config::{AutosaveConfig, Config, RestoreConfig},
     model::{Snapshot, SnapshotSource},
-    restore::ProcessMetadataSource,
     storage::SnapshotStore,
     tmux::{capture::capture, control::ControlClient},
     util::socket_identity,
 };
+
+#[cfg(target_os = "linux")]
+use tmux_recover::restore::ProcessMetadataSource;
 
 struct TestServer {
     directory: TempDir,

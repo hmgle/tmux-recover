@@ -101,6 +101,10 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
 
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
     let captured = capture(&mut client, &server.socket).await.unwrap();
+    // macOS reports a cwd below /private/var even when tempfile returned its
+    // /var alias. Compare filesystem identities while still exercising the
+    // tabs, newlines, colons, and Unicode this test exists to preserve.
+    let expected_cwd = cwd.canonicalize().unwrap();
     assert_eq!(captured.state.sessions[0].name, "capture:雪");
     let window = &captured.state.windows[0];
     assert_eq!(window.automatic_rename, Some(false));
@@ -113,7 +117,7 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
             .unwrap()
             .to_path_buf()
             .unwrap(),
-        cwd
+        expected_cwd
     );
 }
 

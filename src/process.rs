@@ -1,6 +1,11 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::collections::HashMap;
 
-use crate::model::{EncodedPath, RestartSpec};
+#[cfg(target_os = "linux")]
+use std::{fs, path::PathBuf};
+
+#[cfg(target_os = "linux")]
+use crate::model::EncodedPath;
+use crate::model::RestartSpec;
 
 #[cfg(target_os = "linux")]
 pub fn collect_restart_specs(pane_pids: impl Iterator<Item = u32>) -> HashMap<u32, RestartSpec> {
