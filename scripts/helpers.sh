@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 tmux_recover_find_binary() {
   if [ -n "${TMUX_RECOVER_BIN:-}" ] && [ -x "$TMUX_RECOVER_BIN" ]; then
@@ -17,13 +17,18 @@ tmux_recover_find_binary() {
 }
 
 tmux_recover_option() {
-  local option_name="$1"
-  local default_value="$2"
-  local value
-  value="$(tmux show-option -gqv "$option_name")"
-  if [ -n "$value" ]; then
-    printf '%s\n' "$value"
+  tmux_recover_option_name="$1"
+  tmux_recover_default_value="$2"
+  tmux_recover_value="$(tmux show-option -gqv "$tmux_recover_option_name")"
+  if [ -n "$tmux_recover_value" ]; then
+    printf '%s\n' "$tmux_recover_value"
   else
-    printf '%s\n' "$default_value"
+    printf '%s\n' "$tmux_recover_default_value"
   fi
+}
+
+tmux_recover_shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
 }

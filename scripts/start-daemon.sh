@@ -1,9 +1,9 @@
-#!/usr/bin/env bash
-set -u
+#!/bin/sh
+set -eu
 
-TMUX_RECOVER_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMUX_RECOVER_PLUGIN_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 export TMUX_RECOVER_PLUGIN_DIR
-source "$TMUX_RECOVER_PLUGIN_DIR/scripts/helpers.sh"
+. "$TMUX_RECOVER_PLUGIN_DIR/scripts/helpers.sh"
 
 if ! binary="$(tmux_recover_find_binary)"; then
   tmux display-message "tmux-recover: binary not found; install it or set TMUX_RECOVER_BIN"

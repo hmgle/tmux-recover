@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+project_dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 prefix="${PREFIX:-$HOME/.local}"
 binary_dir="$prefix/bin"
 
