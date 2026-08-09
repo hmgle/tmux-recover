@@ -1010,7 +1010,9 @@ async fn wait_for_default_shell_pane(server: &TestServer, pane: &str) {
             .output()
             .ok()
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        if current.as_deref() == Some(expected.as_str()) || current == resolved {
+        let macos_system_sh =
+            cfg!(target_os = "macos") && expected == "sh" && current.as_deref() == Some("bash");
+        if current.as_deref() == Some(expected.as_str()) || current == resolved || macos_system_sh {
             return;
         }
         assert!(

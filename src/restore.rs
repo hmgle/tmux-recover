@@ -385,16 +385,27 @@ pub fn target_is_auto_bootstrap(target: &CaptureResult) -> bool {
     let Some(default_shell) = target.default_shell.as_deref() else {
         return false;
     };
-    pane.current_command
-        .as_deref()
-        .is_some_and(|current| default_shell_command_matches(default_shell, current))
+    pane.current_command.as_deref().is_some_and(|current| {
+        default_shell_command_matches(default_shell, current, &target.origin.os)
+    })
 }
 
-fn default_shell_command_matches(default_shell: &str, current_command: &str) -> bool {
+fn default_shell_command_matches(
+    default_shell: &str,
+    current_command: &str,
+    operating_system: &str,
+) -> bool {
     let configured_name = Path::new(default_shell)
         .file_name()
         .and_then(|name| name.to_str());
     if configured_name == Some(current_command) {
+        return true;
+    }
+
+    // On macOS, /bin/sh is a separate filesystem entry rather than a symlink
+    // canonicalize can follow, but the operating system runs it as bash and
+    // tmux consequently reports `pane_current_command=bash`.
+    if operating_system == "macos" && configured_name == Some("sh") && current_command == "bash" {
         return true;
     }
 
@@ -1687,6 +1698,17 @@ mod tests {
         let mut target = bootstrap_target(directory.path());
         target.default_shell = Some(configured_shell.to_string_lossy().into_owned());
         target.state.windows[0].panes[0].current_command = Some("real-shell".to_owned());
+
+        assert!(target_is_auto_bootstrap(&target));
+    }
+
+    #[test]
+    fn auto_bootstrap_accepts_macos_system_sh_reported_as_bash() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut target = bootstrap_target(directory.path());
+        target.origin.os = "macos".to_owned();
+        target.default_shell = Some("/bin/sh".to_owned());
+        target.state.windows[0].panes[0].current_command = Some("bash".to_owned());
 
         assert!(target_is_auto_bootstrap(&target));
     }
