@@ -50,12 +50,19 @@ struct CurrentPointer {
 }
 
 /// Cheap directory listing entry. Deriving the timestamp from the filename lets
-/// `prune` decide what to keep without parsing or hashing snapshot bodies.
+/// `prune` decide what to keep without hashing complete snapshot bodies. It
+/// still reads each body ID so a renamed file cannot enter retention under the
+/// wrong identity.
 #[derive(Debug, Clone)]
 struct StoredEntry {
     id: String,
     created_at: DateTime<Utc>,
     path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct StoredSnapshotIdentity {
+    id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,15 +245,18 @@ impl SnapshotStore {
     }
 
     pub fn load_path(&self, path: &Path) -> Result<Snapshot> {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let json = if path.extension().is_some_and(|extension| extension == "zst") {
-            zstd::stream::decode_all(bytes.as_slice())?
-        } else {
-            bytes
-        };
+        let filename_id = snapshot_id_from_path(path)
+            .with_context(|| format!("snapshot filename is invalid: {}", path.display()))?;
+        let json = read_snapshot_json(path)?;
         let snapshot: Snapshot = serde_json::from_slice(&json)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         snapshot.validate()?;
+        if snapshot.id != filename_id {
+            bail!(
+                "snapshot filename id {filename_id} does not match content id {}",
+                snapshot.id
+            );
+        }
         Ok(snapshot)
     }
 
@@ -291,9 +301,9 @@ impl SnapshotStore {
         Ok(summaries)
     }
 
-    /// Directory scan that reads no snapshot bodies. Entries whose filename is
-    /// not a recognisable snapshot id are omitted, which keeps them out of
-    /// retention decisions entirely.
+    /// Directory scan that reads only each body ID. Entries whose filename is
+    /// not a recognisable snapshot id or does not match that content ID are
+    /// omitted, which keeps them out of retention decisions entirely.
     fn entries(&self) -> Result<Vec<StoredEntry>> {
         let mut entries = Vec::new();
         for path in self.snapshot_paths()? {
@@ -304,6 +314,26 @@ impl SnapshotStore {
                 );
                 continue;
             };
+            let content_id = match read_snapshot_identity(&path) {
+                Ok(identity) => identity.id,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{error:#}"),
+                        "snapshot content id is unreadable; retention will leave it alone"
+                    );
+                    continue;
+                }
+            };
+            if content_id != id {
+                tracing::warn!(
+                    path = %path.display(),
+                    filename_id = %id,
+                    content_id = %content_id,
+                    "snapshot filename does not match its content id; retention will leave it alone"
+                );
+                continue;
+            }
             let Some(created_at) = created_at_from_id(&id) else {
                 tracing::warn!(
                     path = %path.display(),
@@ -351,9 +381,10 @@ impl SnapshotStore {
         self.safety_dir().join(id).is_file()
     }
 
-    /// Applies the retention policy. Runs after every autosave, so it works
-    /// from filenames, the pins directory, and the current pointer only; it
-    /// never parses or re-hashes a snapshot body.
+    /// Applies the retention policy. Runs after every autosave, using filename
+    /// timestamps, the pins directory, and the current pointer. It reads only
+    /// enough snapshot JSON to cross-check each content ID and never re-hashes
+    /// the full state.
     pub fn prune(&self, config: &RetentionConfig) -> Result<Vec<String>> {
         let entries = self.entries()?;
         let current_id = self.read_pointer().map(|pointer| pointer.snapshot_id);
@@ -550,6 +581,21 @@ fn snapshot_id_from_path(path: &Path) -> Option<String> {
         .strip_suffix(".json.zst")
         .or_else(|| name.strip_suffix(".json"))?;
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn read_snapshot_json(path: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if path.extension().is_some_and(|extension| extension == "zst") {
+        zstd::stream::decode_all(bytes.as_slice())
+            .with_context(|| format!("failed to decompress {}", path.display()))
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn read_snapshot_identity(path: &Path) -> Result<StoredSnapshotIdentity> {
+    serde_json::from_slice(&read_snapshot_json(path)?)
+        .with_context(|| format!("failed to parse snapshot identity from {}", path.display()))
 }
 
 fn validate_path_component(value: &str, description: &str) -> Result<()> {
@@ -1010,6 +1056,37 @@ mod tests {
         // directory listing, where current.json does not live.
         assert_eq!(snapshot_id_from_path(Path::new("/store/notes.txt")), None);
         assert_eq!(snapshot_id_from_path(Path::new("/store/.json")), None);
+    }
+
+    #[test]
+    fn renamed_snapshot_is_rejected_and_excluded_from_retention() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        let stored = snapshot("stored");
+        let other = snapshot("other");
+        store.commit(&stored, false).unwrap();
+
+        let original = store.snapshot_paths().unwrap().pop().unwrap();
+        let renamed = store.snapshots_dir().join(format!("{}.json", other.id));
+        fs::rename(original, &renamed).unwrap();
+
+        let error = format!("{:#}", store.load(&other.id).unwrap_err());
+        assert!(error.contains("does not match content id"), "{error}");
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.pin(&other.id).is_err());
+        assert_eq!(fs::read_dir(store.pins_dir()).unwrap().count(), 0);
+
+        let removed = store
+            .prune(&RetentionConfig {
+                recent: 0,
+                hourly_days: 0,
+                daily_days: 0,
+                safety_snapshots: 0,
+            })
+            .unwrap();
+        assert!(removed.is_empty());
+        assert!(renamed.is_file());
     }
 
     #[test]
