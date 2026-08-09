@@ -1,159 +1,200 @@
 # tmux-recover
 
+[![CI](https://github.com/hmgle/tmux-recover/actions/workflows/ci.yml/badge.svg)](https://github.com/hmgle/tmux-recover/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/hmgle/tmux-recover?sort=semver)](https://github.com/hmgle/tmux-recover/releases/latest)
+[![License](https://img.shields.io/github/license/hmgle/tmux-recover)](LICENSE)
+[![tmux 3.7+](https://img.shields.io/badge/tmux-3.7%2B-1BB91F)](https://github.com/tmux/tmux/releases)
+[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-DEA584?logo=rust)](Cargo.toml)
+
 [简体中文](README.zh-CN.md)
 
-`tmux-recover` is a Rust-based tmux session snapshot, restore, and continuous
-save tool. It does not depend on tmux-resurrect or tmux-continuum and does not
-modify `status-right`.
+`tmux-recover` continuously saves tmux sessions and restores them after a
+reboot, crash, or accidental server exit. It remembers the session/window/pane
+structure, working directories, names, layouts, active selections, and zoomed
+panes without taking over your status bar.
 
-## Features
+Restore is intentionally conservative: it validates a snapshot and shows a
+plan before replacing real work, creates a safety snapshot, and rolls back
+changes when a pre-commit step fails.
 
-- Captures the complete server state through one persistent tmux control-mode
-  connection.
-- Saves sessions, linked and grouped windows, panes, cwd, titles, layout,
-  active selections, and zoom state.
-- Uses tmux hooks for structural changes and low-frequency polling for cwd,
-  title, and process changes.
-- Derives socket identity from the canonical connection path, so symlinks,
-  relative paths, and macOS aliases such as `/var` and `/private/var` share one
-  store and one daemon lock even when tmux reports its original spelling.
-- Serializes capture and multi-file publication across the daemon and CLI, so a
-  delayed older capture cannot move `current` behind a newer save.
-- Preserves non-UTF-8 Unix paths and distinguishes empty strings, `null`, and
-  missing values in JSON.
-- Runs restore preflight before mutation, retains old sessions during the
-  reversible phase, and writes a durable restore report.
-- Tracks current process restart metadata in a separate checkpoint sidecar.
-- Imports tmux-resurrect v3/v4 without trusting imported command text.
+## Why tmux-recover?
 
-tmux 3.7+ and Rust 1.85+ are required. Linux and macOS are supported. Optional
-process restart metadata is currently collected on Linux through `/proc`.
+- **Continuous history:** saves structural changes quickly and polls quieter
+  metadata such as working directories and titles.
+- **Safe recovery:** dry-run preflight, explicit replacement, rollback, safety
+  snapshots, and durable restore reports.
+- **One history per tmux server:** different sockets remain isolated, including
+  sockets reached through symlinks or alternate path spellings.
+- **Bounded storage:** keeps recent, hourly, and daily history; important
+  snapshots can be pinned indefinitely.
+- **Migration path:** imports tmux-resurrect v3/v4 files without executing the
+  imported command text.
+- **Scriptable CLI:** human-readable output by default and JSON for inspection
+  or automation.
 
-## Installation
+Linux and macOS are supported. tmux 3.7 or newer is required. Building from
+source requires Rust 1.85 or newer. Process restart metadata is opt-in and is
+currently collected only on Linux; ordinary session restore works on both
+platforms.
+
+## Quick start
+
+### 1. Install the binary
+
+Download a prebuilt archive from the [latest release](https://github.com/hmgle/tmux-recover/releases/latest):
+
+| Platform | Release target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple silicon | `aarch64-apple-darwin` |
+
+For example, on Linux x86_64:
 
 ```sh
-cargo install --path . --locked
+target=x86_64-unknown-linux-musl
+archive="tmux-recover-$target"
+curl -fLO "https://github.com/hmgle/tmux-recover/releases/latest/download/$archive.tar.gz"
+curl -fLO "https://github.com/hmgle/tmux-recover/releases/latest/download/$archive.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "$archive.tar.gz.sha256"
+else
+  shasum -a 256 -c "$archive.tar.gz.sha256"
+fi
+tar -xzf "$archive.tar.gz"
+install -d "$HOME/.local/bin"
+install -m 0755 "$archive/tmux-recover" "$HOME/.local/bin/tmux-recover"
 ```
 
-To install into `~/.local/bin`:
+Ensure `$HOME/.local/bin` is in the environment that starts tmux.
+
+To build the current `main` branch with Cargo instead:
 
 ```sh
-./scripts/install.sh
+cargo install --git https://github.com/hmgle/tmux-recover --locked
 ```
 
-### TPM
+From a source or TPM checkout, `./scripts/install.sh` builds a locked release
+binary and installs it to `${PREFIX:-$HOME/.local}/bin`.
+
+### 2. Enable the TPM integration
+
+Add the plugin before TPM is initialized in `.tmux.conf`:
 
 ```tmux
-set -g @plugin 'gle/tmux-recover'
+set -g @plugin 'hmgle/tmux-recover'
 
-# Optional; defaults are C-s for save and C-r for safe restore.
+# Optional: keys used after the tmux prefix.
 set -g @tmux-recover-save-key 'C-s'
 set -g @tmux-recover-restore-key 'C-r'
 
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-The TPM entry point starts one background daemon for the current canonical tmux
-socket. Repeated starts exit after failing the daemon singleton lock. Set
-`TMUX_RECOVER_BIN` before starting tmux when the binary is not in `PATH`.
+Press `prefix` + <kbd>I</kbd> to install the plugin, then reload the tmux
+configuration. TPM starts one background watcher for the current tmux server.
+Press `prefix` + <kbd>Ctrl-s</kbd> to save and `prefix` + <kbd>Ctrl-r</kbd> to
+restore the latest snapshot into an empty bootstrap server. Change the two
+options above if those bindings conflict with your configuration.
 
-TPM logs are written to
-`${XDG_STATE_HOME:-~/.local/state}/tmux-recover/tpm.log`.
-
-## CLI
+If the binary is not in tmux's `PATH`, export its absolute path before starting
+tmux:
 
 ```sh
-# Current TMUX socket, or the default socket.
+export TMUX_RECOVER_BIN="$HOME/.local/bin/tmux-recover"
+```
+
+TPM is optional. Run `tmux-recover daemon` under your preferred supervisor for
+continuous saves, or use `tmux-recover save` manually.
+
+## Everyday use
+
+### Save and browse history
+
+```sh
+# Save now. Unchanged layouts are deduplicated.
 tmux-recover save
+
+# Record a named checkpoint even if the layout has not changed.
+tmux-recover save --label before-upgrade --pin
+
+# List saved history for the current tmux server.
 tmux-recover list
+
+# Inspect or verify the latest snapshot.
+tmux-recover show current
 tmux-recover show current --json
 tmux-recover validate current
-
-# Explicit server. Socket aliases are canonicalized.
-tmux-recover save --socket /tmp/tmux-1000/other
-
-# Foreground daemon, suitable for systemd or launchd.
-tmux-recover daemon --socket /tmp/tmux-1000/default
 ```
 
-An unlabeled `save` deduplicates unchanged structure and prints `unchanged`.
-`--label` always records a history entry. `--pin` pins the stored current
-snapshot when structure is unchanged instead of writing a duplicate.
-
-### Restore
-
-Start with a dry run:
+The list prefix uses `*` for the current snapshot, `+` for a user pin, and `!`
+for a bounded pre-restore safety snapshot. Use an ID printed by `list` wherever
+the examples use `SNAPSHOT`.
 
 ```sh
-tmux-recover restore 20260801T212922 --dry-run
+tmux-recover pin SNAPSHOT
+tmux-recover unpin SNAPSHOT
 ```
 
-By default, restore only replaces a 1 session / 1 window / 1 pane bootstrap
-whose pane has no explicit start command. Replacing real work requires explicit
-review and confirmation:
+### Recover after a reboot or server exit
+
+Start tmux, then preview the latest restore:
+
+```sh
+tmux-recover restore current --dry-run
+tmux-recover restore current
+```
+
+The second command can replace only a fresh one-session/one-window/one-pane
+bootstrap. If the target server already contains real work, review an explicit
+replacement plan first:
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --replace
 tmux-recover restore SNAPSHOT --replace --yes
 ```
 
-Missing cwd values fail preflight. A fallback must be explicit:
+Omit `--yes` to confirm interactively. A missing working directory fails
+preflight instead of silently choosing another location. When the original
+directory is intentionally gone, select a fallback yourself:
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
-Preflight validates snapshot identity, graph ownership, non-negative window
-indexes, restorable contiguous pane indexes, cwd availability, and the tmux
-layout checksum before any session is renamed. Dead panes are currently
-rejected because restoring them as live shells would silently change their
-state.
+Every real restore first captures the target server as a safety snapshot.
+Failures before the commit point restore the previous session names and client
+attachments; the result is recorded in a restore report.
 
-Restore has a reversible phase and a commit cleanup phase. Before commit, a
-failure removes newly created sessions and restores backup names and client
-attachments. After the restored state is complete and clients have switched,
-old backup deletion is irreversible. Cleanup failures therefore leave the new
-state live and are recorded as warnings in the restore report instead of
-triggering an unsafe rollback.
+### Restore selected programs on Linux
 
-Every non-dry-run restore records a pre-restore safety snapshot. Safety
-snapshots have a separate bounded retention policy and are marked with `!` in
-`list`; user pins are marked with `+` and remain until explicitly unpinned.
-Safety snapshots created by older versions as ordinary pins remain pinned and
-can be released with `tmux-recover unpin SNAPSHOT`.
+Processes are not restarted by default. To opt in, first review the plan:
 
-### Process restore
+```sh
+tmux-recover restore current --dry-run --restore-processes
+tmux-recover restore current --restore-processes
+```
 
-Processes are not restored by default. `--restore-processes` only launches
-trusted native restart metadata whose executable basename is in
-`restore.process_allowlist`. Imported resurrect command strings are never
-executed.
+Only native restart metadata marked trusted and allowlisted by executable name
+is launched. Edit `restore.process_allowlist` in the configuration to match
+your needs. Imported tmux-resurrect command strings are never executed.
 
-Restored programs run under a fixed `/bin/sh` supervisor. SIGINT and SIGQUIT
-are reset for the program, and tmux's captured `default-shell` is entered after
-the program exits. This keeps `C-c` from destroying the pane. Known limitation:
-`C-z` can stop the program while the supervisor waits, leaving the pane stuck.
+### Enable automatic recovery
 
-#### Process checkpoint sidecar
+Automatic restore is off by default. Enable it in `config.toml`:
 
-Structural dedup means a history snapshot may predate the program currently
-running in a pane. `process-current.json` fills that gap without appending
-history. It tracks `pane_id`, `current_command`, and `restart`, is refreshed on
-a separate interval, and is atomically overwritten only when relevant process
-state changes.
+```toml
+[restore]
+auto = true
+auto_bootstrap_max_age_seconds = 30
+```
 
-The sidecar is only eligible when restoring `current` from the same socket
-store with `--restore-processes`, and only when its snapshot ID, structural
-hash, socket identity, server generation, and complete pane set all match.
-Otherwise restore falls back to the snapshot's own metadata and reports a
-warning. A sidecar `restart: null` is authoritative and suppresses older
-snapshot restart metadata for that pane.
+The watcher restores only a newly created, empty bootstrap server. It leaves an
+older or non-empty server untouched, and a failed preflight does not stop later
+autosaves.
 
-Dry runs and JSON plans expose `process_metadata_source` and checkpoint capture
-time.
-
-### tmux-resurrect import
+### Import tmux-resurrect history
 
 ```sh
 tmux-recover import-resurrect \
@@ -164,129 +205,102 @@ tmux-recover show --imports current --json
 tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 ```
 
-Imports are kept in a separate store and are never structurally deduplicated.
-The importer recognizes v3/v4 and repairs the known v4 empty-title field shift
-only when its signature is unambiguous. Diagnostics record repaired, ambiguous,
-and lossy rows.
+Imports live in a separate history. Ambiguous or lossy legacy rows are reported
+instead of being guessed, and imported command text remains non-executable.
 
-## Automatic restore
+### Work with more than one tmux server
 
-Automatic restore is disabled by default:
+Commands use the socket in `$TMUX`, or tmux's default socket when run outside a
+client. Select another server explicitly when needed:
 
-```toml
-[restore]
-auto = true
-auto_bootstrap_max_age_seconds = 30
+```sh
+tmux-recover save --socket /tmp/tmux-1000/other
+tmux-recover list --socket /tmp/tmux-1000/other
+tmux-recover daemon --socket /tmp/tmux-1000/other
 ```
-
-The daemon only auto-restores a young 1/1/1 bootstrap whose pane is running the
-server's `default-shell` and has no explicit start command. Preflight failures
-leave the server untouched and the daemon continues watching.
 
 ## Configuration and data
 
-Default configuration locations:
+Copy [config.example.toml](config.example.toml) to the platform configuration
+path and change only the values you need:
 
-- Linux: `${XDG_CONFIG_HOME:-~/.config}/tmux-recover/config.toml`
+- Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/tmux-recover/config.toml`
 - macOS: `~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
 
-See [config.example.toml](config.example.toml) for every option. Important
-storage and daemon controls include:
-
-```toml
-[autosave]
-hook_slot = 901
-process_checkpoint_interval = 300
-
-[retention]
-safety_snapshots = 10
-```
-
-The daemon installs a persistent `wait-for` event hook with tmux's atomic
-set-if-absent option update. An identical hook from an earlier daemon is reused;
-every other command in `hook_slot` is left untouched and makes the daemon warn
-and continue with low-frequency polling. The hook remains available across
-daemon reconnects and restarts, so shutdown never needs a racy check-and-remove
-operation. Use a dedicated slot when event-driven saves are important.
-
-Versions that predate the persistent hook used a client-specific
-`display-message -c ... tmux-recover:state-changed` command. If a crashed old
-daemon left those entries behind, startup reports every exact legacy hook and
-does not remove it automatically: the entry could have been replaced between
-inspection and removal. Stop any old daemon, then unset only the reported
-entries on the explicit target socket, for example:
-
-```sh
-tmux -S /tmp/tmux-1000/default set-hook -gu 'after-new-window[901]'
-```
-
-Repeat that command for each hook named in the error, then restart the daemon.
-Choosing another dedicated `autosave.hook_slot` is also safe.
-
-Linux data defaults to `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`:
-
-```text
-sockets/<socket-key>/
-  snapshots/*.json[.zst]
-  current.json
-  process-current.json
-  pins/
-  safety/
-  restores/*.json
-  daemon.lock
-  mutation.lock
-imports/
-```
-
 The default retention policy keeps the latest 100 snapshots, one per hour for
-30 days, one per day for 180 days, and the latest 10 safety snapshots. Current
-and user-pinned snapshots are exempt. `storage.zstd = true` enables compressed
-snapshot envelopes.
+30 days, one per day for 180 days, and the latest 10 pre-restore safety
+snapshots. Current and user-pinned snapshots are exempt. Optional zstd
+compression is enabled with `storage.zstd = true`.
 
-Every history filename must be exactly `<snapshot.id>.json` or
-`<snapshot.id>.json.zst`. Direct reads and pinning reject a mismatch; `list`
-skips it, and retention logs a warning and leaves the file untouched.
-Retention still cross-checks the filename against the body ID, but a long-lived
-daemon caches that validated ID while the file's metadata fingerprint remains
-unchanged. The first prune after process startup is a cold scan; later prunes
-read and decompress only new or externally changed history files.
+Linux stores snapshots under
+`${XDG_DATA_HOME:-$HOME/.local/share}/tmux-recover`; macOS uses its standard
+Application Support directory. Each canonical tmux socket has an isolated
+subdirectory. Snapshots may contain working directories, titles, and process
+arguments, so do not publish them without sanitizing them.
 
-All `current.json` readers validate its schema, safe ID and filename components,
-the exact ID-to-filename relationship, and the semantic hash shape. A malformed
-pointer is never used to mark or retain a current snapshot: `list` warns and
-marks none as current, while `prune` fails before deleting history.
+TPM logs are written to
+`${XDG_STATE_HOME:-$HOME/.local/state}/tmux-recover/tpm.log`. See
+[Troubleshooting](docs/troubleshooting.md) for missing binaries, old tmux
+versions, cwd failures, hook-slot conflicts, and legacy development hooks.
 
-The systemd user service template is
-[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service).
-Its instance must be the `systemd-escape` result of the socket path:
+## Upgrade and uninstall
 
-```sh
-instance="$(systemd-escape '/tmp/tmux-1000/default')"
-systemctl --user enable --now "tmux-recover@${instance}.service"
-```
-
-TPM remains the recommended server-lifecycle integration on Linux and macOS.
-
-## Design and limitations
-
-- [Architecture and restore transaction](docs/architecture.md)
-- [Snapshot schema and atomic storage](docs/snapshot-format.md)
-- Scrollback and pane contents are not saved in v1.
-- Dead panes are captured but restore currently rejects them before mutation.
-- Pane titles may later be legitimately changed by shells or programs through
-  OSC sequences.
-- macOS captures structural state but does not currently collect restart
-  metadata.
-- Unescaped tabs or newlines in resurrect files may be inherently ambiguous;
-  the importer records diagnostics instead of guessing executable commands.
-
-## Development
+To upgrade a prebuilt installation, repeat the release download and `install`
+steps with the latest archive. To update a Cargo installation:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo install --git https://github.com/hmgle/tmux-recover --locked --force
 ```
 
-tmux-backed tests use dedicated temporary `tmux -S` sockets and never mutate
-the ambient server.
+For a source checkout, run `git pull --ff-only` and `./scripts/install.sh`.
+With TPM, press `prefix` + <kbd>U</kbd> to update the plugin checkout and update
+the binary separately using one of the methods above.
+
+Replacing the file does not replace an already running watcher. Manual CLI
+commands use the new binary immediately; the TPM watcher adopts it the next
+time that tmux server starts. A supervised installation can be restarted
+immediately, for example with `systemctl --user restart` for its exact service
+instance. Do not terminate a tmux server merely to upgrade tmux-recover.
+
+Before uninstalling, remove the TPM entry or supervisor unit so it will not
+start again. Then use the matching installation method:
+
+```sh
+# Installation made by scripts/install.sh
+./scripts/uninstall.sh
+
+# Installation made by cargo install
+cargo uninstall tmux-recover
+```
+
+Configuration, snapshots, reports, and TPM files are intentionally retained.
+Back them up or remove them separately only after confirming they are no longer
+needed.
+
+## Safety model and limitations
+
+- Restore validates snapshot identity, graph references, indexes, working
+  directories, and tmux layouts before changing the target server.
+- Existing sessions remain available during the reversible phase. Old backup
+  deletion begins only after the restored state is complete and clients have
+  switched.
+- Captures and multi-file updates are serialized so a delayed older save cannot
+  become current after a newer one.
+- Scrollback and pane contents are not saved in snapshot schema v1.
+- Dead panes are captured but currently rejected during restore because
+  recreating them as live shells would change their meaning.
+- macOS does not currently collect program restart metadata.
+- Pane titles can later be changed by shells or programs through terminal
+  escape sequences.
+
+More detail is available in [Architecture](docs/architecture.md) and
+[Snapshot format](docs/snapshot-format.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development checks and isolated
+tmux test requirements. Report sensitive problems through the process in
+[SECURITY.md](SECURITY.md). User-visible changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
+
+tmux-recover is available under the [MIT License](LICENSE).

@@ -1,137 +1,185 @@
 # tmux-recover
 
+[![CI](https://github.com/hmgle/tmux-recover/actions/workflows/ci.yml/badge.svg)](https://github.com/hmgle/tmux-recover/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/hmgle/tmux-recover?sort=semver)](https://github.com/hmgle/tmux-recover/releases/latest)
+[![License](https://img.shields.io/github/license/hmgle/tmux-recover)](LICENSE)
+[![tmux 3.7+](https://img.shields.io/badge/tmux-3.7%2B-1BB91F)](https://github.com/tmux/tmux/releases)
+[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-DEA584?logo=rust)](Cargo.toml)
+
 [English](README.md)
 
-`tmux-recover` 是一个用 Rust 实现的 tmux 会话快照、恢复和持续保存工具。它不
-依赖 tmux-resurrect 或 tmux-continuum，也不修改 `status-right`。
+`tmux-recover` 持续保存 tmux 会话，并在重启、崩溃或 server 意外退出后恢复工作
+环境。它会记住 session/window/pane 结构、工作目录、名称、布局、当前选择和 zoom
+状态，同时不会接管你的状态栏。
 
-## 功能
+恢复操作有意采用保守策略：替换真实工作前先校验快照并展示计划；真正恢复前创建
+安全快照；提交前的步骤失败时自动回滚。
 
-- 通过单个持久 tmux control-mode 连接抓取完整 server 状态；
-- 保存 session、linked/grouped window、pane、cwd、title、layout、active 和 zoom；
-- 结构变化由 tmux hooks 触发，cwd、title 和进程变化由低频轮询发现；
-- 使用 canonical connection path 计算 socket identity，使 symlink、相对路径以及
-  macOS 的 `/var` 与 `/private/var` 别名共享同一个 store 与锁，即使 tmux 回报原始拼写；
-- 在 daemon 和 CLI 之间串行化 capture 与跨文件发布，避免延迟的旧 capture 把
-  `current` 回退到新 save 之前；
-- JSON 区分空字符串、`null` 和缺失值，并保留非 UTF-8 Unix 路径；
-- 恢复前执行 preflight，可逆阶段保留旧 session，并写入持久 restore report；
-- 使用独立 checkpoint sidecar 跟踪 pane 当前运行的程序；
-- 导入 tmux-resurrect v3/v4，但永远不信任导入的命令文本。
+## 为什么选择 tmux-recover？
 
-要求 tmux 3.7+ 和 Rust 1.85+。支持 Linux 与 macOS；Linux 通过 `/proc` 采集
-可选的进程重启元数据。
+- **持续历史：**结构变化后快速保存，同时低频检查工作目录、标题等不易触发事件的
+  信息；
+- **安全恢复：**提供 dry-run 预检、显式替换、回滚、安全快照和持久恢复报告；
+- **每个 tmux server 独立：**不同 socket 的历史互不混淆，包括通过软链接或不同
+  路径写法访问的同一个 socket；
+- **有上限的存储：**保留近期、每小时和每日历史，重要快照可长期 pin；
+- **平滑迁移：**可导入 tmux-resurrect v3/v4 文件，但不会执行导入的命令文本；
+- **方便自动化：**默认输出适合人阅读，也可用 JSON 做检查或脚本处理。
 
-## 安装
+支持 Linux 和 macOS，要求 tmux 3.7+。源码构建要求 Rust 1.85+。进程重启元数据
+目前只在 Linux 上采集且必须显式启用；普通会话恢复在两个平台都可使用。
+
+## 快速开始
+
+### 1. 安装 binary
+
+从 [最新 Release](https://github.com/hmgle/tmux-recover/releases/latest) 下载预编译包：
+
+| 平台 | Release target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple 芯片 | `aarch64-apple-darwin` |
+
+例如 Linux x86_64 可执行：
 
 ```sh
-cargo install --path . --locked
+target=x86_64-unknown-linux-musl
+archive="tmux-recover-$target"
+curl -fLO "https://github.com/hmgle/tmux-recover/releases/latest/download/$archive.tar.gz"
+curl -fLO "https://github.com/hmgle/tmux-recover/releases/latest/download/$archive.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "$archive.tar.gz.sha256"
+else
+  shasum -a 256 -c "$archive.tar.gz.sha256"
+fi
+tar -xzf "$archive.tar.gz"
+install -d "$HOME/.local/bin"
+install -m 0755 "$archive/tmux-recover" "$HOME/.local/bin/tmux-recover"
 ```
 
-安装到 `~/.local/bin`：
+请确保启动 tmux 的环境能在 `PATH` 中找到 `$HOME/.local/bin`。
+
+也可以用 Cargo 构建当前 `main` 分支：
 
 ```sh
-./scripts/install.sh
+cargo install --git https://github.com/hmgle/tmux-recover --locked
 ```
 
-### TPM
+在源码或 TPM checkout 中运行 `./scripts/install.sh`，会按 lock file 构建 release
+binary，并安装到 `${PREFIX:-$HOME/.local}/bin`。
+
+### 2. 启用 TPM 集成
+
+在 `.tmux.conf` 中把插件放在 TPM 初始化之前：
 
 ```tmux
-set -g @plugin 'gle/tmux-recover'
+set -g @plugin 'hmgle/tmux-recover'
 
-# 可选；默认 C-s 保存，C-r 安全恢复。
+# 可选：按下 tmux prefix 后使用的按键。
 set -g @tmux-recover-save-key 'C-s'
 set -g @tmux-recover-restore-key 'C-r'
 
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-TPM 入口会为当前 canonical tmux socket 启动一个后台 daemon。重复启动会因
-daemon 单实例锁而退出。binary 不在 `PATH` 时，请在启动 tmux 前设置
-`TMUX_RECOVER_BIN`。
+按 `prefix` + <kbd>I</kbd> 安装插件，然后重新加载 tmux 配置。TPM 会为当前 tmux
+server 启动一个后台 watcher。`prefix` + <kbd>Ctrl-s</kbd> 立即保存；在空的初始
+server 中，`prefix` + <kbd>Ctrl-r</kbd> 恢复最新快照。如果按键与现有配置冲突，
+请修改上面的两个 option。
 
-TPM 日志位于 `${XDG_STATE_HOME:-~/.local/state}/tmux-recover/tpm.log`。
-
-## CLI
+如果 tmux 的 `PATH` 找不到 binary，请在启动 tmux 前导出绝对路径：
 
 ```sh
-# 当前 TMUX socket，或默认 socket。
+export TMUX_RECOVER_BIN="$HOME/.local/bin/tmux-recover"
+```
+
+TPM 不是必需项。可以在自己的 supervisor 下运行 `tmux-recover daemon` 持续保存，
+也可以只手动执行 `tmux-recover save`。
+
+## 日常使用
+
+### 保存和查看历史
+
+```sh
+# 立即保存；布局未变化时会去重。
 tmux-recover save
+
+# 即使布局未变化，也记录并长期保留一个有名称的检查点。
+tmux-recover save --label before-upgrade --pin
+
+# 列出当前 tmux server 的历史。
 tmux-recover list
+
+# 查看或校验最新快照。
+tmux-recover show current
 tmux-recover show current --json
 tmux-recover validate current
-
-# 显式指定 server；socket 别名会被 canonicalize。
-tmux-recover save --socket /tmp/tmux-1000/other
-
-# 前台 daemon，适合 systemd/launchd。
-tmux-recover daemon --socket /tmp/tmux-1000/default
 ```
 
-无 label 的 `save` 会对未变化结构去重并输出 `unchanged`。`--label` 总会写入一条
-历史；结构未变化时，`--pin` 会 pin 当前已存快照，而不是复制一份。
-
-### 恢复
-
-先执行 dry-run：
+列表前缀中，`*` 表示当前快照，`+` 表示用户 pin，`!` 表示有数量上限的恢复前安全
+快照。下面示例里的 `SNAPSHOT` 可替换成 `list` 输出的 ID。
 
 ```sh
-tmux-recover restore 20260801T212922 --dry-run
+tmux-recover pin SNAPSHOT
+tmux-recover unpin SNAPSHOT
 ```
 
-默认只允许替换一个无显式启动命令的 1 session / 1 window / 1 pane bootstrap。
-替换真实工作状态需要明确 review 和确认：
+### 重启或 server 退出后恢复
+
+先启动 tmux，再预览最新恢复计划：
+
+```sh
+tmux-recover restore current --dry-run
+tmux-recover restore current
+```
+
+第二条命令只能替换刚创建的 1 session / 1 window / 1 pane 空白 server。如果目标
+server 已经有真实工作，必须先检查显式替换计划：
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --replace
 tmux-recover restore SNAPSHOT --replace --yes
 ```
 
-cwd 缺失时 preflight 默认失败；fallback 必须显式指定：
+不传 `--yes` 会进行交互确认。原工作目录不存在时，preflight 会失败，不会悄悄换到
+其他目录。确认原目录已不再需要时，可以自行选择 fallback：
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --cwd-fallback HOME
 tmux-recover restore SNAPSHOT --cwd-fallback /known/safe/path
 ```
 
-preflight 会在重命名任何 session 前校验 snapshot identity、状态图所有权、非负
-window index、可重建的连续 pane index、cwd 可用性和 layout checksum。dead pane
-当前会被明确拒绝，因为把它恢复成 live shell 会静默改变原状态。
+每次真实恢复都会先把目标 server 保存成安全快照。commit point 之前的失败会恢复
+原 session 名称和客户端附着状态，结果会写入 restore report。
 
-恢复分为可逆阶段和 commit cleanup 阶段。commit 前失败会删除新建 session，恢复
-备份名称和普通客户端附着。新状态完整建立且客户端完成切换后，删除旧备份是不可逆
-操作；因此 cleanup 失败会保留新状态，并在 restore report 中记录 warning，而不会
-执行可能同时丢失新旧状态的 rollback。
+### 在 Linux 上恢复选定程序
 
-每次非 dry-run 恢复都会记录一份恢复前 safety snapshot。safety snapshot 使用独立、
-有上限的保留策略，在 `list` 中以 `!` 标记；用户 pin 使用 `+` 标记，并一直保留到
-显式 unpin。旧版本以普通 pin 保存的 safety snapshot 会继续保持 pin，可通过
-`tmux-recover unpin SNAPSHOT` 释放。
+默认不重启进程。需要时先检查计划，再显式启用：
 
-### 进程恢复
+```sh
+tmux-recover restore current --dry-run --restore-processes
+tmux-recover restore current --restore-processes
+```
 
-进程默认不恢复。只有显式传入 `--restore-processes`，且 native restart metadata
-为 trusted、可执行文件 basename 位于 `restore.process_allowlist` 时才会启动。
-导入的 resurrect 命令文本永远不会执行。
+只有 native restart metadata 标记为 trusted，且可执行文件名位于 allowlist 时才会
+启动。可在配置中按需修改 `restore.process_allowlist`。导入的 tmux-resurrect 命令
+文本永远不会执行。
 
-恢复程序运行在固定的 `/bin/sh` supervisor 中。程序启动前重置 SIGINT/SIGQUIT，
-程序退出后进入目标 tmux server 捕获的 `default-shell`，避免 `C-c` 连同 pane 一起
-杀掉。已知限制：`C-z` 可能暂停程序而 supervisor 继续等待，使 pane 卡住。
+### 启用自动恢复
 
-#### 进程 checkpoint sidecar
+自动恢复默认关闭。在 `config.toml` 中启用：
 
-结构去重意味着历史快照可能早于 pane 当前运行的程序。`process-current.json` 在不
-追加历史的情况下补齐这部分状态，记录 `pane_id`、`current_command` 和 `restart`，
-按独立 interval 刷新，并仅在相关进程状态变化时原子覆盖。
+```toml
+[restore]
+auto = true
+auto_bootstrap_max_age_seconds = 30
+```
 
-sidecar 只会用于同一 socket store 的 `current` + `--restore-processes`，并要求
-snapshot ID、structural hash、socket identity、server generation 和完整 pane 集合
-全部匹配。否则恢复会回退到 snapshot 自带元数据并报告 warning。sidecar 中的
-`restart: null` 是权威状态，会压制该 pane 更旧的 snapshot restart metadata。
+watcher 只会恢复刚创建的空白 server；较旧或非空 server 保持不变。preflight 失败
+也不会阻止后续 autosave。
 
-dry-run 和 JSON plan 会输出 `process_metadata_source` 与 checkpoint 捕获时间。
-
-### tmux-resurrect 导入
+### 导入 tmux-resurrect 历史
 
 ```sh
 tmux-recover import-resurrect \
@@ -142,116 +190,85 @@ tmux-recover show --imports current --json
 tmux-recover restore --from-imports current --dry-run --cwd-fallback HOME
 ```
 
-导入快照保存在独立 store 中，并且永远不做结构去重。导入器识别 v3/v4，只有在字段
-签名明确时才修复已知的 v4 空 title 错位；repaired、ambiguous 和 lossy 行都会写入
-diagnostics。
+导入记录保存在单独的历史中。遇到有歧义或有损的旧格式行时会报告问题而不是猜测，
+导入的命令文本始终不可执行。
 
-## 自动恢复
+### 使用多个 tmux server
 
-自动恢复默认关闭：
+命令默认使用 `$TMUX` 中的 socket；不在 client 内运行时使用 tmux 默认 socket。
+需要时可显式选择其他 server：
 
-```toml
-[restore]
-auto = true
-auto_bootstrap_max_age_seconds = 30
+```sh
+tmux-recover save --socket /tmp/tmux-1000/other
+tmux-recover list --socket /tmp/tmux-1000/other
+tmux-recover daemon --socket /tmp/tmux-1000/other
 ```
-
-daemon 仅自动恢复足够新的 1/1/1 bootstrap，并要求 pane 正在运行 server 的
-`default-shell` 且没有显式 start command。preflight 失败不会修改 server，daemon
-会继续监控。
 
 ## 配置与数据
 
-默认配置路径：
+把 [config.example.toml](config.example.toml) 复制到平台配置路径，只修改需要的值：
 
-- Linux: `${XDG_CONFIG_HOME:-~/.config}/tmux-recover/config.toml`
-- macOS: `~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
+- Linux：`${XDG_CONFIG_HOME:-$HOME/.config}/tmux-recover/config.toml`
+- macOS：`~/Library/Application Support/dev.tmux-recover.tmux-recover/config.toml`
 
-完整配置见 [config.example.toml](config.example.toml)。重要的 daemon 与存储配置：
+默认保留最新 100 份快照、30 天内每小时一份、180 天内每天一份，以及最新 10 份
+恢复前安全快照。current 和用户 pin 不会被清理。设置 `storage.zstd = true` 可启用
+zstd 压缩。
 
-```toml
-[autosave]
-hook_slot = 901
-process_checkpoint_interval = 300
+Linux 数据默认位于 `${XDG_DATA_HOME:-$HOME/.local/share}/tmux-recover`，macOS 使用
+标准 Application Support 目录。每个 canonical tmux socket 都有独立子目录。快照
+可能包含工作目录、标题和进程参数，未经脱敏不要公开。
 
-[retention]
-safety_snapshots = 10
-```
+TPM 日志位于 `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-recover/tpm.log`。binary
+找不到、tmux 版本过旧、cwd 恢复失败、hook slot 冲突和旧开发版 hook 的处理方法见
+[故障排查](docs/troubleshooting.md)。
 
-daemon 使用 tmux 原子的 set-if-absent option update 安装持久 `wait-for` event hook。
-之前 daemon 留下的相同 hook 会被复用；`hook_slot` 中的其他命令会保持不变，并使启动
-失败。hook 可跨 control connection 重连和 daemon 重启继续使用，因此 shutdown 不再
-执行存在竞态的 check-and-remove。应使用专用 slot。
+## 升级与卸载
 
-更早版本使用绑定 client 的
-`display-message -c ... tmux-recover:state-changed` 命令。如果旧 daemon 崩溃后留下
-这类 entry，新版本启动时会列出所有严格匹配的 legacy hook，但不会自动删除：检查后
-到删除前，该 entry 可能已被其他进程替换。请先停止所有旧 daemon，再在明确指定的
-目标 socket 上只清除错误中列出的 entry，例如：
+预编译安装可重复最新 Release 的下载与 `install` 步骤。Cargo 安装可执行：
 
 ```sh
-tmux -S /tmp/tmux-1000/default set-hook -gu 'after-new-window[901]'
+cargo install --git https://github.com/hmgle/tmux-recover --locked --force
 ```
 
-对错误中列出的每个 hook 重复该命令，然后重启 daemon；改用另一个专用的
-`autosave.hook_slot` 也同样安全。
+源码 checkout 中运行 `git pull --ff-only` 和 `./scripts/install.sh`。使用 TPM 时，按
+`prefix` + <kbd>U</kbd> 更新插件 checkout，并另外使用上述任一方式更新 binary。
 
-Linux 默认数据目录是 `${XDG_DATA_HOME:-~/.local/share}/tmux-recover`：
+替换磁盘上的文件不会替换已经运行的 watcher。手动 CLI 会立即使用新 binary；TPM
+watcher 会在该 tmux server 下次启动时采用新版本。由 supervisor 管理时可以立即重启
+精确的服务实例，例如执行对应实例的 `systemctl --user restart`。不要仅为升级
+tmux-recover 而终止 tmux server。
 
-```text
-sockets/<socket-key>/
-  snapshots/*.json[.zst]
-  current.json
-  process-current.json
-  pins/
-  safety/
-  restores/*.json
-  daemon.lock
-  mutation.lock
-imports/
-```
-
-默认保留最新 100 份、30 天内每小时一份、180 天内每天一份，以及最新 10 份 safety
-snapshot。current 和用户 pin 不会被清理。`storage.zstd = true` 可启用压缩快照。
-
-每个历史文件名必须严格为 `<snapshot.id>.json` 或 `<snapshot.id>.json.zst`。直接读取
-和 pin 会拒绝不一致文件；`list` 会跳过，retention 会记录 warning 并保留原文件。
-retention 仍会交叉校验文件名与内容 ID，但长驻 daemon 会在文件 metadata fingerprint
-未变化时复用已验证 ID。进程启动后的第一次 prune 是冷扫描；后续 prune 只读取并解压
-新增或被外部修改的历史文件。
-
-所有 `current.json` reader 都会校验 schema、安全的 ID 与 filename component、两者的
-严格对应关系及 semantic hash 格式。损坏的 pointer 不会再用于标记或保留 current：
-`list` 会 warning 并且不标记任何 current，`prune` 会在删除历史前失败。
-
-systemd user service 模板位于
-[contrib/systemd/tmux-recover@.service](contrib/systemd/tmux-recover@.service)。实例名必须
-是 socket 路径经 `systemd-escape` 转义后的结果：
+卸载前先删除 TPM 配置或 supervisor unit，避免再次启动。然后按安装方式执行：
 
 ```sh
-instance="$(systemd-escape '/tmp/tmux-1000/default')"
-systemctl --user enable --now "tmux-recover@${instance}.service"
+# 通过 scripts/install.sh 安装
+./scripts/uninstall.sh
+
+# 通过 cargo install 安装
+cargo uninstall tmux-recover
 ```
 
-Linux/macOS 上仍推荐使用 TPM 集成 server 生命周期。
+配置、快照、报告和 TPM 文件会有意保留。请先备份或确认不再需要，再单独清理。
 
-## 设计与限制
+## 安全模型与限制
 
-- [架构与恢复事务](docs/architecture.md)
-- [snapshot schema 与原子存储](docs/snapshot-format.md)
-- v1 不保存 scrollback 或 pane contents；
-- dead pane 会被捕获，但恢复会在修改 server 前拒绝；
-- pane title 可能被 shell 或程序通过 OSC 合法更新；
-- macOS 当前保存结构状态，但不采集 restart metadata；
-- resurrect 中未转义的 Tab/换行可能无法无损消歧，导入器会记录 diagnostics，而不是
-  猜测为可执行命令。
+- 修改目标 server 前会校验快照 identity、对象引用、index、工作目录和 tmux layout；
+- 可逆阶段会保留现有 session；只有新状态完整建立、客户端完成切换后，才开始删除旧
+  backup；
+- capture 和多文件更新会串行执行，避免延迟的旧保存覆盖较新的 current；
+- snapshot schema v1 不保存 scrollback 和 pane 内容；
+- dead pane 会被抓取，但恢复时暂时拒绝，因为重建成 live shell 会改变原状态含义；
+- macOS 暂不采集程序重启元数据；
+- shell 或程序可通过 terminal escape sequence 再次修改 pane title。
 
-## 开发
+更多实现细节见[架构与恢复事务](docs/architecture.md)和
+[快照格式与原子存储](docs/snapshot-format.md)。
 
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-```
+## 参与贡献
 
-所有 tmux-backed 测试均使用独立临时 `tmux -S` socket，不会修改当前 ambient server。
+开发检查和隔离 tmux 测试要求见 [CONTRIBUTING.md](CONTRIBUTING.md)；敏感问题请按
+[SECURITY.md](SECURITY.md) 私下报告；用户可见变更记录在
+[CHANGELOG.md](CHANGELOG.md)。
+
+tmux-recover 使用 [MIT License](LICENSE)。
