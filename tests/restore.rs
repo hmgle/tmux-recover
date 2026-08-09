@@ -64,6 +64,11 @@ async fn restores_special_fields_active_pane_and_zoom() {
     let cwd_two = server.directory.path().join("cwd\ttab\nline:雪");
     std::fs::create_dir(&cwd_one).unwrap();
     std::fs::create_dir(&cwd_two).unwrap();
+    // macOS tempfile paths use /var while tmux reports the canonical
+    // /private/var spelling. Exercise the same directories through their
+    // canonical identities so restore assertions compare like with like.
+    let cwd_one = cwd_one.canonicalize().unwrap();
+    let cwd_two = cwd_two.canonicalize().unwrap();
 
     let first = output(
         server
