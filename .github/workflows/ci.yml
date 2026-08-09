@@ -2,13 +2,59 @@ name: CI
 
 on:
   push:
+    branches: [main, dev]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  quality:
+    name: Format, lint, and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check shell scripts
+        run: shellcheck scripts/*.sh tmux-recover.tmux
+      - name: Check release package
+        run: cargo package --locked
+
+  msrv:
+    name: Rust 1.85 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --locked --all-targets
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test:
+    name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -17,14 +63,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
-      - name: Install tmux on Linux
+      - name: Build tmux 3.7b on Linux
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison libevent-dev libncurses-dev pkg-config
+          curl --fail --location --silent --show-error \
+            https://github.com/tmux/tmux/archive/refs/tags/3.7b.tar.gz \
+            --output /tmp/tmux-3.7b.tar.gz
+          echo "156dc43dcbc7f06e35e1fae3118c44d77a370c46676b34b82bbafc4e608d8130  /tmp/tmux-3.7b.tar.gz" \
+            | sha256sum --check
+          tar -xzf /tmp/tmux-3.7b.tar.gz -C /tmp
+          cd /tmp/tmux-3.7b
+          sh autogen.sh
+          ./configure
+          make -j2
+          sudo make install
       - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets
+      - name: Verify supported tmux version
+        run: |
+          tmux_version="$(tmux -V | awk '{print $2}')"
+          tmux_major="${tmux_version%%.*}"
+          tmux_minor="${tmux_version#*.}"
+          tmux_minor="${tmux_minor%%[!0-9]*}"
+          test "$tmux_major" -gt 3 || {
+            test "$tmux_major" -eq 3 && test "$tmux_minor" -ge 7
+          }
+          tmux -V
+      - run: cargo test --locked --all-targets
