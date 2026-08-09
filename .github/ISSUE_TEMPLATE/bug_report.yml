@@ -1,0 +1,52 @@
+name: Bug report
+description: Report reproducible incorrect behavior or a crash.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please remove private paths, commands, and session names from logs or snapshots.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the result you saw and the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run ...
+        2. Change ...
+        3. Restore ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: tmux-recover version
+      placeholder: Output of tmux-recover --version
+    validations:
+      required: true
+  - type: input
+    id: tmux
+    attributes:
+      label: tmux version
+      placeholder: Output of tmux -V
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+      placeholder: Distribution/macOS version and CPU architecture
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste sanitized CLI output or daemon log lines here.
+      render: shell
