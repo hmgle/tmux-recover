@@ -371,23 +371,23 @@ impl TmuxState {
                 }
                 owned_window_ids.insert(link.window_id.as_str());
             }
-            if let Some(active) = &session.active_window_id
-                && !linked_ids.contains(active.as_str())
-            {
-                bail!(
-                    "session {} references active window {} that it does not link",
-                    session.name,
-                    active
-                );
+            if let Some(active) = &session.active_window_id {
+                if !linked_ids.contains(active.as_str()) {
+                    bail!(
+                        "session {} references active window {} that it does not link",
+                        session.name,
+                        active
+                    );
+                }
             }
-            if let Some(last) = &session.last_window_id
-                && !linked_ids.contains(last.as_str())
-            {
-                bail!(
-                    "session {} references last window {} that it does not link",
-                    session.name,
-                    last
-                );
+            if let Some(last) = &session.last_window_id {
+                if !linked_ids.contains(last.as_str()) {
+                    bail!(
+                        "session {} references last window {} that it does not link",
+                        session.name,
+                        last
+                    );
+                }
             }
         }
         for window in &self.windows {
@@ -447,14 +447,14 @@ impl TmuxState {
                     );
                 }
             }
-            if let Some(active) = &window.active_pane_id
-                && !pane_ids.contains(active.as_str())
-            {
-                bail!(
-                    "window {} references missing active pane {}",
-                    window.name,
-                    active
-                );
+            if let Some(active) = &window.active_pane_id {
+                if !pane_ids.contains(active.as_str()) {
+                    bail!(
+                        "window {} references missing active pane {}",
+                        window.name,
+                        active
+                    );
+                }
             }
         }
         Ok(())

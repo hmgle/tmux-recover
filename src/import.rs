@@ -320,10 +320,10 @@ impl Builder {
             });
         }
         let window = self.windows.get_mut(&key).expect("window exists");
-        if window.name.is_empty()
-            && let Some(name) = &parsed.window_name
-        {
-            window.name.clone_from(name);
+        if window.name.is_empty() {
+            if let Some(name) = &parsed.window_name {
+                window.name.clone_from(name);
+            }
         }
         let id = pane_id(&parsed.session, parsed.window_index, parsed.index);
         if parsed.active {

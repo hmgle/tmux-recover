@@ -244,16 +244,17 @@ impl SnapshotStore {
         // Origin field is stable within a generation, so this cannot cause
         // per-tick churn; a tool or tmux upgrade writes one extra snapshot,
         // which is a real history boundary worth recording.
-        if dedup == Dedup::OnUnchangedStructure
-            && set_current
-            && let Ok(current) = self.load_current()
-            && current.origin == snapshot.origin
-            && current.state.structural_hash()? == structural_hash
-        {
-            return Ok(CommitResult {
-                outcome: CommitOutcome::Unchanged,
-                structural_hash,
-            });
+        if dedup == Dedup::OnUnchangedStructure && set_current {
+            if let Ok(current) = self.load_current() {
+                if current.origin == snapshot.origin
+                    && current.state.structural_hash()? == structural_hash
+                {
+                    return Ok(CommitResult {
+                        outcome: CommitOutcome::Unchanged,
+                        structural_hash,
+                    });
+                }
+            }
         }
 
         let extension = if self.compression { "json.zst" } else { "json" };

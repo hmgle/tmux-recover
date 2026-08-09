@@ -179,11 +179,10 @@ pub fn preflight(
                         .unwrap_or_default(),
                     None => pane.restart.as_ref(),
                 };
-                if let Some(restart) = restart
-                    && restart.trusted
-                    && allowlist.contains(process_basename(restart).as_str())
-                {
-                    restart_specs.insert(pane.id.clone(), restart.clone());
+                if let Some(restart) = restart {
+                    if restart.trusted && allowlist.contains(process_basename(restart).as_str()) {
+                        restart_specs.insert(pane.id.clone(), restart.clone());
+                    }
                 }
             }
         }
@@ -1176,32 +1175,33 @@ async fn restore_session_windows(
         let new_session = session_ids
             .get(&session.id)
             .context("missing restored session")?;
-        if let Some(last) = &session.last_window_id
-            && let Some(link) = session.windows.iter().find(|link| &link.window_id == last)
-        {
-            execute_empty(
-                client,
-                &format!(
-                    "switch-client -t {}",
-                    quote(&format!("{new_session}:{}", link.index))
-                ),
-            )
-            .await?;
+        if let Some(last) = &session.last_window_id {
+            if let Some(link) = session.windows.iter().find(|link| &link.window_id == last) {
+                execute_empty(
+                    client,
+                    &format!(
+                        "switch-client -t {}",
+                        quote(&format!("{new_session}:{}", link.index))
+                    ),
+                )
+                .await?;
+            }
         }
-        if let Some(active) = &session.active_window_id
-            && let Some(link) = session
+        if let Some(active) = &session.active_window_id {
+            if let Some(link) = session
                 .windows
                 .iter()
                 .find(|link| &link.window_id == active)
-        {
-            execute_empty(
-                client,
-                &format!(
-                    "switch-client -t {}",
-                    quote(&format!("{new_session}:{}", link.index))
-                ),
-            )
-            .await?;
+            {
+                execute_empty(
+                    client,
+                    &format!(
+                        "switch-client -t {}",
+                        quote(&format!("{new_session}:{}", link.index))
+                    ),
+                )
+                .await?;
+            }
         }
     }
     Ok(())
