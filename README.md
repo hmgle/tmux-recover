@@ -74,8 +74,15 @@ To build the current `main` branch with Cargo instead:
 cargo install --git https://github.com/hmgle/tmux-recover --locked
 ```
 
-From a source or TPM checkout, `./scripts/install.sh` builds a locked release
-binary and installs it to `${PREFIX:-$HOME/.local}/bin`.
+From a source or TPM checkout, `./scripts/install.sh` downloads and verifies
+the latest release binary, then installs it to `${PREFIX:-$HOME/.local}/bin`.
+This does not require Rust.
+
+Maintainers can build the current checkout instead:
+
+```sh
+./scripts/install.sh --local
+```
 
 ### 2. Enable the TPM integration
 
@@ -319,16 +326,27 @@ versions, cwd failures, hook-slot conflicts, and legacy development hooks.
 
 ## Upgrade and uninstall
 
-To upgrade a prebuilt installation, repeat the release download and `install`
-steps with the latest archive. To update a Cargo installation:
+From a source or TPM checkout, upgrade to the latest prebuilt release without
+a Rust toolchain:
+
+```sh
+./scripts/install.sh
+```
+
+To update a Cargo installation:
 
 ```sh
 cargo install --git https://github.com/hmgle/tmux-recover --locked --force
 ```
 
-For a source checkout, run `git pull --ff-only` and `./scripts/install.sh`.
-With TPM, press `prefix` + <kbd>U</kbd> to update the plugin checkout and update
-the binary separately using one of the methods above.
+Update the checkout first with `git pull --ff-only` when its installation
+script also needs updating. Maintainers should use
+`./scripts/install.sh --local` to install uncommitted local changes. Set
+`PREFIX="$HOME/.cargo"` when the binary must be installed to `~/.cargo/bin`.
+
+Both modes replace the installed binary atomically, so an already running
+daemon does not cause `Text file busy`. With TPM, press `prefix` + <kbd>U</kbd>
+to update the plugin checkout and run the installer separately.
 
 Replacing the file does not replace an already running watcher. Manual CLI
 commands use the new binary immediately; the TPM watcher adopts it the next

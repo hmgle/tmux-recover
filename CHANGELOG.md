@@ -6,6 +6,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Download and verify the latest release by default in `scripts/install.sh`,
+  with `--local` for atomic upgrades built from a maintainer checkout.
+
 ### Fixed
 
 - Synchronously establish the first TPM snapshot so stopping tmux immediately

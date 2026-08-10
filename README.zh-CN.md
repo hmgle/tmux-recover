@@ -66,8 +66,14 @@ install -m 0755 "$archive/tmux-recover" "$HOME/.local/bin/tmux-recover"
 cargo install --git https://github.com/hmgle/tmux-recover --locked
 ```
 
-在源码或 TPM checkout 中运行 `./scripts/install.sh`，会按 lock file 构建 release
-binary，并安装到 `${PREFIX:-$HOME/.local}/bin`。
+在源码或 TPM checkout 中运行 `./scripts/install.sh`，会下载并校验最新 Release
+binary，再安装到 `${PREFIX:-$HOME/.local}/bin`，普通用户不需要 Rust。
+
+本地维护者如需验证当前 checkout（包括未提交的改动），运行：
+
+```sh
+./scripts/install.sh --local
+```
 
 ### 2. 启用 TPM 集成
 
@@ -286,14 +292,28 @@ TPM 日志位于 `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-recover/tpm.log`。
 
 ## 升级与卸载
 
-预编译安装可重复最新 Release 的下载与 `install` 步骤。Cargo 安装可执行：
+在源码或 TPM checkout 中，不需要 Rust 即可升级到最新预编译 Release：
+
+```sh
+./scripts/install.sh
+```
+
+Cargo 安装可执行：
 
 ```sh
 cargo install --git https://github.com/hmgle/tmux-recover --locked --force
 ```
 
-源码 checkout 中运行 `git pull --ff-only` 和 `./scripts/install.sh`。使用 TPM 时，按
-`prefix` + <kbd>U</kbd> 更新插件 checkout，并另外使用上述任一方式更新 binary。
+如果安装脚本本身也需要更新，先在源码 checkout 中运行 `git pull --ff-only`。本地
+维护者使用 `./scripts/install.sh --local`。如果要安装到 `~/.cargo/bin`，设置：
+
+```sh
+PREFIX="$HOME/.cargo" ./scripts/install.sh --local
+```
+
+两种模式都会先写入临时文件，再原子替换目标 binary，因此已有 watcher 运行时不会
+再出现 `Text file busy`。使用 TPM 时，按 `prefix` + <kbd>U</kbd> 更新插件 checkout，
+再单独运行安装脚本。
 
 替换磁盘上的文件不会替换已经运行的 watcher。手动 CLI 会立即使用新 binary；TPM
 watcher 会在该 tmux server 下次启动时采用新版本。由 supervisor 管理时可以立即重启
