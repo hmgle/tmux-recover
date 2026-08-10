@@ -35,6 +35,12 @@ Capturing inside the lock is intentional: if an older capture waited for the
 lock after a newer save, publishing it afterwards would move `current`
 backwards even though every individual file write was atomic.
 
+TPM startup first runs an `--if-empty` capture synchronously under that same
+mutation lock. It creates the first recovery point only when neither a current
+pointer nor any snapshot body exists. Existing history makes it a read-only
+no-op, which is essential on a fresh bootstrap server: the detached daemon must
+see the previous generation's `current` before deciding whether to restore it.
+
 The daemon installs persistent indexed hook entries in `autosave.hook_slot`
 (default 901) and never writes `status-right`. Hooks are tmux array options, so
 installation uses `set-option -o`: the tmux server atomically sets an empty

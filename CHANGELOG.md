@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Synchronously establish the first TPM snapshot so stopping tmux immediately
+  after initial plugin activation cannot outrun the background watcher.
+- Retry the automatic-restore shell check briefly when prompt helpers obscure
+  an otherwise empty bootstrap pane during server startup.
+
 ## [0.1.0] - 2026-08-09
 
 ### Added

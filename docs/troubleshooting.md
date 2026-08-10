@@ -12,6 +12,19 @@ export TMUX_RECOVER_BIN="$HOME/.local/bin/tmux-recover"
 Reload the tmux configuration after fixing the path. TPM daemon output is in
 `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-recover/tpm.log`.
 
+## No snapshot after the first plugin installation
+
+Current releases synchronously write an initial snapshot before TPM startup
+returns, then detach the continuous watcher. Confirm that `tmux-recover list`
+shows that baseline before deliberately stopping the server. If it does not,
+inspect `tpm.log` for `initial snapshot failed`; the original tmux state cannot
+be recovered after server exit when no snapshot was ever written.
+
+Older releases started both initialization and the watcher in the background,
+so an immediate first exit could outrun the initial capture. Update both the
+TPM checkout and the installed `tmux-recover` binary; updating only one leaves
+the old startup behavior in place.
+
 ## tmux is too old
 
 tmux-recover requires tmux 3.7 or newer. Check with `tmux -V`. Upgrade tmux

@@ -189,6 +189,18 @@ impl SnapshotStore {
         self.current_path().is_file()
     }
 
+    /// Whether this socket store has never held a structural snapshot.
+    ///
+    /// A missing `current.json` does not make a store empty when snapshot
+    /// bodies still exist. Startup initialization must preserve that history
+    /// for manual repair instead of publishing a fresh bootstrap over it.
+    pub fn is_empty(&self) -> Result<bool> {
+        if self.current_path().try_exists()? {
+            return Ok(false);
+        }
+        Ok(self.snapshot_paths()?.is_empty())
+    }
+
     pub fn commit(&self, snapshot: &Snapshot, set_current: bool) -> Result<CommitOutcome> {
         Ok(self
             .commit_with(snapshot, set_current, Dedup::OnUnchangedStructure)?
@@ -869,6 +881,20 @@ mod tests {
             store.load_current().unwrap().semantic_hash,
             first.semantic_hash
         );
+    }
+
+    #[test]
+    fn snapshot_history_keeps_a_store_nonempty_without_its_current_pointer() {
+        let directory = tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), "socket", &StorageConfig::default());
+        assert!(store.is_empty().unwrap());
+
+        store.commit(&snapshot("one"), true).unwrap();
+        assert!(!store.is_empty().unwrap());
+        fs::remove_file(store.current_path()).unwrap();
+
+        assert!(!store.is_empty().unwrap());
     }
 
     #[test]

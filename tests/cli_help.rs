@@ -16,6 +16,8 @@ fn save_help_explains_snapshot_options() {
         "Attach a label; labeled saves are recorded even when unchanged",
         "--pin",
         "Keep the saved snapshot from retention pruning",
+        "--if-empty",
+        "Save only when this socket has no snapshot history",
     ] {
         assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
     }

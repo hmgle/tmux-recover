@@ -17,4 +17,7 @@ restore_runner_q="$(tmux_recover_shell_quote "$TMUX_RECOVER_PLUGIN_DIR/scripts/r
 
 tmux bind-key "$save_key" run-shell -b "$binary_q save"
 tmux bind-key "$restore_key" run-shell -b "$restore_runner_q"
-tmux run-shell -b "$TMUX_RECOVER_PLUGIN_DIR/scripts/start-daemon.sh"
+# Wait for start-daemon.sh's empty-store initialization. The daemon itself is
+# still detached by that script, so ordinary config reloads only block for the
+# bounded initialization command.
+tmux run-shell "$TMUX_RECOVER_PLUGIN_DIR/scripts/start-daemon.sh"

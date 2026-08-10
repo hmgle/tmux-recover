@@ -340,13 +340,12 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
     store.commit(&source, true).unwrap();
 
     assert!(server.stop(), "source tmux server did not stop");
-    // Auto-restore is a deliberate one-shot at daemon startup, and its gate
-    // requires the pane's foreground command to equal the default shell. The
-    // developer's interactive shell breaks that in two ways: `new-session -d`
-    // returns before the exec completes, and a prompt framework like oh-my-zsh
-    // runs `git` on every render, so the pane flickers off the shell name --
-    // and the daemon then correctly declines. Pin the pane to a bare `sh` with
-    // no rc file so its foreground command is stable, then wait for it.
+    // The gate requires the pane's foreground command to equal the default
+    // shell. `new-session -d` returns before the shell settles, and a prompt
+    // framework like oh-my-zsh can briefly run `git` on every render. Pin the
+    // pane to a bare `sh`, wait until the structural bootstrap is complete,
+    // then deliberately put a transient child in the foreground to reproduce
+    // that startup race.
     // `default-shell` has to be set at server start, not after: naming the
     // shell on the `new-session` command line would record a
     // `pane_start_command`, and `target_is_bootstrap` requires none.
@@ -362,9 +361,32 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
             .unwrap()
             .success()
     );
-    // Wait on the same full capture predicate the daemon uses. Checking only
-    // the foreground command can race the rest of tmux's pane metadata.
+    // Wait on the same full capture predicate the daemon uses before creating
+    // the transient foreground process. Checking only one field can race the
+    // rest of tmux's pane metadata.
     let _ = wait_for_auto_bootstrap_capture(&server).await;
+    assert!(
+        server
+            .tmux()
+            .args(["send-keys", "-t", "bootstrap:0.0", "sleep 1", "Enter"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(5), || {
+        server
+            .tmux()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                "bootstrap:0.0",
+                "#{pane_current_command}",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n")
+    })
+    .await;
     let daemon_socket = server.socket.clone();
     let daemon_data = data.path().to_path_buf();
     let daemon_config = config.clone();

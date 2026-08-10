@@ -92,10 +92,12 @@ run '~/.tmux/plugins/tpm/tpm'
 ```
 
 Press `prefix` + <kbd>I</kbd> to install the plugin, then reload the tmux
-configuration. TPM starts one background watcher for the current tmux server.
-Press `prefix` + <kbd>Ctrl-s</kbd> to save and `prefix` + <kbd>Ctrl-r</kbd> to
-restore the latest snapshot into an empty bootstrap server. Change the two
-options above if those bindings conflict with your configuration.
+configuration. On the first activation for a socket, plugin startup writes a
+baseline snapshot before it returns; it never replaces existing history during
+this initialization. TPM then starts one background watcher for the current
+tmux server. Press `prefix` + <kbd>Ctrl-s</kbd> to save and `prefix` +
+<kbd>Ctrl-r</kbd> to restore the latest snapshot into an empty bootstrap server.
+Change the two options above if those bindings conflict with your configuration.
 
 The restore binding reports the final result in tmux's status line. It will
 explain when a manually populated server is protected from replacement; use
@@ -244,9 +246,10 @@ auto = true
 auto_bootstrap_max_age_seconds = 30
 ```
 
-The watcher restores only a newly created, empty bootstrap server. It leaves an
-older or non-empty server untouched, and a failed preflight does not stop later
-autosaves.
+The watcher restores only a newly created, empty bootstrap server. It briefly
+rechecks a structurally empty pane while the default shell and prompt helpers
+settle, but leaves an older or populated server untouched. A failed preflight
+does not stop later autosaves.
 
 ### Import tmux-resurrect history
 

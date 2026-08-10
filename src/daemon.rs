@@ -7,11 +7,16 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::{
     config::Config,
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
-    restore::{apply, preflight, restore_config_options, target_is_auto_bootstrap},
+    restore::{
+        apply, preflight, restore_config_options, target_is_auto_bootstrap, target_is_bootstrap,
+    },
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture, control::ControlClient, hooks},
     util::socket_identity,
 };
+
+const AUTO_RESTORE_SHELL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTO_RESTORE_SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> {
     config.validate()?;
@@ -25,7 +30,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
     // the whole daemon down: the server is still there and still worth
     // watching, so log it and fall through to the normal watch loop instead
     // of propagating the error out of `run`.
-    match auto_restore(&mut client, &store, config, &initial).await {
+    match auto_restore(&mut client, socket, &store, config, &initial).await {
         Ok(true) => {
             drop(client);
             client = ControlClient::connect(socket).await?;
@@ -152,12 +157,12 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
 
 async fn auto_restore(
     client: &mut ControlClient,
+    socket: &Path,
     store: &SnapshotStore,
     config: &Config,
-    target: &crate::tmux::capture::CaptureResult,
+    initial_target: &crate::tmux::capture::CaptureResult,
 ) -> std::result::Result<bool, AutoRestoreError> {
-    if !config.restore.auto || !target_is_auto_bootstrap(target) || !server_is_young(target, config)
-    {
+    if !config.restore.auto {
         return Ok(false);
     }
     if !store.has_current() {
@@ -168,6 +173,50 @@ async fn auto_restore(
     let snapshot = store
         .load_current()
         .context("automatic restore could not load the current snapshot")?;
+    // The plugin's synchronous empty-store initialization creates the first
+    // snapshot immediately before this daemon starts. It already describes
+    // this server generation, so there is nothing to recover and no reason to
+    // wait for an interactive shell to settle.
+    if snapshot.origin == initial_target.origin {
+        return Ok(false);
+    }
+    if !server_is_young(initial_target, config) {
+        return Ok(false);
+    }
+
+    // An interactive shell can briefly report a prompt helper (git, direnv,
+    // and similar programs) as pane_current_command while the tmux config is
+    // still starting. Auto-restore used to sample exactly once, permanently
+    // skip in that instant, and then publish the blank server as `current`.
+    // Retry only while every structural bootstrap guard still holds, and for a
+    // short bound inside the configured server-age safety window.
+    let mut refreshed_target = None;
+    if !target_is_auto_bootstrap(initial_target) {
+        if !target_is_bootstrap(initial_target) {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + AUTO_RESTORE_SHELL_SETTLE_TIMEOUT;
+        loop {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "automatic restore skipped because the bootstrap pane did not settle on the default shell"
+                );
+                return Ok(false);
+            }
+            tokio::time::sleep(AUTO_RESTORE_SHELL_SETTLE_INTERVAL).await;
+            let target = capture(client, socket)
+                .await
+                .context("automatic restore could not recapture the bootstrap server")?;
+            if !target_is_bootstrap(&target) || !server_is_young(&target, config) {
+                return Ok(false);
+            }
+            if target_is_auto_bootstrap(&target) {
+                refreshed_target = Some(target);
+                break;
+            }
+        }
+    }
+    let target = refreshed_target.as_ref().unwrap_or(initial_target);
     let options = restore_config_options(&config.restore, false, false, None, false, None);
     let plan =
         preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;

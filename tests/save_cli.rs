@@ -371,3 +371,38 @@ fn save_captures_after_waiting_for_the_mutation_lock() {
         "after-lock"
     );
 }
+
+#[test]
+fn if_empty_initializes_once_without_replacing_existing_history() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &StorageConfig::default());
+
+    let first_output = save(data.path(), &server.socket, &["--if-empty"]);
+    assert!(first_output.starts_with("saved "), "{first_output}");
+    let first = store.load_current().unwrap();
+    assert_eq!(
+        first.source,
+        tmux_recover::model::SnapshotSource::Native {
+            reason: "initial".to_owned()
+        }
+    );
+
+    assert!(
+        Command::new("tmux")
+            .args(["-S"])
+            .arg(&server.socket)
+            .args(["rename-window", "-t", "work:0", "must-not-be-saved"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let second_output = save(data.path(), &server.socket, &["--if-empty"]);
+    assert_eq!(second_output, "snapshot store already initialized");
+    assert_eq!(store.load_current().unwrap().id, first.id);
+    assert_eq!(store.list().unwrap().len(), 1);
+}

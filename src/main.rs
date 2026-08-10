@@ -76,6 +76,12 @@ struct SaveArgs {
     label: Option<String>,
     #[arg(long, help = "Keep the saved snapshot from retention pruning")]
     pin: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["label", "pin"],
+        help = "Save only when this socket has no snapshot history"
+    )]
+    if_empty: bool,
 }
 
 #[derive(Debug, Args)]
@@ -381,12 +387,25 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     // captured an older server state could wait behind a newer writer and then
     // move `current` backwards when it finally acquired the lock.
     let _mutation_lock = store.acquire_mutation_lock()?;
+    // Plugin activation uses this mode to synchronously establish the first
+    // recovery point before it starts the background daemon. Checking under
+    // the mutation lock makes concurrent config reloads harmless, and looking
+    // at all history (rather than only current.json) avoids replacing a store
+    // whose pointer was lost or damaged.
+    if args.if_empty && !store.is_empty()? {
+        println!("snapshot store already initialized");
+        return Ok(());
+    }
     let mut client = ControlClient::connect(&socket).await?;
     let captured = capture(&mut client, &socket).await?;
     let snapshot = Snapshot::new(
         args.label,
         SnapshotSource::Native {
-            reason: "manual".to_owned(),
+            reason: if args.if_empty {
+                "initial".to_owned()
+            } else {
+                "manual".to_owned()
+            },
         },
         captured.origin,
         captured.state,

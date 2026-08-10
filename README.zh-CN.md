@@ -83,10 +83,11 @@ set -g @tmux-recover-restore-key 'C-r'
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-按 `prefix` + <kbd>I</kbd> 安装插件，然后重新加载 tmux 配置。TPM 会为当前 tmux
-server 启动一个后台 watcher。`prefix` + <kbd>Ctrl-s</kbd> 立即保存；在空的初始
-server 中，`prefix` + <kbd>Ctrl-r</kbd> 恢复最新快照。如果按键与现有配置冲突，
-请修改上面的两个 option。
+按 `prefix` + <kbd>I</kbd> 安装插件，然后重新加载 tmux 配置。某个 socket 首次激活
+插件时，启动脚本会在返回前同步写入一份基线快照；初始化不会覆盖已有历史。随后
+TPM 会为当前 tmux server 启动一个后台 watcher。`prefix` + <kbd>Ctrl-s</kbd>
+立即保存；在空的初始 server 中，`prefix` + <kbd>Ctrl-r</kbd> 恢复最新快照。
+如果按键与现有配置冲突，请修改上面的两个 option。
 
 恢复快捷键会把最后结果显示在 tmux 状态栏。如果 server 中已有手动创建的窗口，
 提示会直接说明恢复被安全策略拦截；请先选择要恢复的快照，再使用下面的 dry-run
@@ -221,8 +222,9 @@ auto = true
 auto_bootstrap_max_age_seconds = 30
 ```
 
-watcher 只会恢复刚创建的空白 server；较旧或非空 server 保持不变。preflight 失败
-也不会阻止后续 autosave。
+watcher 只会恢复刚创建的空白 server。默认 shell 和提示符辅助进程启动期间，它会对
+结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。preflight
+失败也不会阻止后续 autosave。
 
 ### 导入 tmux-resurrect 历史
 
