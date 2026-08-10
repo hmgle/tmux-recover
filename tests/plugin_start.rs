@@ -76,7 +76,7 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
         return;
     };
     let environment = tempfile::tempdir().unwrap();
-    let data_home = environment.path().join("data");
+    let data_dir = environment.path().join("data");
     let state_home = environment.path().join("state");
     let config_home = environment.path().join("config");
     let tmux_environment = format!("{},0,0", server.socket.display());
@@ -88,8 +88,11 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
                 "/scripts/start-daemon.sh"
             ))
             .env("TMUX_RECOVER_BIN", env!("CARGO_BIN_EXE_tmux-recover"))
+            // `directories` ignores XDG_DATA_HOME on macOS, so use the CLI's
+            // explicit cross-platform override for an isolated snapshot store.
+            .env("TMUX_RECOVER_DATA_DIR", &data_dir)
             .env("TMUX", &tmux_environment)
-            .env("XDG_DATA_HOME", &data_home)
+            .env("HOME", environment.path())
             .env("XDG_STATE_HOME", &state_home)
             .env("XDG_CONFIG_HOME", &config_home)
             .env("RUST_LOG", "info")
@@ -104,11 +107,7 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
         String::from_utf8_lossy(&output.stderr)
     );
     let identity = socket_identity(&server.socket).unwrap();
-    let store = SnapshotStore::for_socket(
-        &data_home.join("tmux-recover"),
-        &identity.key,
-        &StorageConfig::default(),
-    );
+    let store = SnapshotStore::for_socket(&data_dir, &identity.key, &StorageConfig::default());
     let initial = store.load_current().unwrap();
     assert_eq!(
         initial.source,
