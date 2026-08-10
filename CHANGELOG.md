@@ -6,13 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 
 - Download and verify the latest release by default in `scripts/install.sh`,
   with `--local` for atomic upgrades built from a maintainer checkout.
+- Explain CLI options directly in command help and document migration from
+  tmux-resurrect in English and Chinese.
 
 ### Fixed
 
+- Ignore unflagged tmux hook output blocks so persistent hooks cannot
+  desynchronize later control-mode commands.
+- Show restore-key failures in the tmux status line instead of only reporting
+  a generic `run-shell` error.
 - Synchronously establish the first TPM snapshot so stopping tmux immediately
   after initial plugin activation cannot outrun the background watcher.
 - Retry the automatic-restore shell check briefly when prompt helpers obscure
@@ -34,5 +42,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - TPM and systemd integration, JSON output, zstd storage, and isolated tmux
   integration tests.
 
-[Unreleased]: https://github.com/hmgle/tmux-recover/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/hmgle/tmux-recover/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/hmgle/tmux-recover/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hmgle/tmux-recover/releases/tag/v0.1.0
