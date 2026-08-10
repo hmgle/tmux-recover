@@ -92,6 +92,7 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
             .env("XDG_DATA_HOME", &data_home)
             .env("XDG_STATE_HOME", &state_home)
             .env("XDG_CONFIG_HOME", &config_home)
+            .env("RUST_LOG", "info")
             .output()
             .unwrap()
     };
@@ -116,19 +117,22 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
         }
     );
     let daemon_lock = store.root().join("daemon.lock");
+    let daemon_log = state_home.join("tmux-recover/tpm.log");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let daemon_pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&daemon_lock) {
-            if !pid.trim().is_empty() {
-                break pid;
-            }
+    loop {
+        if std::fs::read_to_string(&daemon_log)
+            .is_ok_and(|log| log.contains("tmux-recover daemon is watching server"))
+        {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "detached daemon never acquired its single-instance lock"
+            "detached daemon never completed initialization"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    }
+    let daemon_pid = std::fs::read_to_string(&daemon_lock).unwrap();
+    assert!(!daemon_pid.trim().is_empty());
 
     assert!(
         server
