@@ -88,6 +88,49 @@ to return the window to the server's configured sizing policy:
 tmux set-option -wu -t work:1 window-size
 ```
 
+`window-size` is a window option, so panes are affected through their parent
+window. To audit every window-local `manual` override and print all panes in
+each affected window, run:
+
+```sh
+tmux list-windows -a -F '#{window_id}' |
+while IFS= read -r window_id; do
+    local_policy=$(tmux show-options -wqv -t "$window_id" window-size)
+    [ "$local_policy" = manual ] || continue
+    tmux list-panes -t "$window_id" -F \
+      'session=#{session_name} window=#{window_index} window_id=#{window_id} pane_id=#{pane_id} pane_index=#{pane_index} window=#{window_width}x#{window_height} pane=#{pane_width}x#{pane_height} policy=#{window-size}'
+done
+```
+
+Review that output, then clear the local override from every matching window:
+
+```sh
+tmux list-windows -a -F '#{window_id}' |
+while IFS= read -r window_id; do
+    local_policy=$(tmux show-options -wqv -t "$window_id" window-size)
+    [ "$local_policy" = manual ] || continue
+    tmux set-option -wu -t "$window_id" window-size
+done
+```
+
+If the audit prints no local overrides but the effective policy is still
+`manual`, inspect the global option:
+
+```sh
+tmux show-options -gv window-size
+```
+
+A global `manual` value is intentional configuration from tmux's point of
+view. Change it to the policy you want, or unset it with `-gu`; also remove or
+update the corresponding `set-option -g window-size ...` line in the tmux
+configuration so it does not return after reload:
+
+```sh
+tmux set-option -gu window-size
+```
+
+Do not batch-clear windows that were deliberately sized by hand.
+
 Current restores use the saved dimensions while reconstructing the layout, then
 remove the temporary override automatically.
 
