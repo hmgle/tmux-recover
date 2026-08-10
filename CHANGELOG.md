@@ -11,6 +11,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Install zsh completion for commands, options, paths, and snapshot selectors
   with release archives and `scripts/install.sh`.
 
+### Changed
+
+- Defer Linux `/proc` process metadata collection until a structural save or a
+  due process checkpoint needs it. An empty `restore.process_allowlist` now
+  disables process capture, removes the live sidecar, and leaves structural
+  snapshots unaffected.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

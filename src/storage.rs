@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{RetentionConfig, StorageConfig},
-    model::{ProcessCheckpoint, RestoreReport, Snapshot},
+    model::{Origin, ProcessCheckpoint, RestoreReport, Snapshot},
 };
 
 #[derive(Debug, Clone)]
@@ -315,6 +315,24 @@ impl SnapshotStore {
     /// should use [`Self::load_current`] instead.
     pub fn current_snapshot_id(&self) -> Result<Option<String>> {
         Ok(self.read_pointer()?.map(|pointer| pointer.snapshot_id))
+    }
+
+    /// Returns the current snapshot id only when its fully validated body has
+    /// the supplied structure and origin. A missing or damaged current is a
+    /// mismatch so the caller can repair it with a normal commit.
+    pub fn current_snapshot_id_if_structure_matches(
+        &self,
+        origin: &Origin,
+        structural_hash: &str,
+    ) -> Result<Option<String>> {
+        let Ok(current) = self.load_current() else {
+            return Ok(None);
+        };
+        if current.origin == *origin && current.state.structural_hash()? == structural_hash {
+            Ok(Some(current.id))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn load_current(&self) -> Result<Snapshot> {
@@ -641,6 +659,22 @@ impl SnapshotStore {
         )
     }
 
+    /// Removes the live process sidecar when process capture is disabled. The
+    /// immutable snapshot history is left untouched.
+    pub fn remove_process_checkpoint(&self) -> Result<bool> {
+        let path = self.process_checkpoint_path();
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_directory(&self.root)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
+        }
+    }
+
     pub fn write_restore_report(&self, report: &RestoreReport) -> Result<PathBuf> {
         validate_path_component(&report.snapshot_id, "restore report snapshot id")?;
         let reports = self.root.join("restores");
@@ -880,6 +914,15 @@ mod tests {
         assert_eq!(
             store.load_current().unwrap().semantic_hash,
             first.semantic_hash
+        );
+        assert_eq!(
+            store
+                .current_snapshot_id_if_structure_matches(
+                    &first.origin,
+                    &first.state.structural_hash().unwrap(),
+                )
+                .unwrap(),
+            Some(first.id.clone())
         );
     }
 
@@ -1135,8 +1178,18 @@ mod tests {
 
         // Same structural state as before. Deduplicating on the pointer alone
         // would report Unchanged and leave the corruption in place forever.
+        let replacement = snapshot("one");
         assert_eq!(
-            store.commit(&snapshot("one"), true).unwrap(),
+            store
+                .current_snapshot_id_if_structure_matches(
+                    &replacement.origin,
+                    &replacement.state.structural_hash().unwrap(),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.commit(&replacement, true).unwrap(),
             CommitOutcome::Written
         );
         assert!(store.load_current().is_ok(), "current must be repaired");
@@ -1195,6 +1248,9 @@ mod tests {
         store.write_process_checkpoint(&second).unwrap();
         assert_eq!(store.read_process_checkpoint().unwrap(), Some(second));
         assert!(!store.snapshots_dir().join("process-current.json").exists());
+        assert!(store.remove_process_checkpoint().unwrap());
+        assert!(store.read_process_checkpoint().unwrap().is_none());
+        assert!(!store.remove_process_checkpoint().unwrap());
     }
 
     #[test]

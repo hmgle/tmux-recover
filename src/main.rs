@@ -11,7 +11,7 @@ use tmux_recover::{
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
-    tmux::{capture::capture, control::ControlClient, resolve_socket},
+    tmux::{capture::capture_structure, control::ControlClient, resolve_socket},
     util::socket_identity,
 };
 
@@ -238,7 +238,7 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     };
     let snapshot = source_store.load(&args.snapshot)?;
     let mut client = ControlClient::connect(&socket).await?;
-    let target = capture(&mut client, &socket).await?;
+    let mut target = capture_structure(&mut client, &socket).await?;
 
     if args.cwd_fallback.as_deref() == Some(Path::new("HOME")) {
         args.cwd_fallback = Some(
@@ -251,16 +251,23 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     // snapshot still carries its own restart metadata. Surface it as a plan
     // warning rather than an error, so a dry-run explains why process restore
     // came up short instead of silently doing less than asked.
-    let mut checkpoint_warning = None;
+    let processes_enabled = config.restore.processes_enabled();
+    let restore_processes = args.restore_processes && processes_enabled;
+    let mut process_warnings = Vec::new();
+    if args.restore_processes && !processes_enabled {
+        process_warnings.push(
+            "process restore is disabled because restore.process_allowlist is empty".to_owned(),
+        );
+    }
     let checkpoint = match process_checkpoint_is_offered(
         &args.snapshot,
         args.from_imports,
-        args.restore_processes,
+        restore_processes,
     ) {
         true => match target_store.read_process_checkpoint() {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
-                checkpoint_warning = Some(format!(
+                process_warnings.push(format!(
                     "process checkpoint ignored ({error:#}); using each pane's own restart metadata instead"
                 ));
                 None
@@ -273,11 +280,11 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
         args.replace,
         args.allow_origin_mismatch,
         args.cwd_fallback.as_deref(),
-        args.restore_processes,
+        restore_processes,
         checkpoint.as_ref(),
     );
     let mut plan = preflight(&snapshot, &target, &options)?;
-    plan.warnings.extend(checkpoint_warning);
+    plan.warnings.extend(process_warnings);
     print_restore_plan(&plan, args.json)?;
     if args.dry_run {
         return Ok(());
@@ -287,6 +294,9 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     }
 
     let _mutation_lock = target_store.acquire_mutation_lock()?;
+    if processes_enabled {
+        target.capture_processes();
+    }
     let safety_snapshot = Snapshot::new(
         Some(format!("pre-restore {}", snapshot.id)),
         SnapshotSource::Native {
@@ -397,7 +407,15 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         return Ok(());
     }
     let mut client = ControlClient::connect(&socket).await?;
-    let captured = capture(&mut client, &socket).await?;
+    let mut captured = capture_structure(&mut client, &socket).await?;
+    let processes_enabled = config.restore.processes_enabled();
+    if processes_enabled {
+        captured.capture_processes();
+    } else {
+        store
+            .remove_process_checkpoint()
+            .context("failed to remove disabled process checkpoint")?;
+    }
     let snapshot = Snapshot::new(
         args.label,
         SnapshotSource::Native {
@@ -449,14 +467,17 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
             }
         }
     }
-    // Refresh the sidecar unconditionally. This capture holds the processes
-    // running right now, and the user asked for them explicitly, so the
-    // daemon's `process_checkpoint_interval` -- which exists to throttle
-    // background polling -- must not decide whether they are recorded. Without
-    // this, saving while a program is running left no sidecar at all, and a
-    // later `--restore-processes` recovered whatever the last structural change
-    // happened to catch.
-    if let Some(base_snapshot_id) = base_snapshot_id {
+    // When process capture is enabled, refresh the sidecar unconditionally.
+    // This capture holds the processes running right now, and the user asked
+    // for them explicitly, so the daemon's `process_checkpoint_interval` --
+    // which exists to throttle background polling -- must not decide whether
+    // they are recorded. Without this, saving while a program is running left
+    // no sidecar at all, and a later `--restore-processes` recovered whatever
+    // the last structural change happened to catch.
+    if processes_enabled {
+        let Some(base_snapshot_id) = base_snapshot_id else {
+            return Ok(());
+        };
         let checkpoint = ProcessCheckpoint::capture(
             base_snapshot_id,
             snapshot.state.structural_hash()?,

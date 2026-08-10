@@ -52,7 +52,8 @@ removed. This is distinct from `error`, which is reserved for a failed restore.
 `process-current.json` is a separate artifact with its own
 `schema_version = 1`, versioned independently of snapshots so it can change
 without migrating history. It is never compressed and never appears in
-`snapshots/`.
+`snapshots/`. The sidecar is omitted when `restore.process_allowlist` is empty;
+immutable snapshot history is not rewritten when process capture is disabled.
 
 ```json
 {
