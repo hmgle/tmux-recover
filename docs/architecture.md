@@ -115,9 +115,10 @@ Process restart metadata is collected from `/proc` on Linux only when
 `restore.process_allowlist` is non-empty and the capture path needs it. It is
 never executed unless `--restore-processes` is present and the executable
 basename is allowlisted. An empty allowlist removes the live process sidecar
-and makes process restore disabled. Imported resurrect command text is metadata
-only and is never trusted for execution. Structural capture and restore work
-without process metadata on every platform.
+from mutating save, daemon, and restore paths and makes process restore
+disabled. Dry-run restore remains read-only. Imported resurrect command text is
+metadata only and is never trusted for execution. Structural capture and
+restore work without process metadata on every platform.
 
 A restarted program is launched through a fixed `/bin/sh` supervisor:
 `trap '' INT QUIT; (trap - INT QUIT; exec <program>); trap - INT QUIT; exec

@@ -443,13 +443,11 @@ fn save_captured(
     mut capture_processes: impl FnMut(&mut CaptureResult),
 ) -> Result<SaveOutcome> {
     let processes_enabled = config.restore.processes_enabled();
-    if !processes_enabled {
-        if let Err(error) = store.remove_process_checkpoint() {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "failed to remove disabled process checkpoint"
-            );
-        }
+    if let Err(error) = store.remove_process_checkpoint_if_disabled(processes_enabled) {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "failed to remove disabled process checkpoint"
+        );
     }
     if target_is_bootstrap(&captured) {
         if let Some(protected) = protected_current {

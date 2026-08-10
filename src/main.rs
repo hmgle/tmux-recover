@@ -294,6 +294,9 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     }
 
     let _mutation_lock = target_store.acquire_mutation_lock()?;
+    target_store
+        .remove_process_checkpoint_if_disabled(processes_enabled)
+        .context("failed to remove disabled process checkpoint")?;
     if processes_enabled {
         target.capture_processes();
     }
@@ -397,6 +400,10 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     // captured an older server state could wait behind a newer writer and then
     // move `current` backwards when it finally acquired the lock.
     let _mutation_lock = store.acquire_mutation_lock()?;
+    let processes_enabled = config.restore.processes_enabled();
+    store
+        .remove_process_checkpoint_if_disabled(processes_enabled)
+        .context("failed to remove disabled process checkpoint")?;
     // Plugin activation uses this mode to synchronously establish the first
     // recovery point before it starts the background daemon. Checking under
     // the mutation lock makes concurrent config reloads harmless, and looking
@@ -408,13 +415,8 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
     }
     let mut client = ControlClient::connect(&socket).await?;
     let mut captured = capture_structure(&mut client, &socket).await?;
-    let processes_enabled = config.restore.processes_enabled();
     if processes_enabled {
         captured.capture_processes();
-    } else {
-        store
-            .remove_process_checkpoint()
-            .context("failed to remove disabled process checkpoint")?;
     }
     let snapshot = Snapshot::new(
         args.label,

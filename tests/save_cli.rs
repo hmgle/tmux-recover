@@ -427,6 +427,7 @@ fn if_empty_initializes_once_without_replacing_existing_history() {
 
     let first_output = save(data.path(), &server.socket, &["--if-empty"]);
     assert!(first_output.starts_with("saved "), "{first_output}");
+    assert!(checkpoint(data.path()).is_some());
     let first = store.load_current().unwrap();
     assert_eq!(
         first.source,
@@ -444,8 +445,19 @@ fn if_empty_initializes_once_without_replacing_existing_history() {
             .unwrap()
             .success()
     );
-    let second_output = save(data.path(), &server.socket, &["--if-empty"]);
+    let disabled = data.path().join("disabled.toml");
+    std::fs::write(&disabled, "[restore]\nprocess_allowlist = []\n").unwrap();
+    let second_output = save_with_config(
+        data.path(),
+        &server.socket,
+        Some(&disabled),
+        &["--if-empty"],
+    );
     assert_eq!(second_output, "snapshot store already initialized");
+    assert!(
+        checkpoint(data.path()).is_none(),
+        "--if-empty must enforce disabled process capture before returning early"
+    );
     assert_eq!(store.load_current().unwrap().id, first.id);
     assert_eq!(store.list().unwrap().len(), 1);
 }

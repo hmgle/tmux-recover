@@ -2,10 +2,12 @@ use std::{process::Command, time::Duration};
 
 use tempfile::TempDir;
 use tmux_recover::{
-    config::RestoreConfig,
+    config::{RestoreConfig, StorageConfig},
     model::{RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, restore_config_options},
+    storage::SnapshotStore,
     tmux::{capture::capture, control::ControlClient},
+    util::socket_identity,
 };
 
 struct TestServer {
@@ -51,6 +53,84 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+#[test]
+fn real_restore_with_an_empty_allowlist_removes_the_process_checkpoint() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    success(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "current", "sleep 60"]),
+    );
+    let data = tempfile::tempdir().unwrap();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &StorageConfig::default());
+
+    let save = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(["save", "--socket"])
+        .arg(&server.socket)
+        .output()
+        .unwrap();
+    assert!(
+        save.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    assert!(store.read_process_checkpoint().unwrap().is_some());
+
+    let config = data.path().join("disabled.toml");
+    std::fs::write(&config, "[restore]\nprocess_allowlist = []\n").unwrap();
+    let dry_run = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--config")
+        .arg(&config)
+        .args(["restore", "current", "--socket"])
+        .arg(&server.socket)
+        .args(["--replace", "--yes", "--dry-run", "--restore-processes"])
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&dry_run.stdout)
+            .contains("process restore is disabled because restore.process_allowlist is empty")
+    );
+    assert!(
+        store.read_process_checkpoint().unwrap().is_some(),
+        "a dry-run must not mutate the snapshot store"
+    );
+
+    let restore = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--config")
+        .arg(&config)
+        .args(["restore", "current", "--socket"])
+        .arg(&server.socket)
+        .args(["--replace", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert!(
+        store.read_process_checkpoint().unwrap().is_none(),
+        "a real restore must remove stale process metadata while capture is disabled"
+    );
 }
 
 #[tokio::test]

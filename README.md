@@ -255,12 +255,13 @@ tmux-recover restore current --restore-processes
 Only native restart metadata marked trusted and allowlisted by executable name
 is launched. Edit `restore.process_allowlist` in the configuration to match
 your needs. Set `restore.process_allowlist = []` when process recovery is not
-needed; saves then skip Linux `/proc` collection and remove the live process
-checkpoint sidecar. Passing `--restore-processes` with an empty allowlist is
-reported as disabled. A historical snapshot uses only the process metadata
-captured in that snapshot; the live process checkpoint is considered only for
-an explicit `current` restore from the same socket. Imported tmux-resurrect
-command strings are never executed.
+needed; saves then skip Linux `/proc` collection, and mutating save, daemon, or
+restore operations remove the live process checkpoint sidecar. Passing
+`--restore-processes` with an empty allowlist is reported as disabled. A
+historical snapshot uses only the process metadata captured in that snapshot;
+the live process checkpoint is considered only for an explicit `current`
+restore from the same socket. Imported tmux-resurrect command strings are never
+executed.
 
 ### Enable automatic recovery
 

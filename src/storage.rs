@@ -675,6 +675,16 @@ impl SnapshotStore {
         }
     }
 
+    /// Enforces the empty-allowlist policy at command entry points, including
+    /// paths that may return before capturing or saving a snapshot.
+    pub fn remove_process_checkpoint_if_disabled(&self, processes_enabled: bool) -> Result<bool> {
+        if processes_enabled {
+            Ok(false)
+        } else {
+            self.remove_process_checkpoint()
+        }
+    }
+
     pub fn write_restore_report(&self, report: &RestoreReport) -> Result<PathBuf> {
         validate_path_component(&report.snapshot_id, "restore report snapshot id")?;
         let reports = self.root.join("restores");
@@ -1251,6 +1261,7 @@ mod tests {
         assert!(store.remove_process_checkpoint().unwrap());
         assert!(store.read_process_checkpoint().unwrap().is_none());
         assert!(!store.remove_process_checkpoint().unwrap());
+        assert!(!store.remove_process_checkpoint_if_disabled(true).unwrap());
     }
 
     #[test]

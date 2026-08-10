@@ -15,8 +15,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Defer Linux `/proc` process metadata collection until a structural save or a
   due process checkpoint needs it. An empty `restore.process_allowlist` now
-  disables process capture, removes the live sidecar, and leaves structural
-  snapshots unaffected.
+  disables process capture, removes the live sidecar from every mutating entry
+  path, and leaves structural snapshots unaffected.
 
 ## [0.2.0] - 2026-08-10
 
