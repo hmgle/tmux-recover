@@ -12,6 +12,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after initial plugin activation cannot outrun the background watcher.
 - Retry the automatic-restore shell check briefly when prompt helpers obscure
   an otherwise empty bootstrap pane during server startup.
+- Preserve the previous-generation `current` snapshot when automatic restore
+  cannot resolve a still-empty bootstrap server.
 
 ## [0.1.0] - 2026-08-09
 

@@ -223,8 +223,9 @@ auto_bootstrap_max_age_seconds = 30
 ```
 
 watcher 只会恢复刚创建的空白 server。默认 shell 和提示符辅助进程启动期间，它会对
-结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。preflight
-失败也不会阻止后续 autosave。
+结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。如果复查
+超时，或 preflight 在修改 tmux 前失败，只要 server 仍是 1 session/1 window/1 pane
+的 bootstrap，上一代 `current` 就会保持不变；加入真实结构后 autosave 自动恢复。
 
 ### 导入 tmux-resurrect 历史
 

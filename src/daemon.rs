@@ -26,12 +26,23 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
 
     let mut client = ControlClient::connect(socket).await?;
     let initial = capture(&mut client, socket).await?;
+    let mut protected_current = match bootstrap_current_to_preserve(&store, config, &initial) {
+        Ok(snapshot_id) => snapshot_id,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not determine whether the current snapshot needs bootstrap protection"
+            );
+            None
+        }
+    };
     // A failed auto-restore (bad snapshot, stale cwd, whatever) must not take
     // the whole daemon down: the server is still there and still worth
     // watching, so log it and fall through to the normal watch loop instead
     // of propagating the error out of `run`.
     match auto_restore(&mut client, socket, &store, config, &initial).await {
         Ok(true) => {
+            protected_current = None;
             drop(client);
             client = ControlClient::connect(socket).await?;
         }
@@ -51,6 +62,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
                 error = %format!("{error:#}"),
                 "automatic restore failed after changing the server; reconnecting and continuing to watch"
             );
+            protected_current = None;
             drop(client);
             client = ControlClient::connect(socket).await?;
         }
@@ -63,7 +75,26 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
     )
     .await?;
     client.take_notifications();
-    save_if_changed(&mut client, socket, &store, config, "daemon_start").await?;
+    let initial_save = save_if_changed(
+        &mut client,
+        socket,
+        &store,
+        config,
+        "daemon_start",
+        protected_current.as_deref(),
+    )
+    .await?;
+    match initial_save {
+        SaveOutcome::ProtectedBootstrap => {
+            if let Some(snapshot_id) = protected_current.as_deref() {
+                tracing::warn!(
+                    snapshot = snapshot_id,
+                    "preserving the previous current snapshot while the new server remains an unresolved bootstrap"
+                );
+            }
+        }
+        SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
+    }
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
 
     let mut poll = tokio::time::interval(config.autosave.poll_interval);
@@ -108,9 +139,20 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
             }
             _ = &mut timer, if pending.is_some() => {
                 pending = None;
-                match save_if_changed(&mut client, socket, &store, config, "autosave").await {
-                    Ok(CommitOutcome::Written) => last_write = Instant::now(),
-                    Ok(CommitOutcome::Unchanged) => {}
+                match save_if_changed(
+                    &mut client,
+                    socket,
+                    &store,
+                    config,
+                    "autosave",
+                    protected_current.as_deref(),
+                ).await {
+                    Ok(SaveOutcome::Written) => {
+                        protected_current = None;
+                        last_write = Instant::now();
+                    }
+                    Ok(SaveOutcome::Unchanged) => protected_current = None,
+                    Ok(SaveOutcome::ProtectedBootstrap) => {}
                     Err(error) => {
                         tracing::error!(error = %format!("{error:#}"), "autosave failed; keeping the previous snapshot current");
                         // A command that failed partway through a sequence left
@@ -153,6 +195,29 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
 
     tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
     Ok(())
+}
+
+/// Identifies a previous-generation `current` that must remain addressable if
+/// automatic restore cannot yet decide whether the new server is safe to
+/// replace. The exact id is rechecked under the mutation lock before every
+/// guarded save, so a concurrent manual save or restore cannot be hidden by a
+/// stale decision made here.
+fn bootstrap_current_to_preserve(
+    store: &SnapshotStore,
+    config: &Config,
+    target: &crate::tmux::capture::CaptureResult,
+) -> Result<Option<String>> {
+    if !config.restore.auto || !target_is_bootstrap(target) || !server_is_young(target, config) {
+        return Ok(None);
+    }
+    let Some(current_id) = store.current_snapshot_id()? else {
+        return Ok(None);
+    };
+    let current = store.load_current()?;
+    if current.origin == target.origin {
+        return Ok(None);
+    }
+    Ok(Some(current_id))
 }
 
 async fn auto_restore(
@@ -343,12 +408,20 @@ async fn save_if_changed(
     store: &SnapshotStore,
     config: &Config,
     reason: &str,
-) -> Result<CommitOutcome> {
+    protected_current: Option<&str>,
+) -> Result<SaveOutcome> {
     // Capture order must be mutation order. Taking this after capture allows a
     // stale daemon capture to wait behind a newer CLI save and then overwrite
     // its `current` pointer.
     let _mutation_lock = store.acquire_mutation_lock()?;
     let captured = capture(client, socket).await?;
+    if target_is_bootstrap(&captured) {
+        if let Some(protected) = protected_current {
+            if store.current_snapshot_id()?.as_deref() == Some(protected) {
+                return Ok(SaveOutcome::ProtectedBootstrap);
+            }
+        }
+    }
     let checkpoint_origin = ProcessCheckpointOrigin {
         socket_key: captured
             .origin
@@ -400,7 +473,23 @@ async fn save_if_changed(
             }
         }
     }
-    Ok(outcome)
+    Ok(outcome.into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcome {
+    Written,
+    Unchanged,
+    ProtectedBootstrap,
+}
+
+impl From<CommitOutcome> for SaveOutcome {
+    fn from(outcome: CommitOutcome) -> Self {
+        match outcome {
+            CommitOutcome::Written => Self::Written,
+            CommitOutcome::Unchanged => Self::Unchanged,
+        }
+    }
 }
 
 /// Rewrites the process checkpoint sidecar when structural state is

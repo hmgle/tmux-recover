@@ -25,6 +25,15 @@ so an immediate first exit could outrun the initial capture. Update both the
 TPM checkout and the installed `tmux-recover` binary; updating only one leaves
 the old startup behavior in place.
 
+## Automatic restore cannot identify the bootstrap shell
+
+Prompt helpers or a long-running foreground command can keep the initial pane
+from reporting the configured default shell. The daemon retries briefly, then
+keeps the previous-generation `current` selected instead of replacing it with
+the unresolved bootstrap. `prefix` + <kbd>Ctrl-r</kbd> therefore remains a safe
+manual fallback. Adding another session, window, or pane establishes real
+server structure and releases this protection so autosave can continue.
+
 ## tmux is too old
 
 tmux-recover requires tmux 3.7 or newer. Check with `tmux -V`. Upgrade tmux

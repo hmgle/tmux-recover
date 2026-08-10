@@ -416,6 +416,123 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
 }
 
 #[tokio::test]
+async fn unresolved_bootstrap_does_not_replace_current_during_later_autosaves() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(80),
+            ..AutosaveConfig::default()
+        },
+        restore: RestoreConfig {
+            auto: true,
+            auto_bootstrap_max_age_seconds: 600,
+            ..RestoreConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let captured = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    let source = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        captured.origin,
+        captured.state,
+        captured.diagnostics,
+    )
+    .unwrap();
+    store.commit(&source, true).unwrap();
+
+    assert!(server.stop(), "source tmux server did not stop");
+    let conf = server.directory.path().join("unresolved-bootstrap.conf");
+    std::fs::write(&conf, "set -g default-shell /bin/sh\n").unwrap();
+    assert!(
+        server
+            .tmux()
+            .arg("-f")
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "bootstrap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = wait_for_auto_bootstrap_capture(&server).await;
+    assert!(
+        server
+            .tmux()
+            .args(["send-keys", "-t", "bootstrap:0.0", "sleep 60", "Enter"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(5), || {
+        server
+            .tmux()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                "bootstrap:0.0",
+                "#{pane_current_command}",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n")
+    })
+    .await;
+
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    // Wait beyond the shell-settle deadline and through many poll intervals.
+    // Neither daemon_start nor a later autosave may move current to this still
+    // ambiguous one-pane server.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(store.load_current().unwrap().id, source.id);
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert!(
+        !task.is_finished(),
+        "daemon stopped while preserving current"
+    );
+
+    // A real structural change proves this is no longer the disposable
+    // bootstrap. The guard must then lift and ordinary autosave must resume.
+    assert!(
+        server
+            .tmux()
+            .args(["new-window", "-d", "-t", "bootstrap", "-n", "work"])
+            .arg("sleep 60")
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(10), || {
+        store.load_current().is_ok_and(|snapshot| {
+            snapshot.origin.server_pid != source.origin.server_pid
+                && snapshot.state.windows.len() == 2
+        })
+    })
+    .await;
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn hook_event_saves_changed_state() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
@@ -553,22 +670,34 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    // The failed auto-restore must not tear the daemon down: the bootstrap
-    // session stays put, and the daemon keeps watching and autosaving it.
-    wait_until(Duration::from_secs(15), || {
-        store.load_current().is_ok_and(|snapshot| {
-            snapshot
-                .state
-                .sessions
-                .first()
-                .is_some_and(|session| session.name == "bootstrap")
-        })
-    })
-    .await;
+    // The failed auto-restore must not tear the daemon down or make the blank
+    // bootstrap current. Keeping the failed source addressable lets the user
+    // inspect or manually restore it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(store.load_current().unwrap().id, source.id);
     assert!(
         !task.is_finished(),
         "daemon exited after a failed auto-restore"
     );
+
+    // Once the target contains real structure, the protection is no longer
+    // appropriate and the daemon must resume ordinary autosaves.
+    assert!(
+        server
+            .tmux()
+            .args(["new-window", "-d", "-t", "bootstrap", "-n", "work"])
+            .arg("sleep 60")
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(15), || {
+        store.load_current().is_ok_and(|snapshot| {
+            snapshot.origin.server_pid != source.origin.server_pid
+                && snapshot.state.windows.len() == 2
+        })
+    })
+    .await;
 
     task.abort();
     let _ = task.await;

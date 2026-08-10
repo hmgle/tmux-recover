@@ -248,8 +248,10 @@ auto_bootstrap_max_age_seconds = 30
 
 The watcher restores only a newly created, empty bootstrap server. It briefly
 rechecks a structurally empty pane while the default shell and prompt helpers
-settle, but leaves an older or populated server untouched. A failed preflight
-does not stop later autosaves.
+settle, but leaves an older or populated server untouched. If that check times
+out, or preflight fails before changing tmux, the previous `current` remains
+selected while the server is still a one-session/one-window/one-pane bootstrap.
+Autosave resumes normally after real structure is added.
 
 ### Import tmux-resurrect history
 
