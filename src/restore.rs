@@ -1121,6 +1121,14 @@ async fn restore_properties(
             ),
         )
         .await?;
+        // resize-window is needed while assembling the saved layout, but tmux
+        // also makes window-size=manual as a side effect. Leave sizing under
+        // the server's configured policy once the exact layout is in place.
+        execute_empty(
+            client,
+            &format!("set-option -wu -t {} window-size", quote(new_window)),
+        )
+        .await?;
         execute_empty(
             client,
             &format!(

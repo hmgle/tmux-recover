@@ -68,6 +68,29 @@ tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
 This option does not bypass snapshot schema, layout, working-directory, or
 process trust checks. Do not use it merely to silence an unexplained error.
 
+## A restored window is clipped or follows the active pane
+
+If the top or bottom of a restored window appears clipped and the visible area
+moves when the active pane changes, compare the window and client sizes and
+check the window sizing policy:
+
+```sh
+tmux display-message -p -t work:1 \
+  'window=#{window_width}x#{window_height} client=#{client_width}x#{client_height} policy=#{window-size}'
+```
+
+Older tmux-recover versions could leave restored windows with a window-local
+`window-size manual` setting. A window larger than the client is then viewed
+through a viewport that follows the active pane. Clear only that local override
+to return the window to the server's configured sizing policy:
+
+```sh
+tmux set-option -wu -t work:1 window-size
+```
+
+Current restores use the saved dimensions while reconstructing the layout, then
+remove the temporary override automatically.
+
 ## The restore key reports a non-empty bootstrap
 
 The restore key only replaces a newly created, one-session/one-window/one-pane

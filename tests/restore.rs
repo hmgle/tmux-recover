@@ -233,6 +233,34 @@ async fn restores_special_fields_active_pane_and_zoom() {
     assert_eq!(restored.state.sessions.len(), 1);
     assert_eq!(restored.state.sessions[0].name, "work:雪");
     assert_eq!(restored.state.windows.len(), 2);
+    let global_window_size = output(server.tmux().args(["show-options", "-gv", "window-size"]));
+    for restored_window in &restored.state.windows {
+        let local_window_size = output(server.tmux().args([
+            "show-options",
+            "-wqv",
+            "-t",
+            &restored_window.id,
+            "window-size",
+        ]));
+        assert!(
+            local_window_size.trim().is_empty(),
+            "restore left a window-size override on {}: {local_window_size:?}",
+            restored_window.id
+        );
+        let effective_window_size = output(server.tmux().args([
+            "display-message",
+            "-p",
+            "-t",
+            &restored_window.id,
+            "#{window-size}",
+        ]));
+        assert_eq!(
+            effective_window_size.trim(),
+            global_window_size.trim(),
+            "restored window {} did not inherit the global size policy",
+            restored_window.id
+        );
+    }
     let window = restored
         .state
         .windows
