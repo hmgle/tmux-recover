@@ -25,14 +25,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install shell tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck zsh
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Check shell scripts
-        run: shellcheck scripts/*.sh tmux-recover.tmux
+        run: |
+          shellcheck scripts/*.sh tmux-recover.tmux
+          zsh -n completions/_tmux-recover
       - name: Check release package
         run: cargo package --locked
 

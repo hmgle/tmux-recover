@@ -64,6 +64,9 @@ fi
 tar -xzf "$archive.tar.gz"
 install -d "$HOME/.local/bin"
 install -m 0755 "$archive/tmux-recover" "$HOME/.local/bin/tmux-recover"
+install -d "$HOME/.local/share/zsh/site-functions"
+install -m 0644 "$archive/completions/_tmux-recover" \
+  "$HOME/.local/share/zsh/site-functions/_tmux-recover"
 ```
 
 Ensure `$HOME/.local/bin` is in the environment that starts tmux.
@@ -83,6 +86,19 @@ Maintainers can build the current checkout instead:
 ```sh
 ./scripts/install.sh --local
 ```
+
+The archive and `scripts/install.sh` include zsh completion. Ensure its install
+directory is in `fpath` before `compinit` runs, for example in `.zshrc`:
+
+```zsh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+The completion covers commands and options, path arguments, and snapshot IDs
+from the selected native or imported history. After installing or upgrading,
+start a new shell or run `compinit` again to refresh zsh's completion cache.
 
 ### 2. Enable the TPM integration
 

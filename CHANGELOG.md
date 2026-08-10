@@ -6,6 +6,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Install zsh completion for commands, options, paths, and snapshot selectors
+  with release archives and `scripts/install.sh`.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

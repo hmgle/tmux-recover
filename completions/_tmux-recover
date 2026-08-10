@@ -1,0 +1,193 @@
+#compdef tmux-recover
+
+# Zsh completion for tmux-recover.
+
+local curcontext="$curcontext" ret=1 state line
+local -a command_names global_opts
+typeset -A opt_args
+
+command_names=(
+    'save:Capture the current tmux server into a native snapshot'
+    'list:List native snapshots for a socket or imported snapshots'
+    'show:Inspect one snapshot'
+    'view:Alias for show'
+    'validate:Verify the schema, graph references, and semantic hash'
+    'restore:Preflight and transactionally restore a snapshot'
+    'daemon:Watch one tmux socket and save changed state continuously'
+    'import-resurrect:Convert a tmux-resurrect v3 or v4 file to native JSON'
+    'pin:Exempt a snapshot from retention pruning'
+    'unpin:Remove a snapshot retention pin'
+    'help:Print command help'
+)
+
+global_opts=(
+    '--data-dir[Override the platform data directory]:directory:_directories'
+    '--config[Use a TOML configuration file instead of the platform default]:configuration file:_files'
+)
+
+(( $+functions[_tmux_recover_command_names] )) ||
+_tmux_recover_command_names() {
+    _describe -t commands 'tmux-recover command' command_names
+}
+
+(( $+functions[_tmux_recover_cwd_fallback] )) ||
+_tmux_recover_cwd_fallback() {
+    _alternative \
+        'home:home directory:(HOME)' \
+        'directories:directory:_directories'
+}
+
+(( $+functions[_tmux_recover_snapshots] )) ||
+_tmux_recover_snapshots() {
+    local history=${1:-native}
+    local executable output entry remainder snapshot_id
+    local -a args snapshots
+
+    executable=${commands[tmux-recover]:-tmux-recover}
+    [[ -n ${opt_args[--data-dir]-} ]] &&
+        args+=(--data-dir "${opt_args[--data-dir]}")
+    [[ -n ${opt_args[--config]-} ]] &&
+        args+=(--config "${opt_args[--config]}")
+    args+=(list)
+    [[ -n ${opt_args[--socket]-} ]] &&
+        args+=(--socket "${opt_args[--socket]}")
+    [[ $history == imports ]] && args+=(--imports)
+
+    output=$(NO_COLOR=1 "$executable" "${args[@]}" 2>/dev/null) || output=
+    snapshots=(current)
+    for entry in ${(f)output}; do
+        (( ${#entry} > 3 )) || continue
+        remainder=${entry[4,-1]}
+        snapshot_id=${remainder%% *}
+        [[ -n $snapshot_id && $snapshot_id != current ]] &&
+            snapshots+=("$snapshot_id")
+    done
+
+    snapshots=(${(u)snapshots})
+    _describe -t snapshots 'snapshot' snapshots
+}
+
+(( $+functions[_tmux_recover_snapshot_candidates] )) ||
+_tmux_recover_snapshot_candidates() {
+    if (( ${+opt_args[--imports]} || ${+opt_args[--from-imports]} )); then
+        _tmux_recover_snapshots imports
+    else
+        _tmux_recover_snapshots native
+    fi
+}
+
+(( $+functions[_tmux_recover_save] )) ||
+_tmux_recover_save() {
+    _arguments -S \
+        $global_opts \
+        '--socket[Use this tmux socket instead of the current or default socket]:socket:_files' \
+        '(--if-empty)--label[Attach a label to the saved snapshot]:label:' \
+        '(--if-empty)--pin[Keep the saved snapshot from retention pruning]' \
+        '(--label --pin)--if-empty[Save only when this socket has no snapshot history]' \
+        '(: -)'{-h,--help}'[Print help]' && ret=0
+}
+
+(( $+functions[_tmux_recover_list] )) ||
+_tmux_recover_list() {
+    _arguments -S \
+        $global_opts \
+        '--socket[Use this tmux socket instead of the current or default socket]:socket:_files' \
+        '--json[Print snapshot summaries as JSON]' \
+        '--imports[Read the separate tmux-resurrect import history]' \
+        '(: -)'{-h,--help}'[Print help]' && ret=0
+}
+
+(( $+functions[_tmux_recover_snapshot] )) ||
+_tmux_recover_snapshot() {
+    _arguments -S \
+        $global_opts \
+        '--socket[Use this tmux socket instead of the current or default socket]:socket:_files' \
+        '--json[Print the snapshot or validation result as JSON]' \
+        '--imports[Read the separate tmux-resurrect import history]' \
+        '(: -)'{-h,--help}'[Print help]' \
+        '1:snapshot:_tmux_recover_snapshot_candidates' && ret=0
+}
+
+(( $+functions[_tmux_recover_restore] )) ||
+_tmux_recover_restore() {
+    _arguments -S \
+        $global_opts \
+        '--socket[Restore into this tmux socket instead of the current or default socket]:socket:_files' \
+        '--dry-run[Only validate and print the restore plan]' \
+        '--replace[Allow replacing a non-empty target server]' \
+        '--yes[Skip the confirmation prompt required by --replace]' \
+        '--cwd-fallback[Use HOME or PATH when a saved pane cwd is unavailable]:fallback:_tmux_recover_cwd_fallback' \
+        '--restore-processes[Attempt trusted, allowlisted process restarts]' \
+        '--allow-origin-mismatch[Allow restore across host, uid, or socket identity]' \
+        '--json[Print the preflight restore plan as JSON]' \
+        '--from-imports[Read the snapshot from the separate import history]' \
+        '(: -)'{-h,--help}'[Print help]' \
+        '1:snapshot:_tmux_recover_snapshot_candidates' && ret=0
+}
+
+(( $+functions[_tmux_recover_daemon] )) ||
+_tmux_recover_daemon() {
+    _arguments -S \
+        $global_opts \
+        '--socket[Watch this tmux socket instead of the current or default socket]:socket:_files' \
+        '(: -)'{-h,--help}'[Print help]' && ret=0
+}
+
+(( $+functions[_tmux_recover_import_resurrect] )) ||
+_tmux_recover_import_resurrect() {
+    _arguments -S \
+        $global_opts \
+        '--label[Attach a label to the imported snapshot]:label:' \
+        '--pin[Keep the imported snapshot from retention pruning]' \
+        '--json[Print the import result as JSON]' \
+        '(: -)'{-h,--help}'[Print help]' \
+        '1:tmux-resurrect snapshot file:_files' && ret=0
+}
+
+(( $+functions[_tmux_recover_help] )) ||
+_tmux_recover_help() {
+    _arguments -S \
+        '(: -)'{-h,--help}'[Print help]' \
+        '*:command:_tmux_recover_command_names' && ret=0
+}
+
+_arguments -C -S -A '-*' \
+    $global_opts \
+    '(- 1 *)'{-h,--help}'[Print help]' \
+    '(- 1 *)'{-V,--version}'[Print version]' \
+    '1:command:->command' \
+    '*::argument:->argument' && ret=0
+
+case $state in
+    command)
+        _tmux_recover_command_names && ret=0
+        ;;
+    argument)
+        curcontext="${curcontext%:*:*}:tmux-recover-$words[1]:"
+        case $words[1] in
+            save)
+                _tmux_recover_save
+                ;;
+            list)
+                _tmux_recover_list
+                ;;
+            (show|view|validate|pin|unpin))
+                _tmux_recover_snapshot
+                ;;
+            restore)
+                _tmux_recover_restore
+                ;;
+            daemon)
+                _tmux_recover_daemon
+                ;;
+            import-resurrect)
+                _tmux_recover_import_resurrect
+                ;;
+            help)
+                _tmux_recover_help
+                ;;
+        esac
+        ;;
+esac
+
+return ret

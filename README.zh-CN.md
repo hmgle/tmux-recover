@@ -56,6 +56,9 @@ fi
 tar -xzf "$archive.tar.gz"
 install -d "$HOME/.local/bin"
 install -m 0755 "$archive/tmux-recover" "$HOME/.local/bin/tmux-recover"
+install -d "$HOME/.local/share/zsh/site-functions"
+install -m 0644 "$archive/completions/_tmux-recover" \
+  "$HOME/.local/share/zsh/site-functions/_tmux-recover"
 ```
 
 请确保启动 tmux 的环境能在 `PATH` 中找到 `$HOME/.local/bin`。
@@ -74,6 +77,18 @@ binary，再安装到 `${PREFIX:-$HOME/.local}/bin`，普通用户不需要 Rust
 ```sh
 ./scripts/install.sh --local
 ```
+
+Release 压缩包和 `scripts/install.sh` 都包含 zsh 自动补全。请确保安装目录在
+`compinit` 运行前已加入 `fpath`，例如在 `.zshrc` 中配置：
+
+```zsh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+补全内容包括子命令、选项、路径参数，以及所选 native/import 历史中的 snapshot ID。
+安装或升级后，请启动新的 shell，或再次运行 `compinit` 刷新 zsh 补全缓存。
 
 ### 2. 启用 TPM 集成
 

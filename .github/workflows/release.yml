@@ -54,6 +54,7 @@ jobs:
           archive="tmux-recover-${TARGET}"
           mkdir -p "dist/${archive}"
           cp "target/${TARGET}/release/tmux-recover" "dist/${archive}/"
+          cp -R completions "dist/${archive}/"
           cp README.md LICENSE "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           cd dist
