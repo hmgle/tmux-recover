@@ -42,11 +42,30 @@ impl Server {
         command.args(["-S"]).arg(&self.socket);
         command
     }
+
+    fn stop(&self) -> bool {
+        let _ = self.tmux().arg("kill-server").output();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if self
+                .tmux()
+                .arg("has-session")
+                .output()
+                .is_ok_and(|output| !output.status.success())
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.tmux().arg("kill-server").status();
+        let _ = self.stop();
     }
 }
 
@@ -96,6 +115,20 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
             reason: "initial".to_owned()
         }
     );
+    let daemon_lock = store.root().join("daemon.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let daemon_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&daemon_lock) {
+            if !pid.trim().is_empty() {
+                break pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached daemon never acquired its single-instance lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 
     assert!(
         server
@@ -113,4 +146,23 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
     let output = start();
     assert!(output.status.success());
     assert_eq!(store.load_current().unwrap().id, initial.id);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        std::fs::read_to_string(&daemon_lock).unwrap(),
+        daemon_pid,
+        "config reload replaced the live daemon lock owner"
+    );
+
+    assert!(server.stop(), "isolated tmux server did not stop");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if store.acquire_daemon_lock().is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached daemon did not release its lock after server shutdown"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
