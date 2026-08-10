@@ -5,7 +5,24 @@ use std::{fs, path::PathBuf};
 
 #[cfg(target_os = "linux")]
 use crate::model::EncodedPath;
-use crate::model::RestartSpec;
+use crate::model::{RestartSpec, TmuxState};
+
+pub fn populate_restart_specs(state: &mut TmuxState) {
+    let restart_specs = collect_restart_specs(
+        state
+            .windows
+            .iter()
+            .flat_map(|window| &window.panes)
+            .filter_map(|pane| pane.pid),
+    );
+    for pane in state
+        .windows
+        .iter_mut()
+        .flat_map(|window| &mut window.panes)
+    {
+        pane.restart = pane.pid.and_then(|pid| restart_specs.get(&pid).cloned());
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub fn collect_restart_specs(pane_pids: impl Iterator<Item = u32>) -> HashMap<u32, RestartSpec> {
@@ -51,10 +68,19 @@ struct ProcStat {
 #[cfg(target_os = "linux")]
 fn read_stat(pid: u32) -> Option<ProcStat> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_stat(stat: &str) -> Option<ProcStat> {
     let close = stat.rfind(')')?;
-    let fields: Vec<&str> = stat.get(close + 2..)?.split_whitespace().collect();
     Some(ProcStat {
-        tpgid: fields.get(5)?.parse().ok()?,
+        tpgid: stat
+            .get(close + 2..)?
+            .split_whitespace()
+            .nth(5)?
+            .parse()
+            .ok()?,
     })
 }
 
@@ -67,4 +93,15 @@ fn read_cmdline(pid: u32) -> Option<Vec<String>> {
         .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
     (!argv.is_empty()).then_some(argv)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tpgid_without_being_confused_by_parentheses_in_comm() {
+        let stat = "123 (name with ) parenthesis) S 1 2 3 4 456 7 8";
+        assert_eq!(parse_stat(stat).unwrap().tpgid, 456);
+    }
 }

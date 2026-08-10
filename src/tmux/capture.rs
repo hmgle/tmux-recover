@@ -8,7 +8,7 @@ use crate::{
         Diagnostic, EncodedPath, Origin, Pane, PaneCwd, Session, SocketIdentity, TmuxState, Window,
         WindowLink,
     },
-    process::collect_restart_specs,
+    process::populate_restart_specs,
     util::{canonical_socket_path, hostname, require_tmux_37, uid},
 };
 
@@ -24,6 +24,15 @@ pub struct CaptureResult {
 }
 
 pub async fn capture(client: &mut ControlClient, requested_socket: &Path) -> Result<CaptureResult> {
+    let mut captured = capture_structure(client, requested_socket).await?;
+    captured.capture_processes();
+    Ok(captured)
+}
+
+pub async fn capture_structure(
+    client: &mut ControlClient,
+    requested_socket: &Path,
+) -> Result<CaptureResult> {
     let output = client
         .execute_blocks(&capture_command(), 4)
         .await?
@@ -31,6 +40,12 @@ pub async fn capture(client: &mut ControlClient, requested_socket: &Path) -> Res
         .flatten()
         .collect();
     parse_capture(output, requested_socket)
+}
+
+impl CaptureResult {
+    pub fn capture_processes(&mut self) {
+        populate_restart_specs(&mut self.state);
+    }
 }
 
 fn capture_command() -> String {
@@ -111,14 +126,9 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
         }
     }
 
-    let restart_specs = collect_restart_specs(
-        pane_rows
-            .iter()
-            .filter_map(|fields| field_u32(fields, 10).ok().flatten()),
-    );
     for fields in pane_rows {
         let window_id = field_string(&fields, 1)?;
-        let pane = parse_pane(&fields, &restart_specs)?;
+        let pane = parse_pane(&fields)?;
         let window = windows
             .get_mut(&window_id)
             .with_context(|| format!("pane {} references unknown window {window_id}", pane.id))?;
@@ -234,7 +244,7 @@ fn parse_window(
     Ok(())
 }
 
-fn parse_pane(fields: &[Vec<u8>], restart_specs: &BTreeMapCompat) -> Result<Pane> {
+fn parse_pane(fields: &[Vec<u8>]) -> Result<Pane> {
     expect_fields(fields, 15)?;
     let id = field_string(fields, 2)?;
     let pid = field_u32(fields, 10)?;
@@ -252,12 +262,10 @@ fn parse_pane(fields: &[Vec<u8>], restart_specs: &BTreeMapCompat) -> Result<Pane
         tty: field_optional_string(fields, 11)?,
         dead: field_bool(fields, 12)?,
         dead_status: field_i32(fields, 13)?,
-        restart: pid.and_then(|pid| restart_specs.get(&pid).cloned()),
+        restart: None,
         import_status: None,
     })
 }
-
-type BTreeMapCompat = std::collections::HashMap<u32, crate::model::RestartSpec>;
 
 fn parse_record(line: &[u8]) -> Result<Vec<Vec<u8>>> {
     line.split(|byte| *byte == SEPARATOR)

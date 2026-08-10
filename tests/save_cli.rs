@@ -90,13 +90,21 @@ impl Drop for Server {
 }
 
 fn save(data: &std::path::Path, socket: &std::path::Path, extra: &[&str]) -> String {
+    save_with_config(data, socket, None, extra)
+}
+
+fn save_with_config(
+    data: &std::path::Path,
+    socket: &std::path::Path,
+    config: Option<&std::path::Path>,
+    extra: &[&str],
+) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tmux-recover"));
-    command
-        .arg("--data-dir")
-        .arg(data)
-        .args(["save", "--socket"])
-        .arg(socket)
-        .args(extra);
+    command.arg("--data-dir").arg(data);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command.args(["save", "--socket"]).arg(socket).args(extra);
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -104,6 +112,41 @@ fn save(data: &std::path::Path, socket: &std::path::Path, extra: &[&str]) -> Str
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn empty_allowlist_saves_without_process_metadata_and_removes_the_sidecar() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    save_until_settled(data.path(), &server.socket);
+    assert!(checkpoint(data.path()).is_some());
+
+    let config = data.path().join("disabled.toml");
+    std::fs::write(&config, "[restore]\nprocess_allowlist = []\n").unwrap();
+    let output = save_with_config(
+        data.path(),
+        &server.socket,
+        Some(&config),
+        &["--label", "without-processes"],
+    );
+    assert!(output.starts_with("saved "), "{output}");
+    assert!(checkpoint(data.path()).is_none());
+
+    let saved = snapshots(data.path())
+        .into_iter()
+        .find(|snapshot| snapshot.label.as_deref() == Some("without-processes"))
+        .unwrap();
+    assert!(
+        saved
+            .state
+            .windows
+            .iter()
+            .flat_map(|window| &window.panes)
+            .all(|pane| pane.restart.is_none())
+    );
 }
 
 fn snapshots(data: &std::path::Path) -> Vec<tmux_recover::model::Snapshot> {

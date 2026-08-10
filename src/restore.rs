@@ -1515,7 +1515,7 @@ pub fn restore_config_options<'a>(
         replace,
         allow_origin_mismatch,
         cwd_fallback,
-        restore_processes,
+        restore_processes: restore_processes && config.processes_enabled(),
         process_allowlist: &config.process_allowlist,
         process_checkpoint,
     }
@@ -2083,6 +2083,14 @@ mod tests {
 
         assert!(plan.warnings.is_empty());
         assert_eq!(plan.process_restarts, 0);
+    }
+
+    #[test]
+    fn empty_allowlist_disables_process_restore_options() {
+        let mut config = RestoreConfig::default();
+        config.process_allowlist.clear();
+        let options = restore_config_options(&config, false, false, None, true, None);
+        assert!(!options.restore_processes);
     }
 
     #[test]

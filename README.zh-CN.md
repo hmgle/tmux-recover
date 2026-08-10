@@ -231,6 +231,8 @@ tmux-recover restore current --restore-processes
 只有 native restart metadata 标记为 trusted，且可执行文件名位于 allowlist 时才会
 启动。可在配置中按需修改 `restore.process_allowlist`。恢复历史快照时只使用该快照
 保存的进程元数据；只有从同一 socket 显式恢复 `current` 时才会考虑实时进程检查点。
+如果不需要进程恢复，可将其设为 `[]`；此后 save 会跳过 Linux `/proc` 扫描并删除实时
+进程检查点。allowlist 为空时传入 `--restore-processes` 会在计划中报告为 disabled。
 导入的 tmux-resurrect 命令文本永远不会执行。
 
 ### 启用自动恢复

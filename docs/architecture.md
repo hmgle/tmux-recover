@@ -61,10 +61,12 @@ selects another dedicated slot. An automatic check-then-unset would recreate
 the same race by deleting a hook that another process installed in between.
 
 Structure events are debounced. cwd and pane title changes are found by a
-low-frequency poll. A capture is committed only when its structural hash
-(topology, layout, cwd, titles; excludes pid/tty/current_command/dead_status)
-differs from the current snapshot, so an idle server does not produce a new
-snapshot on every poll.
+low-frequency poll. Capture first reads only tmux structure; process restart
+metadata is added later only when the structure changed or a process checkpoint
+is due. A capture is committed only when its structural hash (topology, layout,
+cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
+current snapshot, so an idle server does not produce a new snapshot on every
+poll or scan `/proc` on every poll.
 
 Retention independently cross-checks each history filename against the ID in
 its snapshot body. A store shared by the daemon and its clones caches that body
@@ -109,11 +111,13 @@ a warning instead of attempting a rollback that could discard both old and new
 state. A pre-restore safety snapshot is marked separately from user pins and is
 retained by the bounded `retention.safety_snapshots` policy.
 
-Process restart metadata is collected from `/proc` on Linux. It is never
-executed unless `--restore-processes` is present and the executable basename is
-allowlisted. Imported resurrect command text is metadata only and is never
-trusted for execution. Structural capture and restore work without process
-metadata on macOS.
+Process restart metadata is collected from `/proc` on Linux only when
+`restore.process_allowlist` is non-empty and the capture path needs it. It is
+never executed unless `--restore-processes` is present and the executable
+basename is allowlisted. An empty allowlist removes the live process sidecar
+and makes process restore disabled. Imported resurrect command text is metadata
+only and is never trusted for execution. Structural capture and restore work
+without process metadata on every platform.
 
 A restarted program is launched through a fixed `/bin/sh` supervisor:
 `trap '' INT QUIT; (trap - INT QUIT; exec <program>); trap - INT QUIT; exec
@@ -145,10 +149,12 @@ It sits next to `current.json`, is overwritten in place rather than appended to
 history, and holds one entry per pane: `pane_id`, `current_command`, and
 `restart`. Its `process_hash` covers exactly those fields, so PIDs, TTYs, and
 capture timestamps cannot trigger a rewrite. When a capture's structural hash
-is unchanged, the sidecar is refreshed at most once per
+is unchanged, the daemon checks the sidecar's timestamp before collecting any
+process metadata. The sidecar is refreshed at most once per
 `autosave.process_checkpoint_interval` (default 300s), and only if
 `process_hash` actually moved. A structural commit refreshes it immediately,
-since the layout it was pinned to is gone.
+since the layout it was pinned to is gone. An empty process allowlist skips this
+path entirely and removes the sidecar.
 
 The elapsed time is measured against the sidecar's own `captured_at`, not an
 in-memory timer, so restarting the daemon does not produce an extra write. If

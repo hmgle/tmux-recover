@@ -1,7 +1,10 @@
 use std::{process::Command, time::Duration};
 
 use tempfile::TempDir;
-use tmux_recover::tmux::{capture::capture, control::ControlClient};
+use tmux_recover::tmux::{
+    capture::{capture, capture_structure},
+    control::ControlClient,
+};
 
 struct TestServer {
     directory: TempDir,
@@ -100,6 +103,13 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
     );
 
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
+    let structural = capture_structure(&mut client, &server.socket)
+        .await
+        .unwrap();
+    assert!(
+        structural.state.windows[0].panes[0].restart.is_none(),
+        "structural capture must not collect process restart metadata"
+    );
     let captured = capture(&mut client, &server.socket).await.unwrap();
     // macOS reports a cwd below /private/var even when tempfile returned its
     // /var alias. Compare filesystem identities while still exercising the
@@ -109,6 +119,11 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
     let window = &captured.state.windows[0];
     assert_eq!(window.automatic_rename, Some(false));
     assert_eq!(window.panes[0].title.as_deref(), Some(""));
+    #[cfg(target_os = "linux")]
+    assert!(
+        window.panes[0].restart.is_some(),
+        "full capture must retain Linux process metadata"
+    );
     assert_eq!(
         window.panes[0]
             .cwd

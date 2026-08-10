@@ -141,6 +141,12 @@ pub struct RestoreConfig {
     pub process_allowlist: Vec<String>,
 }
 
+impl RestoreConfig {
+    pub fn processes_enabled(&self) -> bool {
+        !self.process_allowlist.is_empty()
+    }
+}
+
 impl Default for RestoreConfig {
     fn default() -> Self {
         Self {
@@ -201,7 +207,15 @@ mod tests {
         assert_eq!(config.retention.recent, 100);
         assert_eq!(config.retention.safety_snapshots, 10);
         assert!(!config.restore.auto);
+        assert!(config.restore.processes_enabled());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn an_empty_process_allowlist_disables_process_capture() {
+        let mut config = RestoreConfig::default();
+        config.process_allowlist.clear();
+        assert!(!config.processes_enabled());
     }
 
     #[test]

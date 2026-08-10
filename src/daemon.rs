@@ -7,11 +7,16 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::{
     config::Config,
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
+    process::populate_restart_specs,
     restore::{
         apply, preflight, restore_config_options, target_is_auto_bootstrap, target_is_bootstrap,
     },
     storage::{CommitOutcome, SnapshotStore},
-    tmux::{capture::capture, control::ControlClient, hooks},
+    tmux::{
+        capture::{CaptureResult, capture_structure},
+        control::ControlClient,
+        hooks,
+    },
     util::socket_identity,
 };
 
@@ -25,7 +30,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
     let _lock = store.acquire_daemon_lock()?;
 
     let mut client = ControlClient::connect(socket).await?;
-    let initial = capture(&mut client, socket).await?;
+    let initial = capture_structure(&mut client, socket).await?;
     let mut protected_current = match bootstrap_current_to_preserve(&store, config, &initial) {
         Ok(snapshot_id) => snapshot_id,
         Err(error) => {
@@ -269,7 +274,7 @@ async fn auto_restore(
                 return Ok(false);
             }
             tokio::time::sleep(AUTO_RESTORE_SHELL_SETTLE_INTERVAL).await;
-            let target = capture(client, socket)
+            let target = capture_structure(client, socket)
                 .await
                 .context("automatic restore could not recapture the bootstrap server")?;
             if !target_is_bootstrap(&target) || !server_is_young(&target, config) {
@@ -286,13 +291,17 @@ async fn auto_restore(
     let plan =
         preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;
     let _mutation_lock = store.acquire_mutation_lock()?;
+    let mut safety_state = target.state.clone();
+    if config.restore.processes_enabled() {
+        populate_restart_specs(&mut safety_state);
+    }
     let safety = Snapshot::new(
         Some(format!("pre-auto-restore {}", snapshot.id)),
         SnapshotSource::Native {
             reason: "pre_auto_restore".to_owned(),
         },
         target.origin.clone(),
-        target.state.clone(),
+        safety_state,
         target.diagnostics.clone(),
     )?;
     store.commit(&safety, false)?;
@@ -414,7 +423,34 @@ async fn save_if_changed(
     // stale daemon capture to wait behind a newer CLI save and then overwrite
     // its `current` pointer.
     let _mutation_lock = store.acquire_mutation_lock()?;
-    let captured = capture(client, socket).await?;
+    let captured = capture_structure(client, socket).await?;
+    save_captured(
+        store,
+        config,
+        reason,
+        protected_current,
+        captured,
+        CaptureResult::capture_processes,
+    )
+}
+
+fn save_captured(
+    store: &SnapshotStore,
+    config: &Config,
+    reason: &str,
+    protected_current: Option<&str>,
+    mut captured: CaptureResult,
+    mut capture_processes: impl FnMut(&mut CaptureResult),
+) -> Result<SaveOutcome> {
+    let processes_enabled = config.restore.processes_enabled();
+    if !processes_enabled {
+        if let Err(error) = store.remove_process_checkpoint() {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to remove disabled process checkpoint"
+            );
+        }
+    }
     if target_is_bootstrap(&captured) {
         if let Some(protected) = protected_current {
             if store.current_snapshot_id()?.as_deref() == Some(protected) {
@@ -422,15 +458,32 @@ async fn save_if_changed(
             }
         }
     }
-    let checkpoint_origin = ProcessCheckpointOrigin {
-        socket_key: captured
-            .origin
-            .socket
-            .as_ref()
-            .map(|socket| socket.key.clone())
-            .unwrap_or_default(),
-        server_started_at: captured.origin.server_started_at,
-    };
+    let structural_hash = captured.state.structural_hash()?;
+    if let Some(base_snapshot_id) =
+        store.current_snapshot_id_if_structure_matches(&captured.origin, &structural_hash)?
+    {
+        if !processes_enabled {
+            return Ok(SaveOutcome::Unchanged);
+        }
+        let Some(refresh) = process_checkpoint_refresh_if_due(store, config, base_snapshot_id)?
+        else {
+            return Ok(SaveOutcome::Unchanged);
+        };
+        capture_processes(&mut captured);
+        refresh_process_checkpoint(
+            store,
+            structural_hash,
+            process_checkpoint_origin(&captured),
+            &captured.state,
+            refresh,
+        )?;
+        return Ok(SaveOutcome::Unchanged);
+    }
+
+    if processes_enabled {
+        capture_processes(&mut captured);
+    }
+    let checkpoint_origin = process_checkpoint_origin(&captured);
     let snapshot = Snapshot::new(
         None,
         SnapshotSource::Native {
@@ -451,25 +504,36 @@ async fn save_if_changed(
             // unconditionally rather than waiting for the checkpoint
             // interval, since the processes were already captured for this
             // snapshot.
-            let checkpoint = ProcessCheckpoint::capture(
-                snapshot.id.clone(),
-                commit.structural_hash,
-                checkpoint_origin,
-                &snapshot.state,
-            )?;
-            if let Err(error) = store.write_process_checkpoint(&checkpoint) {
-                tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+            if processes_enabled {
+                let checkpoint = ProcessCheckpoint::capture(
+                    snapshot.id.clone(),
+                    commit.structural_hash,
+                    checkpoint_origin,
+                    &snapshot.state,
+                )?;
+                if let Err(error) = store.write_process_checkpoint(&checkpoint) {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+                }
             }
         }
         CommitOutcome::Unchanged => {
-            if let Err(error) = maybe_refresh_process_checkpoint(
-                store,
-                config,
-                &snapshot,
-                commit.structural_hash,
-                checkpoint_origin,
-            ) {
-                tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+            if processes_enabled {
+                let base_snapshot_id = store.current_snapshot_id()?;
+                if let Some(base_snapshot_id) = base_snapshot_id {
+                    if let Some(refresh) =
+                        process_checkpoint_refresh_if_due(store, config, base_snapshot_id)?
+                    {
+                        if let Err(error) = refresh_process_checkpoint(
+                            store,
+                            commit.structural_hash,
+                            checkpoint_origin,
+                            &snapshot.state,
+                            refresh,
+                        ) {
+                            tracing::warn!(error = %format!("{error:#}"), "failed to refresh process checkpoint");
+                        }
+                    }
+                }
             }
         }
     }
@@ -492,26 +556,30 @@ impl From<CommitOutcome> for SaveOutcome {
     }
 }
 
-/// Rewrites the process checkpoint sidecar when structural state is
-/// unchanged, but only often enough to matter: `process_checkpoint_interval`
-/// gates how frequently this runs, and a hash comparison against the
-/// existing sidecar skips the write entirely when nothing a restore cares
-/// about has changed. The elapsed time is measured against the sidecar's own
-/// `captured_at`, not an in-memory timestamp, so a daemon restart does not
-/// immediately force a redundant write.
-fn maybe_refresh_process_checkpoint(
+fn process_checkpoint_origin(captured: &CaptureResult) -> ProcessCheckpointOrigin {
+    ProcessCheckpointOrigin {
+        socket_key: captured
+            .origin
+            .socket
+            .as_ref()
+            .map(|socket| socket.key.clone())
+            .unwrap_or_default(),
+        server_started_at: captured.origin.server_started_at,
+    }
+}
+
+struct PendingProcessCheckpointRefresh {
+    base_snapshot_id: String,
+    existing: Option<ProcessCheckpoint>,
+    clock_moved_backwards: bool,
+}
+
+/// Determines whether process metadata is due before `/proc` is consulted.
+fn process_checkpoint_refresh_if_due(
     store: &SnapshotStore,
     config: &Config,
-    snapshot: &Snapshot,
-    structural_hash: String,
-    origin: ProcessCheckpointOrigin,
-) -> Result<()> {
-    // `commit` already confirmed this snapshot's structural state matches
-    // the persisted current snapshot, so the pointer's id is what a restore
-    // will actually check the sidecar's `base_snapshot_id` against.
-    let Some(base_snapshot_id) = store.current_snapshot_id()? else {
-        return Ok(());
-    };
+    base_snapshot_id: String,
+) -> Result<Option<PendingProcessCheckpointRefresh>> {
     // An unreadable sidecar is treated as absent here, which makes the write
     // below repair it. Only a restore needs to distinguish the two.
     let existing = store.read_process_checkpoint().unwrap_or_else(|error| {
@@ -547,15 +615,29 @@ fn maybe_refresh_process_checkpoint(
             Some(checkpoint) => now.signed_duration_since(checkpoint.captured_at) >= interval,
         };
     if !due {
-        return Ok(());
+        return Ok(None);
     }
 
+    Ok(Some(PendingProcessCheckpointRefresh {
+        base_snapshot_id,
+        existing,
+        clock_moved_backwards,
+    }))
+}
+
+fn refresh_process_checkpoint(
+    store: &SnapshotStore,
+    structural_hash: String,
+    origin: ProcessCheckpointOrigin,
+    state: &crate::model::TmuxState,
+    refresh: PendingProcessCheckpointRefresh,
+) -> Result<()> {
     let checkpoint =
-        ProcessCheckpoint::capture(base_snapshot_id, structural_hash, origin, &snapshot.state)?;
+        ProcessCheckpoint::capture(refresh.base_snapshot_id, structural_hash, origin, state)?;
     // A future timestamp has to be replaced even when nothing else changed,
     // since re-anchoring the clock is the whole point of that rewrite.
-    let unchanged = !clock_moved_backwards
-        && existing.is_some_and(|previous| {
+    let unchanged = !refresh.clock_moved_backwards
+        && refresh.existing.is_some_and(|previous| {
             previous.base_snapshot_id == checkpoint.base_snapshot_id
                 && previous.process_hash == checkpoint.process_hash
         });
@@ -616,14 +698,45 @@ mod tests {
     }
 
     fn refresh_process_checkpoint(store: &SnapshotStore, config: &Config, snapshot: &Snapshot) {
-        maybe_refresh_process_checkpoint(
-            store,
-            config,
-            snapshot,
-            snapshot.state.structural_hash().unwrap(),
-            origin(),
-        )
-        .unwrap();
+        let base_snapshot_id = store.current_snapshot_id().unwrap().unwrap();
+        if let Some(refresh) =
+            process_checkpoint_refresh_if_due(store, config, base_snapshot_id).unwrap()
+        {
+            super::refresh_process_checkpoint(
+                store,
+                snapshot.state.structural_hash().unwrap(),
+                origin(),
+                &snapshot.state,
+                refresh,
+            )
+            .unwrap();
+        }
+    }
+
+    fn captured(cwd: &Path, running: Option<&str>) -> CaptureResult {
+        let mut snapshot = snapshot(cwd, running);
+        for pane in snapshot
+            .state
+            .windows
+            .iter_mut()
+            .flat_map(|window| &mut window.panes)
+        {
+            pane.restart = None;
+        }
+        CaptureResult {
+            origin: snapshot.origin,
+            state: snapshot.state,
+            diagnostics: snapshot.diagnostics,
+            default_shell: Some("/bin/sh".to_owned()),
+        }
+    }
+
+    fn add_nvim_restart(captured: &mut CaptureResult) {
+        captured.state.windows[0].panes[0].restart = Some(RestartSpec {
+            executable: EncodedPath::from_path(Path::new("/usr/bin/nvim")),
+            argv: vec!["nvim".to_owned()],
+            trusted: true,
+        });
     }
 
     /// Structurally identical snapshots that differ only in what the pane is
@@ -745,6 +858,108 @@ mod tests {
         // No recorded start time means the age cannot be established, so the
         // conservative answer is "not young".
         assert!(!super::server_is_young_at(&target(None), &config, now));
+    }
+
+    #[test]
+    fn interval_gate_skips_process_collection_until_due() {
+        use std::cell::Cell;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let patient = config(Duration::from_secs(300));
+
+        let first_calls = Cell::new(0);
+        assert_eq!(
+            save_captured(
+                &store,
+                &patient,
+                "test",
+                None,
+                captured(cwd, None),
+                |captured| {
+                    first_calls.set(first_calls.get() + 1);
+                    add_nvim_restart(captured);
+                },
+            )
+            .unwrap(),
+            SaveOutcome::Written
+        );
+        assert_eq!(first_calls.get(), 1);
+
+        let deferred_calls = Cell::new(0);
+        assert_eq!(
+            save_captured(
+                &store,
+                &patient,
+                "test",
+                None,
+                captured(cwd, Some("/usr/bin/nvim")),
+                |_| deferred_calls.set(deferred_calls.get() + 1),
+            )
+            .unwrap(),
+            SaveOutcome::Unchanged
+        );
+        assert_eq!(
+            deferred_calls.get(),
+            0,
+            "a checkpoint interval that is not due must avoid process collection"
+        );
+
+        let eager = config(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(2));
+        let due_calls = Cell::new(0);
+        assert_eq!(
+            save_captured(
+                &store,
+                &eager,
+                "test",
+                None,
+                captured(cwd, Some("/usr/bin/nvim")),
+                |captured| {
+                    due_calls.set(due_calls.get() + 1);
+                    add_nvim_restart(captured);
+                },
+            )
+            .unwrap(),
+            SaveOutcome::Unchanged
+        );
+        assert_eq!(due_calls.get(), 1);
+    }
+
+    #[test]
+    fn empty_allowlist_skips_collection_and_removes_the_sidecar() {
+        use std::cell::Cell;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let enabled = config(Duration::from_secs(300));
+        save_captured(
+            &store,
+            &enabled,
+            "test",
+            None,
+            captured(cwd, None),
+            add_nvim_restart,
+        )
+        .unwrap();
+        assert!(store.read_process_checkpoint().unwrap().is_some());
+
+        let mut disabled = enabled;
+        disabled.restore.process_allowlist.clear();
+        let calls = Cell::new(0);
+        assert_eq!(
+            save_captured(&store, &disabled, "test", None, captured(cwd, None), |_| {
+                calls.set(calls.get() + 1)
+            },)
+            .unwrap(),
+            SaveOutcome::Unchanged
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(store.read_process_checkpoint().unwrap().is_none());
     }
 
     #[test]
