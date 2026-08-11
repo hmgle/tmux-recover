@@ -19,7 +19,7 @@ use tmux_recover::{
 
 mod support;
 
-use support::PtyDrain;
+use support::{PtyDrain, ioctl_request};
 
 struct TestServer {
     directory: TempDir,
@@ -100,7 +100,7 @@ impl AttachedClient {
                 if nix::libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
+                if nix::libc::ioctl(0, ioctl_request(nix::libc::TIOCSCTTY), 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

@@ -7,6 +7,10 @@ use std::{
 
 const MAX_CAPTURED_BYTES: usize = 1024 * 1024;
 
+pub fn ioctl_request(request: impl Into<nix::libc::c_ulong>) -> nix::libc::c_ulong {
+    request.into()
+}
+
 pub struct PtyDrain {
     output: Arc<Mutex<Vec<u8>>>,
     handle: Option<JoinHandle<io::Result<()>>>,
