@@ -13,7 +13,7 @@ command_names=(
     'view:Alias for show'
     'validate:Verify the schema, graph references, and semantic hash'
     'restore:Preflight and transactionally restore a snapshot'
-    'daemon:Watch one tmux socket and save changed state continuously'
+    'daemon:Run or control the continuous watcher for one tmux socket'
     'import-resurrect:Convert a tmux-resurrect v3 or v4 file to native JSON'
     'pin:Exempt a snapshot from retention pruning'
     'unpin:Remove a snapshot retention pin'
@@ -129,7 +129,11 @@ _tmux_recover_restore() {
 _tmux_recover_daemon() {
     _arguments -S \
         $global_opts \
-        '--socket[Watch this tmux socket instead of the current or default socket]:socket:_files' \
+        '--socket[Use this tmux socket instead of the current or default socket]:socket:_files' \
+        '(--stop --reload)--status[Report the running daemon version and process identity]' \
+        '(--status --reload --json)--stop[Ask the running daemon to exit cleanly]' \
+        '(--status --stop --json)--reload[Re-exec the running daemon from the installed binary]' \
+        '(--stop --reload)--json[Print daemon status as JSON]' \
         '(: -)'{-h,--help}'[Print help]' && ret=0
 }
 

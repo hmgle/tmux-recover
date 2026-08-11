@@ -8,6 +8,8 @@ binary_path="$binary_dir/tmux-recover"
 completion_dir="$prefix/share/zsh/site-functions"
 completion_path="$completion_dir/_tmux-recover"
 mode="release"
+reload_daemon=false
+daemon_socket=""
 download_dir=""
 temporary_binary=""
 temporary_completion=""
@@ -15,13 +17,16 @@ source_completion=""
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install.sh [--local]
+Usage: scripts/install.sh [--local] [--reload-daemon --socket SOCKET]
 
 Install the latest GitHub release, or build from this checkout with --local.
 The zsh completion is installed under PREFIX/share/zsh/site-functions.
+Use --reload-daemon with an explicit socket to re-exec its running watcher
+after installation.
 
 Environment:
-  PREFIX   installation prefix (default: $HOME/.local)
+  PREFIX                   installation prefix (default: $HOME/.local)
+  TMUX_RECOVER_DATA_DIR     data directory used to locate a daemon for reload
 EOF
 }
 
@@ -29,6 +34,18 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --local)
       mode="local"
+      ;;
+    --reload-daemon)
+      reload_daemon=true
+      ;;
+    --socket)
+      shift
+      if [ "$#" -eq 0 ] || [ -z "$1" ]; then
+        printf 'error: --socket requires a tmux socket path\n' >&2
+        usage >&2
+        exit 2
+      fi
+      daemon_socket="$1"
       ;;
     -h|--help)
       usage
@@ -42,6 +59,17 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "$daemon_socket" ] && [ "$reload_daemon" != true ]; then
+  printf 'error: --socket is only valid with --reload-daemon\n' >&2
+  usage >&2
+  exit 2
+fi
+if [ "$reload_daemon" = true ] && [ -z "$daemon_socket" ]; then
+  printf 'error: --reload-daemon requires --socket SOCKET\n' >&2
+  usage >&2
+  exit 2
+fi
 
 cleanup() {
   if [ -n "$temporary_binary" ]; then
@@ -150,4 +178,15 @@ if [ -n "$temporary_completion" ]; then
   mv -f "$temporary_completion" "$completion_path"
   temporary_completion=""
   printf 'installed %s\n' "$completion_path"
+fi
+
+if [ "$reload_daemon" = true ]; then
+  if ! "$binary_path" daemon --socket "$daemon_socket" --reload; then
+    printf '%s\n' \
+      'error: the binary was installed, but the requested daemon reload failed' >&2
+    exit 1
+  fi
+else
+  printf '%s\n' \
+    'note: an already running daemon keeps its old binary; use --reload-daemon with --socket to update it' >&2
 fi

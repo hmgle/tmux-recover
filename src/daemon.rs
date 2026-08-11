@@ -6,6 +6,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::{
     config::Config,
+    daemon_control::{ControlAction, ControlServer, DaemonStatus},
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     process::populate_restart_specs,
     restore::{
@@ -23,7 +24,13 @@ use crate::{
 const AUTO_RESTORE_SHELL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTO_RESTORE_SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 
-pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonExit {
+    Stop,
+    Reload,
+}
+
+pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<DaemonExit> {
     config.validate()?;
     let identity = socket_identity(socket)?;
     let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
@@ -100,6 +107,9 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
         }
         SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
     }
+    let control = ControlServer::bind(data_dir, &identity.key)?;
+    let status = DaemonStatus::running(socket);
+    let mut control_request = control.next_request(status.clone());
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
 
     let mut poll = tokio::time::interval(config.autosave.poll_interval);
@@ -111,13 +121,24 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
 
     let mut pending = None;
     let mut last_write = Instant::now();
-    loop {
+    let exit = loop {
         let timer_deadline =
             pending.unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         let timer = tokio::time::sleep_until(timer_deadline);
         tokio::pin!(timer);
 
         tokio::select! {
+            request = &mut control_request => {
+                match request {
+                    Ok(ControlAction::Continue) => {}
+                    Ok(ControlAction::Stop) => break DaemonExit::Stop,
+                    Ok(ControlAction::Reload) => break DaemonExit::Reload,
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "daemon control request failed");
+                    }
+                }
+                control_request = control.next_request(status.clone());
+            }
             notification = client.next_notification() => {
                 let notification = notification?;
                 if matches!(notification, crate::tmux::control::Notification::Exit(_)) {
@@ -193,13 +214,20 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<()> 
             }
             result = &mut shutdown => {
                 result?;
-                break;
+                break DaemonExit::Stop;
             }
         }
-    }
+    };
 
-    tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
-    Ok(())
+    match exit {
+        DaemonExit::Stop => {
+            tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
+        }
+        DaemonExit::Reload => {
+            tracing::info!(socket = %socket.display(), "tmux-recover daemon is reloading");
+        }
+    }
+    Ok(exit)
 }
 
 /// Identifies a previous-generation `current` that must remain addressable if

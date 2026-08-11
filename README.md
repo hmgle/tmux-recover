@@ -166,6 +166,7 @@ Use `--help` to see the available commands and the options for any command:
 tmux-recover --help
 tmux-recover save --help
 tmux-recover restore --help
+tmux-recover daemon --help
 ```
 
 The list prefix uses `*` for the current snapshot, `+` for a user pin, and `!`
@@ -195,6 +196,34 @@ itself may match multiple snapshots and is not a reliable selector.
 tmux-recover pin SNAPSHOT
 tmux-recover unpin SNAPSHOT
 ```
+
+### Inspect, reload, or stop the watcher
+
+Daemon controls target the same canonical tmux socket and data directory as
+the watcher. Select both explicitly when managing a non-default instance:
+
+```sh
+# Human-readable or JSON status, including PID and running version.
+tmux-recover daemon --socket /tmp/tmux-1000/default --status
+tmux-recover daemon --socket /tmp/tmux-1000/default --status --json
+
+# Re-read configuration and execute the binary currently installed on disk.
+tmux-recover daemon --socket /tmp/tmux-1000/default --reload
+
+# Exit cleanly without starting a replacement process.
+tmux-recover daemon --socket /tmp/tmux-1000/default --stop
+```
+
+`--reload` keeps the same PID and original command line, so a TPM watcher stays
+detached in the same way and a systemd watcher remains owned by its unit. It
+waits until the replacement process publishes its status and verifies that the
+running version matches the controlling binary. It also reloads `config.toml`.
+
+`--stop` deliberately does not start a new watcher. Prefer the supervisor's
+own stop command for a supervised service. Control commands do not parse the
+configuration file, so an invalid configuration cannot prevent status or a
+clean stop. When the daemon uses `--data-dir` or `TMUX_RECOVER_DATA_DIR`, use
+the same value for its control commands.
 
 ### Recover after a reboot or server exit
 
@@ -368,11 +397,37 @@ Both modes replace the installed binary atomically, so an already running
 daemon does not cause `Text file busy`. With TPM, press `prefix` + <kbd>U</kbd>
 to update the plugin checkout and run the installer separately.
 
-Replacing the file does not replace an already running watcher. Manual CLI
-commands use the new binary immediately; the TPM watcher adopts it the next
-time that tmux server starts. A supervised installation can be restarted
-immediately, for example with `systemctl --user restart` for its exact service
-instance. Do not terminate a tmux server merely to upgrade tmux-recover.
+Replacing the file alone does not replace an already running watcher. Manual
+CLI commands use the new binary immediately, while the watcher keeps its old
+code until it reloads or exits. To atomically install and then reload one exact
+watcher:
+
+```sh
+socket="$(tmux display-message -p '#{socket_path}')"
+./scripts/install.sh --reload-daemon --socket "$socket"
+```
+
+The reload is opt-in. If installation succeeds but reload fails, the new
+binary remains installed and the script exits with an error explaining that
+the watcher was not updated. Maintainer builds can combine `--local` with the
+same reload options. For Cargo installations, reload after `cargo install`:
+
+```sh
+tmux-recover daemon --socket "$socket" --reload
+```
+
+A daemon from a release older than the control protocol cannot receive this
+first reload. A TPM watcher can adopt the new version the next time that tmux
+server starts. For a systemd instance, restart the exact unit instead:
+
+```sh
+instance="$(systemd-escape "$socket")"
+systemctl --user restart "tmux-recover@${instance}.service"
+```
+
+Do not terminate a tmux server merely to upgrade tmux-recover. See
+[Troubleshooting](docs/troubleshooting.md) for a one-time immediate TPM restart
+when upgrading a legacy watcher.
 
 Before uninstalling, remove the TPM entry or supervisor unit so it will not
 start again. Then use the matching installation method:

@@ -25,6 +25,62 @@ so an immediate first exit could outrun the initial capture. Update both the
 TPM checkout and the installed `tmux-recover` binary; updating only one leaves
 the old startup behavior in place.
 
+## Daemon control cannot find a running watcher
+
+Status, stop, and reload must use the same canonical tmux socket and data
+directory as the watcher:
+
+```sh
+tmux-recover --data-dir /path/to/data daemon \
+  --socket /tmp/tmux-1000/default --status
+```
+
+An endpoint error usually means the socket or data directory differs, the
+watcher has not completed startup, or it predates the daemon control protocol.
+Check the exact process and running version with the service manager or TPM
+log. Do not use a broad `pkill` command when more than one socket may be
+watched.
+
+For a legacy systemd watcher, restart its exact instance after installing the
+new binary:
+
+```sh
+socket=/tmp/tmux-1000/default
+instance="$(systemd-escape "$socket")"
+systemctl --user restart "tmux-recover@${instance}.service"
+```
+
+A legacy TPM watcher can simply adopt the binary the next time that tmux server
+starts. If it must be replaced immediately, first print the current socket and
+inspect the candidate PID rather than selecting it automatically:
+
+```sh
+socket="$(tmux display-message -p '#{socket_path}')"
+ps -ww -eo pid=,args= |
+  rg -F -- "tmux-recover daemon --socket $socket"
+```
+
+After confirming that one line names exactly that socket, send SIGTERM only to
+its first-column PID, wait for it to exit, and restart the TPM watcher through
+the same explicit socket:
+
+```sh
+pid=CONFIRMED_PID
+kill -TERM "$pid"
+while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+tmux -S "$socket" run-shell \
+  "$HOME/.tmux/plugins/tmux-recover/scripts/start-daemon.sh"
+```
+
+Never stop the tmux server merely to upgrade tmux-recover. Once the new daemon
+is running, later upgrades can use `tmux-recover daemon --reload` or the
+installer's `--reload-daemon --socket` option.
+
+Reload re-parses the daemon's original configuration. If that configuration is
+invalid, the old process has already exited and the replacement will report the
+parse error in its normal service or TPM log. Fix the file, then use the
+supervisor or TPM startup script to start the watcher again.
+
 ## Automatic restore cannot identify the bootstrap shell
 
 Prompt helpers or a long-running foreground command can keep the initial pane

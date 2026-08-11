@@ -35,6 +35,26 @@ Capturing inside the lock is intentional: if an older capture waited for the
 lock after a newer save, publishing it afterwards would move `current`
 backwards even though every individual file write was atomic.
 
+After initialization, each watcher also binds a private Unix control socket
+under `/tmp/tmux-recover-<uid>/`. The directory must be owned by the current
+uid and inaccessible to group and other users. The endpoint filename hashes
+both the canonical data directory and socket identity, so two watchers for the
+same tmux server but different `--data-dir` values remain independently
+addressable. Startup holds the daemon lock before replacing a stale socket and
+refuses to remove a non-socket path. Shutdown removes only the socket inode the
+process originally bound.
+
+The versioned JSON control protocol supports status, stop, and reload. Status
+reports the PID, tool version, startup time, and encoded tmux socket path. Stop
+acknowledges the request before leaving the normal daemon loop and releasing
+its locks. Reload does the same cleanup, then the top-level process re-executes
+its original executable argument and command line. Re-exec preserves the PID
+and supervisor ownership while loading the binary now present on disk and
+parsing configuration again. The client waits for a different startup time and
+requires the new watcher to report the same version as the controlling binary.
+Control commands locate the endpoint without loading `config.toml`, so a
+malformed configuration cannot prevent status or a clean stop.
+
 TPM startup first runs an `--if-empty` capture synchronously under that same
 mutation lock. It creates the first recovery point only when neither a current
 pointer nor any snapshot body exists. Existing history makes it a read-only

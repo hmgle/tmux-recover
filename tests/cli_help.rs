@@ -22,3 +22,26 @@ fn save_help_explains_snapshot_options() {
         assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
     }
 }
+
+#[test]
+fn daemon_help_explains_lifecycle_controls() {
+    let output = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .args(["daemon", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let help = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "--status",
+        "Report the running daemon version and process identity",
+        "--stop",
+        "Ask the running daemon to exit cleanly",
+        "--reload",
+        "Re-exec the running daemon from the installed binary",
+        "--json",
+        "Print daemon status as JSON",
+    ] {
+        assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+    }
+}

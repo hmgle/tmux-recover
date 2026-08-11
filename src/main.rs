@@ -1,6 +1,7 @@
 use std::{
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -8,6 +9,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
+    daemon::DaemonExit,
+    daemon_control::{ControlRequest, DaemonStatus, request as daemon_request},
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
@@ -50,7 +53,7 @@ enum Command {
     Validate(SnapshotArgs),
     /// Preflight and transactionally restore a snapshot.
     Restore(RestoreArgs),
-    /// Watch one tmux socket and save changed state continuously.
+    /// Run or control the continuous watcher for one tmux socket.
     Daemon(DaemonArgs),
     /// Convert a tmux-resurrect v3 or v4 file to native JSON.
     ImportResurrect(ImportResurrectArgs),
@@ -162,9 +165,29 @@ struct DaemonArgs {
     #[arg(
         long,
         value_name = "SOCKET",
-        help = "Watch this tmux socket instead of $TMUX or the default socket"
+        help = "Use this tmux socket instead of $TMUX or the default socket"
     )]
     socket: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with_all = ["stop", "reload"],
+        help = "Report the running daemon version and process identity"
+    )]
+    status: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["status", "reload", "json"],
+        help = "Ask the running daemon to exit cleanly"
+    )]
+    stop: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["status", "stop", "json"],
+        help = "Re-exec the running daemon from the installed binary"
+    )]
+    reload: bool,
+    #[arg(long, requires = "status", help = "Print daemon status as JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -207,24 +230,137 @@ async fn run() -> Result<()> {
     if let Some(config) = cli.config {
         paths.config_file = config;
     }
-    let config = Config::load(&paths)?;
-
     match cli.command {
-        Command::Save(args) => save(&paths.data_dir, &config, args).await,
-        Command::List(args) => list(&paths.data_dir, &config, args).await,
-        Command::Show(args) => show(&paths.data_dir, &config, args).await,
-        Command::Validate(args) => validate(&paths.data_dir, &config, args).await,
-        Command::Restore(args) => restore(&paths.data_dir, &config, args).await,
-        Command::Daemon(args) => daemon(&paths.data_dir, &config, args).await,
-        Command::ImportResurrect(args) => import_resurrect(&paths.data_dir, &config, args),
-        Command::Pin(args) => pin(&paths.data_dir, &config, args, true).await,
-        Command::Unpin(args) => pin(&paths.data_dir, &config, args, false).await,
+        Command::Daemon(args) => daemon(&paths, args).await,
+        command => {
+            let config = Config::load(&paths)?;
+            match command {
+                Command::Save(args) => save(&paths.data_dir, &config, args).await,
+                Command::List(args) => list(&paths.data_dir, &config, args).await,
+                Command::Show(args) => show(&paths.data_dir, &config, args).await,
+                Command::Validate(args) => validate(&paths.data_dir, &config, args).await,
+                Command::Restore(args) => restore(&paths.data_dir, &config, args).await,
+                Command::ImportResurrect(args) => import_resurrect(&paths.data_dir, &config, args),
+                Command::Pin(args) => pin(&paths.data_dir, &config, args, true).await,
+                Command::Unpin(args) => pin(&paths.data_dir, &config, args, false).await,
+                Command::Daemon(_) => unreachable!(),
+            }
+        }
     }
 }
 
-async fn daemon(data_dir: &Path, config: &Config, args: DaemonArgs) -> Result<()> {
+async fn daemon(paths: &AppPaths, args: DaemonArgs) -> Result<()> {
     let socket = resolve_socket(args.socket.as_deref()).await?;
-    tmux_recover::daemon::run(&socket, data_dir, config).await
+    let identity = socket_identity(&socket)?;
+
+    if args.status {
+        let status = daemon_request(&paths.data_dir, &identity.key, ControlRequest::Status)
+            .await?
+            .context("daemon status response was empty")?;
+        print_daemon_status(&status, args.json)?;
+        return Ok(());
+    }
+    if args.stop {
+        daemon_request(&paths.data_dir, &identity.key, ControlRequest::Stop).await?;
+        wait_for_daemon_stop(&paths.data_dir, &identity.key).await?;
+        println!("stopped daemon for {}", socket.display());
+        return Ok(());
+    }
+    if args.reload {
+        let previous = daemon_request(&paths.data_dir, &identity.key, ControlRequest::Status)
+            .await?
+            .context("daemon status response was empty")?;
+        daemon_request(&paths.data_dir, &identity.key, ControlRequest::Reload).await?;
+        let reloaded = wait_for_daemon_reload(&paths.data_dir, &identity.key, &previous).await?;
+        println!(
+            "reloaded daemon for {} with tmux-recover {}",
+            socket.display(),
+            reloaded.version
+        );
+        return Ok(());
+    }
+
+    let config = Config::load(paths)?;
+    match tmux_recover::daemon::run(&socket, &paths.data_dir, &config).await? {
+        DaemonExit::Stop => Ok(()),
+        DaemonExit::Reload => reexec_daemon(),
+    }
+}
+
+fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+    } else {
+        println!("running");
+        println!("pid:       {}", status.pid);
+        println!("version:   {}", status.version);
+        println!("started:   {}", status.started_at.to_rfc3339());
+        println!("socket:    {}", status.socket.display_lossy());
+    }
+    Ok(())
+}
+
+async fn wait_for_daemon_stop(data_dir: &Path, socket_key: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if daemon_request(data_dir, socket_key, ControlRequest::Status)
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("daemon acknowledged stop but did not exit within 15 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_daemon_reload(
+    data_dir: &Path,
+    socket_key: &str,
+    previous: &DaemonStatus,
+) -> Result<DaemonStatus> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(Some(status)) = daemon_request(data_dir, socket_key, ControlRequest::Status).await
+        {
+            if status.started_at != previous.started_at {
+                if status.version != tmux_recover::VERSION {
+                    anyhow::bail!(
+                        "daemon reloaded as version {}, but the controlling binary is version {}",
+                        status.version,
+                        tmux_recover::VERSION
+                    );
+                }
+                return Ok(status);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "daemon acknowledged reload but did not return as tmux-recover {} within 15 seconds",
+                tmux_recover::VERSION
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(unix)]
+fn reexec_daemon() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = std::env::args_os();
+    let executable = args
+        .next()
+        .context("daemon process has no executable argument")?;
+    let error = std::process::Command::new(&executable).args(args).exec();
+    Err(error).with_context(|| format!("failed to re-exec {}", PathBuf::from(executable).display()))
+}
+
+#[cfg(not(unix))]
+fn reexec_daemon() -> Result<()> {
+    anyhow::bail!("daemon reload is only supported on Unix")
 }
 
 async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Result<()> {

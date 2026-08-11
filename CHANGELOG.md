@@ -10,6 +10,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Install zsh completion for commands, options, paths, and snapshot selectors
   with release archives and `scripts/install.sh`.
+- Add per-socket daemon status, clean stop, and in-place reload controls over a
+  private local Unix socket. Reload preserves the PID and supervisor ownership
+  while executing the installed binary and re-reading configuration.
+- Allow `scripts/install.sh --reload-daemon --socket SOCKET` to reload one
+  explicit watcher after an atomic binary replacement.
 
 ### Changed
 
@@ -17,6 +22,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   due process checkpoint needs it. An empty `restore.process_allowlist` now
   disables process capture, removes the live sidecar from every mutating entry
   path, and leaves structural snapshots unaffected.
+- Keep daemon control commands independent of configuration parsing so a bad
+  configuration cannot prevent status or a clean stop.
 
 ## [0.2.0] - 2026-08-10
 

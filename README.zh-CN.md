@@ -152,6 +152,7 @@ tmux-recover list --json
 tmux-recover --help
 tmux-recover save --help
 tmux-recover restore --help
+tmux-recover daemon --help
 ```
 
 列表前缀中，`*` 表示当前快照，`+` 表示用户 pin，`!` 表示有数量上限的恢复前安全
@@ -177,6 +178,31 @@ window 和 pane 的数量。最后一列是通过 `save --label` 设置的标签
 tmux-recover pin SNAPSHOT
 tmux-recover unpin SNAPSHOT
 ```
+
+### 查看、重载或停止 watcher
+
+daemon 控制命令按同一个 canonical tmux socket 和 data directory 定位 watcher。
+管理非默认实例时，应明确指定两者：
+
+```sh
+# 普通或 JSON 状态，包括 PID 和当前运行版本。
+tmux-recover daemon --socket /tmp/tmux-1000/default --status
+tmux-recover daemon --socket /tmp/tmux-1000/default --status --json
+
+# 重新读取配置，并执行磁盘上当前安装的 binary。
+tmux-recover daemon --socket /tmp/tmux-1000/default --reload
+
+# 干净退出，但不启动替代进程。
+tmux-recover daemon --socket /tmp/tmux-1000/default --stop
+```
+
+`--reload` 保留原 PID 和命令行，因此 TPM watcher 仍保持原来的 detached 关系，
+systemd watcher 也仍归原 unit 管理。命令会等待替代进程重新发布状态，并确认运行版本
+与发出控制请求的 binary 一致；`config.toml` 也会重新读取。
+
+`--stop` 有意不启动新 watcher。由 supervisor 管理时，优先使用 supervisor 自己的
+stop 命令。控制命令不会解析配置文件，因此无效配置不会阻止 status 或干净退出。
+daemon 使用 `--data-dir` 或 `TMUX_RECOVER_DATA_DIR` 时，控制命令必须使用同一个值。
 
 ### 重启或 server 退出后恢复
 
@@ -333,10 +359,32 @@ PREFIX="$HOME/.cargo" ./scripts/install.sh --local
 再出现 `Text file busy`。使用 TPM 时，按 `prefix` + <kbd>U</kbd> 更新插件 checkout，
 再单独运行安装脚本。
 
-替换磁盘上的文件不会替换已经运行的 watcher。手动 CLI 会立即使用新 binary；TPM
-watcher 会在该 tmux server 下次启动时采用新版本。由 supervisor 管理时可以立即重启
-精确的服务实例，例如执行对应实例的 `systemctl --user restart`。不要仅为升级
-tmux-recover 而终止 tmux server。
+只替换磁盘文件不会替换已经运行的 watcher。手动 CLI 会立即使用新 binary，而
+watcher 会继续运行旧代码，直到 reload 或退出。可以原子安装后再重载一个精确实例：
+
+```sh
+socket="$(tmux display-message -p '#{socket_path}')"
+./scripts/install.sh --reload-daemon --socket "$socket"
+```
+
+reload 必须显式启用。安装成功但 reload 失败时，新 binary 仍会保留，脚本会返回错误并
+说明 watcher 尚未更新。本地维护构建可以同时使用 `--local` 和上述 reload 选项。
+Cargo 安装完成后单独执行：
+
+```sh
+tmux-recover daemon --socket "$socket" --reload
+```
+
+早于控制协议的旧 daemon 无法接收第一次 reload。TPM watcher 可以等到该 tmux server
+下次启动时采用新版。systemd 实例应重启精确 unit：
+
+```sh
+instance="$(systemd-escape "$socket")"
+systemctl --user restart "tmux-recover@${instance}.service"
+```
+
+不要仅为升级 tmux-recover 而终止 tmux server。旧 TPM watcher 需要立即完成一次性
+重启时，见[故障排查](docs/troubleshooting.md)。
 
 卸载前先删除 TPM 配置或 supervisor unit，避免再次启动。然后按安装方式执行：
 
