@@ -40,6 +40,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that both are applied after. Lifecycle polls use their own deadline instead of
   ending early at the ordinary one-shot request timeout.
 
+### Fixed
+
+- Keep a completed restore live when an ordinary terminal detaches during
+  client switching, and report the vanished client as a warning instead of a
+  failed or incomplete rollback.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

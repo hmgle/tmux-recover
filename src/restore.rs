@@ -759,7 +759,7 @@ async fn apply_inner(
             // commit phase: once even one backup is gone, rolling back by deleting
             // the new state would risk losing both versions. Cleanup errors are
             // therefore reported as warnings while the restored state stays live.
-            let mut warnings = Vec::new();
+            let mut warnings = client_result.warnings;
             for backup in &backups {
                 if let Err(error) = execute_empty(
                     &mut final_client,
@@ -803,7 +803,11 @@ async fn apply_inner(
                 .await
                 .is_err()
                 {
-                    rollback_complete = false;
+                    match list_clients(client).await {
+                        Ok(attached)
+                            if !ordinary_client_is_attached(&attached, &attachment.name) => {}
+                        Ok(_) | Err(_) => rollback_complete = false,
+                    }
                 }
             }
             for session_id in new_sessions.iter().rev() {
@@ -1466,6 +1470,7 @@ async fn list_clients(client: &mut ControlClient) -> Result<Vec<ClientAttachment
 struct ClientSwitchResult {
     ordinary_clients: Vec<ClientRestoreRecord>,
     session_visibility: Vec<SessionVisibilityRecord>,
+    warnings: Vec<String>,
 }
 
 struct DesiredClient {
@@ -1553,37 +1558,49 @@ async fn switch_clients(
         });
     }
 
+    let mut warnings = Vec::new();
+    let mut switched = Vec::new();
     for target in &desired {
         if let Some(last_target_id) = &target.last_target_id {
-            execute_empty(
+            if !switch_client_if_present(
                 client,
-                &format!(
-                    "switch-client -c {} -t {}",
-                    quote(&target.name),
-                    quote(last_target_id)
-                ),
+                target,
+                last_target_id,
+                "restoring its last session",
+                &mut warnings,
             )
-            .await?;
+            .await?
+            {
+                continue;
+            }
         }
-        execute_empty(
+        if !switch_client_if_present(
             client,
-            &format!(
-                "switch-client -c {} -t {}",
-                quote(&target.name),
-                quote(&target.target_id)
-            ),
+            target,
+            &target.target_id,
+            "restoring its current session",
+            &mut warnings,
         )
-        .await?;
+        .await?
+        {
+            continue;
+        }
+        switched.push(target);
     }
 
     let attached = list_clients(client).await?;
-    for target in &desired {
-        let actual = attached
+    let mut verified = Vec::new();
+    for target in switched {
+        let Some(actual) = attached
             .iter()
             .find(|attachment| !attachment.control && attachment.name == target.name)
-            .with_context(|| {
-                format!("ordinary client {} disappeared during restore", target.name)
-            })?;
+        else {
+            warnings.push(format!(
+                "ordinary client {} disappeared after its session was restored; continuing without it",
+                target.name
+            ));
+            continue;
+        };
         if actual.session_id != target.target_id {
             bail!(
                 "ordinary client {} remained on {} instead of restored session {}",
@@ -1592,15 +1609,16 @@ async fn switch_clients(
                 target.to_session
             );
         }
+        verified.push(target);
     }
 
-    let ordinary_clients = desired
+    let ordinary_clients = verified
         .into_iter()
         .map(|target| ClientRestoreRecord {
-            client_name: target.name,
-            client_tty: target.tty,
-            from_session: target.from_session,
-            to_session: target.to_session,
+            client_name: target.name.clone(),
+            client_tty: target.tty.clone(),
+            from_session: target.from_session.clone(),
+            to_session: target.to_session.clone(),
         })
         .collect();
     let session_visibility = snapshot
@@ -1626,7 +1644,47 @@ async fn switch_clients(
     Ok(ClientSwitchResult {
         ordinary_clients,
         session_visibility,
+        warnings,
     })
+}
+
+async fn switch_client_if_present(
+    client: &mut ControlClient,
+    target: &DesiredClient,
+    session_id: &str,
+    operation: &str,
+    warnings: &mut Vec<String>,
+) -> Result<bool> {
+    let command = format!(
+        "switch-client -c {} -t {}",
+        quote(&target.name),
+        quote(session_id)
+    );
+    let Err(error) = execute_empty(client, &command).await else {
+        return Ok(true);
+    };
+    let attached = list_clients(client)
+        .await
+        .with_context(|| format!("failed to inventory clients after {operation}"))?;
+    if ordinary_client_is_attached(&attached, &target.name) {
+        return Err(error).with_context(|| {
+            format!(
+                "failed to switch ordinary client {} while {operation}",
+                target.name
+            )
+        });
+    }
+    warnings.push(format!(
+        "ordinary client {} disappeared while {operation}; continuing without it",
+        target.name
+    ));
+    Ok(false)
+}
+
+fn ordinary_client_is_attached(clients: &[ClientAttachment], name: &str) -> bool {
+    clients
+        .iter()
+        .any(|attachment| !attachment.control && attachment.name == name)
 }
 
 /// Decides whether the process checkpoint sidecar may even be read for a

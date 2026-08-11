@@ -168,7 +168,10 @@ restore, existing ordinary clients are paired in the same order and switched
 with an explicit `switch-client -c`; saved client state takes precedence over a
 coincidentally matching bootstrap session name. Older snapshots without client
 state retain the compatible name-matching fallback. The restore re-lists
-clients and verifies every switch before reaching the commit point.
+clients and verifies every still-attached client before reaching the commit
+point. A terminal that closes concurrently is omitted from the transition list
+and reported as a warning; an attached client on the wrong session remains a
+hard failure.
 
 A control client is allowed to remain attached for background collection, but
 it can never make a session visible. The durable report counts ordinary clients

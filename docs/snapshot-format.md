@@ -56,9 +56,10 @@ client record names the explicit tmux client, its optional TTY, and the source
 and restored session. Each visibility record counts only
 `client_control_mode=0` clients for one restored session. A successful report
 can therefore say that a session exists but is not visible in any terminal.
-Cleanup warnings mean restored state reached the commit point but one or more
-old backup sessions could not be removed. This is distinct from `error`, which
-is reserved for a failed restore.
+Warnings also record an ordinary terminal that detached while its selection was
+being restored. Cleanup warnings mean restored state reached the commit point
+but one or more old backup sessions could not be removed. This is distinct from
+`error`, which is reserved for a failed restore.
 
 ## Process checkpoint sidecar
 

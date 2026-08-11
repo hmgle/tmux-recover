@@ -586,6 +586,84 @@ async fn restores_ordinary_client_current_and_last_sessions() {
 }
 
 #[tokio::test]
+async fn ordinary_client_detach_during_restore_is_a_warning() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    let saved = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "saved",
+        "sleep 60",
+    ]));
+    let source_terminal = AttachedClient::start(&server, saved.trim());
+    let source = {
+        let mut control = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut control, &server.socket).await.unwrap()
+    };
+    let snapshot = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "client-detach-test".to_owned(),
+        },
+        source.origin,
+        source.state,
+        source.diagnostics,
+    )
+    .unwrap();
+
+    drop(source_terminal);
+    server.stop();
+    let bootstrap = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "bootstrap",
+    ]));
+    let target_terminal = AttachedClient::start(&server, bootstrap.trim());
+    let mut control = ControlClient::connect(&server.socket).await.unwrap();
+    let target = capture(&mut control, &server.socket).await.unwrap();
+    let detach_hook = format!("detach-client -t {}", target_terminal.name);
+    success(
+        server
+            .tmux()
+            .args(["set-hook", "-g", "after-new-session[998]", &detach_hook]),
+    );
+
+    let config = RestoreConfig::default();
+    let options = restore_config_options(&config, false, false, None, false, None);
+    let plan = preflight(&snapshot, &target, &options).unwrap();
+    let report = apply(&mut control, &snapshot, &target, &plan).await;
+    assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ordinary client") && warning.contains("disappeared")),
+        "detach warning missing: {report:#?}"
+    );
+    assert!(report.ordinary_clients.is_empty());
+    assert_eq!(report.session_visibility.len(), 1);
+    assert_eq!(report.session_visibility[0].session, "saved");
+    assert_eq!(report.session_visibility[0].ordinary_clients, 0);
+    let sessions = output(
+        server
+            .tmux()
+            .args(["list-sessions", "-F", "#{session_name}"]),
+    );
+    assert_eq!(sessions.trim(), "saved");
+}
+
+#[tokio::test]
 async fn restores_default_shell_panes_without_a_hold_command() {
     if !TestServer::available() {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
