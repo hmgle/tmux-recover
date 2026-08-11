@@ -26,7 +26,7 @@ after installation.
 
 Environment:
   PREFIX                   installation prefix (default: $HOME/.local)
-  TMUX_RECOVER_DATA_DIR     data directory used to locate a daemon for reload
+  TMUX_RECOVER_DATA_DIR    data directory used to locate a daemon for reload
 EOF
 }
 
@@ -188,5 +188,5 @@ if [ "$reload_daemon" = true ]; then
   fi
 else
   printf '%s\n' \
-    'note: an already running daemon keeps its old binary; use --reload-daemon with --socket to update it' >&2
+    'note: an already running daemon keeps its old binary; use --reload-daemon with --socket to update it'
 fi
