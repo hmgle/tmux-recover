@@ -14,7 +14,10 @@ use tmux_recover::{
         ControlRequest, DaemonStatus, is_connection_closed, is_daemon_unavailable,
         request as daemon_request, status_until as daemon_status_until,
     },
-    model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
+    model::{
+        ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, SessionVisibilityRecord,
+        Snapshot, SnapshotSource,
+    },
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture_structure, control::ControlClient, resolve_socket},
@@ -520,13 +523,8 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     for warning in &report.warnings {
         eprintln!("tmux-recover: warning: {warning}");
     }
-    for visibility in &report.session_visibility {
-        if visibility.ordinary_clients == 0 {
-            eprintln!(
-                "tmux-recover: restored session {} is not visible (no ordinary terminal client)",
-                visibility.session
-            );
-        }
+    if let Some(notice) = session_visibility_notice(&report.session_visibility) {
+        eprintln!("tmux-recover: {notice}");
     }
     match report.status {
         RestoreStatus::Succeeded => {
@@ -540,6 +538,28 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
                 report.error.as_deref().unwrap_or("unknown error")
             )
         }
+    }
+}
+
+fn session_visibility_notice(visibility: &[SessionVisibilityRecord]) -> Option<String> {
+    let invisible: Vec<_> = visibility
+        .iter()
+        .filter(|record| record.ordinary_clients == 0)
+        .map(|record| record.session.as_str())
+        .collect();
+    if invisible.is_empty() {
+        return None;
+    }
+    let sessions = invisible.join(", ");
+    if invisible.len() == visibility.len() {
+        Some(format!(
+            "no restored session is visible; no ordinary terminal clients are attached: {sessions}"
+        ))
+    } else {
+        Some(format!(
+            "restored sessions without ordinary terminal clients ({}): {sessions}",
+            invisible.len()
+        ))
     }
 }
 
@@ -909,9 +929,9 @@ async fn selected_store(
 
 #[cfg(test)]
 mod tests {
-    use tmux_recover::model::{Pane, PaneCwd, TmuxState, Window};
+    use tmux_recover::model::{Pane, PaneCwd, SessionVisibilityRecord, TmuxState, Window};
 
-    use super::foreground_restore_would_destroy_caller;
+    use super::{foreground_restore_would_destroy_caller, session_visibility_notice};
 
     fn state_with_pane(pane_id: &str) -> TmuxState {
         TmuxState {
@@ -977,5 +997,39 @@ mod tests {
             Some("socket-a"),
             Some("%8")
         ));
+    }
+
+    #[test]
+    fn visibility_notice_summarizes_partial_and_fully_detached_restores() {
+        let visibility = vec![
+            SessionVisibilityRecord {
+                session: "first".to_owned(),
+                ordinary_clients: 0,
+            },
+            SessionVisibilityRecord {
+                session: "visible".to_owned(),
+                ordinary_clients: 1,
+            },
+            SessionVisibilityRecord {
+                session: "second".to_owned(),
+                ordinary_clients: 0,
+            },
+        ];
+        assert_eq!(
+            session_visibility_notice(&visibility).as_deref(),
+            Some("restored sessions without ordinary terminal clients (2): first, second")
+        );
+
+        let detached: Vec<_> = visibility
+            .into_iter()
+            .filter(|record| record.ordinary_clients == 0)
+            .collect();
+        assert_eq!(
+            session_visibility_notice(&detached).as_deref(),
+            Some(
+                "no restored session is visible; no ordinary terminal clients are attached: first, second"
+            )
+        );
+        assert_eq!(session_visibility_notice(&[]), None);
     }
 }

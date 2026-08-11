@@ -47,6 +47,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failed or incomplete rollback.
 - Canonicalize ordinary-client attachments in the structural hash so switching
   activity between terminals does not create redundant autosave history.
+- Summarize restored sessions without ordinary terminal clients on one line
+  while retaining per-session counts in the restore report.
 
 ## [0.2.0] - 2026-08-10
 
