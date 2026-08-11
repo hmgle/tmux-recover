@@ -70,6 +70,9 @@ tmux-recover restore --from-imports current --dry-run --replace
 导入的命令字符串只作为 metadata 保存，永远不会执行。tmux-resurrect 创建的 pane
 内容归档不会被导入。修复过、有歧义或不支持的旧记录会出现在 diagnostics 中，而不会
 被静默猜测。
+resurrect 的 `state <current> <last>` 行会作为普通 client 的 session 选择导入。恢复时
+tmux-recover 会让真实终端 client 先切换到 `last`、再切换到 `current`，从而同时还原
+两项状态；后台 watcher 的 control-mode client 不会被用于这个过程。
 
 ## 3. 替换 TPM 条目
 

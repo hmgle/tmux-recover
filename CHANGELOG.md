@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Capture ordinary terminal clients' current/last sessions, import resurrect
+  `state` rows, and record explicit client transitions and per-session
+  visibility in restore reports.
 - Install zsh completion for commands, options, paths, and snapshot selectors
   with release archives and `scripts/install.sh`.
 - Add per-socket daemon status, clean stop, and in-place reload controls over a

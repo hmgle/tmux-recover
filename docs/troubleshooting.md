@@ -12,6 +12,36 @@ export TMUX_RECOVER_BIN="$HOME/.local/bin/tmux-recover"
 Reload the tmux configuration after fixing the path. TPM daemon output is in
 `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-recover/tpm.log`.
 
+## The binary, TPM checkout, and source checkout disagree
+
+The watcher is a long-lived process. Replacing the file on disk does not change
+the executable inode that an already running watcher uses. Confirm all three
+inputs before reproducing a restore issue:
+
+```sh
+binary="$(command -v tmux-recover)"
+readlink -f "$binary"
+"$binary" --version
+git -C "$HOME/.tmux/plugins/tmux-recover" rev-parse --short HEAD
+git -C /path/to/tmux-recover-source rev-parse --short HEAD
+ps -ww -eo pid=,args= | rg 'tmux-recover daemon'
+```
+
+After confirming the one daemon PID for the explicit socket, inspect the image
+that process actually runs:
+
+```sh
+pid=CONFIRMED_PID
+readlink "/proc/$pid/exe"
+tr '\0' ' ' <"/proc/$pid/cmdline"
+```
+
+`(deleted)` on `/proc/PID/exe` means the process still runs an unlinked old
+binary even if `command -v` now finds a newer release. Build/install from the
+intended source, make the TPM checkout match it, then reload that exact watcher
+with the same socket and data directory. Do not infer the running version from
+the on-disk path alone, and do not stop tmux to update the watcher.
+
 ## No snapshot after the first plugin installation
 
 Current releases synchronously write an initial snapshot before TPM startup
@@ -107,6 +137,39 @@ keeps the previous-generation `current` selected instead of replacing it with
 the unresolved bootstrap. `prefix` + <kbd>Ctrl-r</kbd> therefore remains a safe
 manual fallback. Adding another session, window, or pane establishes real
 server structure and releases this protection so autosave can continue.
+
+## A restored session exists but no terminal shows it
+
+Inventory every tmux client with control mode visible in the output:
+
+```sh
+socket=/tmp/tmux-1000/default
+tmux -S "$socket" list-clients -F \
+  'name=#{client_name} tty=#{client_tty} control=#{client_control_mode} session=#{session_name} last=#{client_last_session}'
+```
+
+Only rows with `control=0` are real terminal clients. A persistent `control=1`
+row with an empty TTY is the watcher's collection channel; it does not make its
+session visible in WezTerm or another terminal. Current restores state this
+explicitly in `session_visibility` and print a line for every restored session
+whose ordinary-client count is zero.
+
+If the target session has no `control=0` row, attach it from a real terminal:
+
+```sh
+tmux -S "$socket" attach-session -t 2
+```
+
+Or, from a shell outside the attached tmux client, select the exact ordinary
+client name printed above and switch it explicitly:
+
+```sh
+tmux -S "$socket" switch-client -c /dev/pts/0 -t 2
+```
+
+Do not use an implicit `switch-client` as a repair: a command launched through
+the watcher can otherwise address the control client and return success without
+moving any user-visible terminal.
 
 ## tmux is too old
 

@@ -11,7 +11,15 @@ The top-level object contains:
 - windows with layout, dimensions, rename, active pane, and zoom state;
 - panes with nullable title, cwd value/status/error, process metadata, and
   optional import status;
+- optional ordinary-client session state, ordered by recent activity, with
+  current and last session IDs;
 - structured diagnostics.
+
+`state.client_state` deliberately excludes control-mode clients and ephemeral
+client names, PIDs, and TTYs. It is absent when no ordinary terminal client was
+attached and when reading snapshots written before this field existed. Keeping
+it optional preserves schema 1 compatibility and the hashes of old snapshots.
+Each referenced current or last session must exist in the same snapshot.
 
 The snapshot id is not an arbitrary label. Validation recomputes it from the
 UTC creation timestamp in `%Y%m%dT%H%M%S%.6fZ` format (microsecond precision)
@@ -42,10 +50,15 @@ after the complete snapshot is durable. A failed capture therefore cannot
 replace the last valid current snapshot. Orphaned completed snapshots remain
 visible to `list` and are safe to inspect or prune.
 
-Restore reports remain `schema_version = 1` and now include a default-empty
-`warnings` array. A successful report can carry cleanup warnings when restored
-state reached the commit point but one or more old backup sessions could not be
-removed. This is distinct from `error`, which is reserved for a failed restore.
+Restore reports remain `schema_version = 1` and include default-empty
+`warnings`, `ordinary_clients`, and `session_visibility` arrays. Each ordinary
+client record names the explicit tmux client, its optional TTY, and the source
+and restored session. Each visibility record counts only
+`client_control_mode=0` clients for one restored session. A successful report
+can therefore say that a session exists but is not visible in any terminal.
+Cleanup warnings mean restored state reached the commit point but one or more
+old backup sessions could not be removed. This is distinct from `error`, which
+is reserved for a failed restore.
 
 ## Process checkpoint sidecar
 
@@ -113,3 +126,5 @@ Resurrect files are import inputs, never native storage. The importer records
 the source path, BLAKE3 digest, detected v3/v4 version, and per-pane repair
 status. The v4 empty-title shift is repaired only when its field signature is
 deterministic. Legacy process command strings remain non-executable metadata.
+One valid `state` row becomes ordinary-client current/last session state; a
+missing or invalid reference is reported through structured diagnostics.

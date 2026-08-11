@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use crate::{
     VERSION,
     model::{
-        Diagnostic, EncodedPath, ImportStatus, Origin, Pane, PaneCwd, Session, Severity, Snapshot,
-        SnapshotSource, TmuxState, Window, WindowLink,
+        ClientSessionState, ClientState, Diagnostic, EncodedPath, ImportStatus, Origin, Pane,
+        PaneCwd, Session, Severity, Snapshot, SnapshotSource, TmuxState, Window, WindowLink,
     },
     util::{hostname, uid},
 };
@@ -134,6 +134,7 @@ struct Builder {
     sessions: BTreeMap<String, Session>,
     windows: BTreeMap<(String, i32), Window>,
     grouped: Vec<GroupRecord>,
+    client_state: Option<StateRecord>,
     diagnostics: Vec<Diagnostic>,
     exact_panes: usize,
     repaired_panes: usize,
@@ -147,6 +148,7 @@ impl Builder {
             sessions: BTreeMap::new(),
             windows: BTreeMap::new(),
             grouped: Vec::new(),
+            client_state: None,
             diagnostics: Vec::new(),
             exact_panes: 0,
             repaired_panes: 0,
@@ -175,7 +177,12 @@ impl Builder {
                         self.line_error(row.number, "invalid_group_record", error);
                     }
                 }
-                Some("window" | "state") => {}
+                Some("state") => {
+                    if let Err(error) = self.parse_state(row) {
+                        self.line_error(row.number, "invalid_state_record", error);
+                    }
+                }
+                Some("window") => {}
                 Some(kind) => self.diagnostics.push(Diagnostic {
                     severity: Severity::Warning,
                     code: "unknown_resurrect_record".to_owned(),
@@ -362,6 +369,18 @@ impl Builder {
         Ok(())
     }
 
+    fn parse_state(&mut self, row: &Row<'_>) -> Result<()> {
+        expect_fields(row, 3)?;
+        if self.client_state.is_some() {
+            bail!("resurrect snapshot contains more than one state record");
+        }
+        self.client_state = Some(StateRecord {
+            current_session: row.fields[1].to_owned(),
+            last_session: (!row.fields[2].is_empty()).then(|| row.fields[2].to_owned()),
+        });
+        Ok(())
+    }
+
     fn ensure_session(&mut self, name: &str) {
         self.sessions.entry(name.to_owned()).or_insert(Session {
             id: session_id(name),
@@ -429,9 +448,52 @@ impl Builder {
         if self.sessions.is_empty() || self.windows.is_empty() {
             bail!("resurrect snapshot contains no usable sessions and windows");
         }
+        let client_state = match self.client_state {
+            Some(record) => match self.sessions.get(&record.current_session) {
+                Some(current) => {
+                    let last_session_id = match record.last_session {
+                        Some(name) => match self.sessions.get(&name) {
+                            Some(session) => Some(session.id.clone()),
+                            None => {
+                                self.diagnostics.push(Diagnostic {
+                                    severity: Severity::Warning,
+                                    code: "missing_state_last_session".to_owned(),
+                                    object_id: Some(name.clone()),
+                                    message: format!(
+                                        "resurrect state references missing last session {name}; only the current session will be restored"
+                                    ),
+                                });
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    Some(ClientState {
+                        attachments: vec![ClientSessionState {
+                            session_id: current.id.clone(),
+                            last_session_id,
+                        }],
+                    })
+                }
+                None => {
+                    self.diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "missing_state_current_session".to_owned(),
+                        object_id: Some(record.current_session.clone()),
+                        message: format!(
+                            "resurrect state references missing current session {}",
+                            record.current_session
+                        ),
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
         let state = TmuxState {
             sessions: self.sessions.into_values().collect(),
             windows: self.windows.into_values().collect(),
+            client_state,
         };
         state.validate()?;
         Ok((
@@ -456,6 +518,11 @@ struct ParsedPane {
     command: String,
     full_command: Option<String>,
     status: ImportStatus,
+}
+
+struct StateRecord {
+    current_session: String,
+    last_session: Option<String>,
 }
 
 fn parse_v3_pane(row: &Row<'_>) -> Result<ParsedPane> {
@@ -684,6 +751,10 @@ mod tests {
             "state\twork\t\n",
         );
         let result = import(input);
+        let client_state = result.snapshot.state.client_state.as_ref().unwrap();
+        assert_eq!(client_state.attachments.len(), 1);
+        assert_eq!(client_state.attachments[0].session_id, session_id("work"));
+        assert_eq!(client_state.attachments[0].last_session_id, None);
         let window = &result.snapshot.state.windows[0];
         assert_eq!(window.name, "editor");
         assert!(window.zoomed);
@@ -699,6 +770,30 @@ mod tests {
                 .to_path_buf()
                 .unwrap(),
             Path::new("/tmp")
+        );
+    }
+
+    #[test]
+    fn imports_current_and_last_client_sessions() {
+        let input = concat!(
+            "pane\tcurrent\t0\t1\t:*\t0\t:shell\t:/tmp\t1\tzsh\t:\n",
+            "pane\tlast\t0\t1\t:*\t0\t:shell\t:/tmp\t1\tzsh\t:\n",
+            "window\tcurrent\t0\t:current\t1\t:*\t1234,80x24,0,0,1\t:\n",
+            "window\tlast\t0\t:last\t1\t:*\t1234,80x24,0,0,1\t:\n",
+            "state\tcurrent\tlast\n",
+        );
+        let result = import(input);
+        let attachment = &result
+            .snapshot
+            .state
+            .client_state
+            .as_ref()
+            .unwrap()
+            .attachments[0];
+        assert_eq!(attachment.session_id, session_id("current"));
+        assert_eq!(
+            attachment.last_session_id.as_deref(),
+            Some(session_id("last").as_str())
         );
     }
 

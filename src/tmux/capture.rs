@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use crate::{
     VERSION,
     model::{
-        Diagnostic, EncodedPath, Origin, Pane, PaneCwd, Session, SocketIdentity, TmuxState, Window,
-        WindowLink,
+        ClientSessionState, ClientState, Diagnostic, EncodedPath, Origin, Pane, PaneCwd, Session,
+        SocketIdentity, TmuxState, Window, WindowLink,
     },
     process::populate_restart_specs,
     util::{canonical_socket_path, hostname, require_tmux_37, uid},
@@ -34,7 +34,7 @@ pub async fn capture_structure(
     requested_socket: &Path,
 ) -> Result<CaptureResult> {
     let output = client
-        .execute_blocks(&capture_command(), 4)
+        .execute_blocks(&capture_command(), 5)
         .await?
         .into_iter()
         .flatten()
@@ -100,8 +100,15 @@ fn capture_command() -> String {
         s("socket_path"),
         s("default-shell")
     );
+    let client = format!(
+        "C|{}|{}|{}|{}",
+        s("client_control_mode"),
+        s("client_activity"),
+        s("session_id"),
+        s("client_last_session")
+    );
     format!(
-        "list-sessions -F \"{session}\" ; list-windows -a -F \"{window}\" ; list-panes -a -F \"{pane}\" ; display-message -p -F \"{metadata}\""
+        "list-sessions -F \"{session}\" ; list-windows -a -F \"{window}\" ; list-panes -a -F \"{pane}\" ; display-message -p -F \"{metadata}\" ; list-clients -F \"{client}\""
     )
 }
 
@@ -113,6 +120,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
     let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
     let mut windows: BTreeMap<String, Window> = BTreeMap::new();
     let mut pane_rows = Vec::new();
+    let mut client_rows = Vec::new();
     let mut metadata = None;
 
     for line in lines {
@@ -122,6 +130,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
             Some(b"W") => parse_window(&fields, &mut sessions, &mut windows)?,
             Some(b"P") => pane_rows.push(fields),
             Some(b"M") => metadata = Some(fields),
+            Some(b"C") => client_rows.push(fields),
             _ => bail!("unknown tmux capture record"),
         }
     }
@@ -156,9 +165,11 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
     // store lookup, so derive the key from that same identity while preserving
     // tmux's original spelling in the snapshot metadata below.
     let socket = SocketIdentity::new(&canonical_socket_path(requested_socket)?, &hostname, uid)?;
+    let client_state = parse_client_state(client_rows, &sessions)?;
     let state = TmuxState {
         sessions: sessions.into_values().collect(),
         windows: windows.into_values().collect(),
+        client_state,
     };
     state.validate()?;
 
@@ -180,6 +191,55 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
         diagnostics: Vec::new(),
         default_shell: field_optional_string(&metadata, 5)?,
     })
+}
+
+fn parse_client_state(
+    rows: Vec<Vec<Vec<u8>>>,
+    sessions: &BTreeMap<String, Session>,
+) -> Result<Option<ClientState>> {
+    struct CapturedAttachment {
+        activity: i64,
+        state: ClientSessionState,
+    }
+
+    let mut attachments = Vec::new();
+    for fields in rows {
+        expect_fields(&fields, 5)?;
+        if field_bool(&fields, 1)? {
+            continue;
+        }
+        let session_id = field_string(&fields, 3)?;
+        if !sessions.contains_key(&session_id) {
+            bail!("ordinary client references unknown session {session_id}");
+        }
+        let last_session_name = field_optional_string(&fields, 4)?;
+        let last_session_id = last_session_name.and_then(|name| {
+            sessions
+                .values()
+                .find(|session| session.name == name)
+                .map(|session| session.id.clone())
+        });
+        attachments.push(CapturedAttachment {
+            activity: field_i64(&fields, 2)?
+                .context("ordinary client has no activity timestamp")?,
+            state: ClientSessionState {
+                session_id,
+                last_session_id,
+            },
+        });
+    }
+    attachments.sort_by(|left, right| {
+        right
+            .activity
+            .cmp(&left.activity)
+            .then_with(|| left.state.session_id.cmp(&right.state.session_id))
+            .then_with(|| left.state.last_session_id.cmp(&right.state.last_session_id))
+    });
+    let attachments: Vec<_> = attachments
+        .into_iter()
+        .map(|attachment| attachment.state)
+        .collect();
+    Ok((!attachments.is_empty()).then_some(ClientState { attachments }))
 }
 
 fn parse_session(fields: &[Vec<u8>], sessions: &mut BTreeMap<String, Session>) -> Result<()> {

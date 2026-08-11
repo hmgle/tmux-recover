@@ -160,6 +160,22 @@ Dead panes are rejected before mutation until their state can be reproduced
 faithfully. Existing sessions are renamed to collision-free temporary backup
 names, and new sessions are built while those backups remain live.
 
+Capture inventories tmux clients separately from the persistent control-mode
+connection used by the watcher. Only `client_control_mode=0` attachments count
+as terminals or visibility. Their current and last sessions are stored in
+most-recently-active order without process-local client identity. During a
+restore, existing ordinary clients are paired in the same order and switched
+with an explicit `switch-client -c`; saved client state takes precedence over a
+coincidentally matching bootstrap session name. Older snapshots without client
+state retain the compatible name-matching fallback. The restore re-lists
+clients and verifies every switch before reaching the commit point.
+
+A control client is allowed to remain attached for background collection, but
+it can never make a session visible. The durable report counts ordinary clients
+per restored session, including zero. Restore cannot manufacture a WezTerm tab
+or another terminal when no ordinary client exists, so a control-only session
+is restored successfully but reported explicitly as not visible.
+
 The point after pane properties are complete and ordinary clients have switched
 is the restore commit point. Before it, failure switches clients back, deletes
 new sessions, and restores backup names. After it, backup deletion is

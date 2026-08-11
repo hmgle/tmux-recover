@@ -1,5 +1,13 @@
-use std::{process::Command, time::Duration};
+use std::{
+    fs::File,
+    io::Read,
+    os::unix::process::CommandExt,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
 
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
 use tmux_recover::tmux::{
     capture::{capture, capture_structure},
@@ -49,6 +57,89 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.tmux().arg("kill-server").status();
+    }
+}
+
+struct AttachedClient {
+    child: Child,
+    _master: File,
+    name: String,
+}
+
+impl AttachedClient {
+    fn start(server: &TestServer, target: &str) -> Self {
+        let pty = openpty(
+            Some(&Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }),
+            None,
+        )
+        .unwrap();
+        let master = File::from(pty.master);
+        fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        let slave = File::from(pty.slave);
+        let mut command = server.tmux();
+        command
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env("TERM", "xterm-256color")
+            .args(["attach-session", "-t", target])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // tmux requires a controlling terminal, not merely a PTY-backed file
+        // descriptor. The child becomes a session leader and claims its stdin
+        // slave before exec; both operations are async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut name = None;
+        for _ in 0..100 {
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut output = String::new();
+                let _ = master.try_clone().unwrap().read_to_string(&mut output);
+                panic!("ordinary tmux client exited before attaching: {status}: {output:?}");
+            }
+            let output = command_output(server.tmux().args([
+                "list-clients",
+                "-F",
+                "#{client_control_mode}|#{client_name}",
+            ]));
+            name = output.lines().find_map(|line| {
+                line.strip_prefix("0|")
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            });
+            if name.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let name = name.expect("ordinary tmux client did not attach to the isolated server");
+        Self {
+            child,
+            _master: master,
+            name,
+        }
+    }
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -133,6 +224,64 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
             .to_path_buf()
             .unwrap(),
         expected_cwd
+    );
+}
+
+#[tokio::test]
+async fn captures_only_ordinary_client_session_selection() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    assert!(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "other", "sleep 60"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let original_session_id = command_output(server.tmux().args([
+        "list-sessions",
+        "-F",
+        "#{session_id}|#{session_name}",
+    ]))
+    .lines()
+    .find_map(|line| line.strip_suffix("|capture:雪"))
+    .unwrap()
+    .to_owned();
+    let ordinary = AttachedClient::start(&server, &original_session_id);
+    assert!(
+        server
+            .tmux()
+            .args(["switch-client", "-c", &ordinary.name, "-t", "other"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut control = ControlClient::connect(&server.socket).await.unwrap();
+    let captured = capture_structure(&mut control, &server.socket)
+        .await
+        .unwrap();
+    let current = captured
+        .state
+        .sessions
+        .iter()
+        .find(|session| session.name == "other")
+        .unwrap();
+    let last = captured
+        .state
+        .sessions
+        .iter()
+        .find(|session| session.name == "capture:雪")
+        .unwrap();
+    let client_state = captured.state.client_state.unwrap();
+    assert_eq!(client_state.attachments.len(), 1);
+    assert_eq!(client_state.attachments[0].session_id, current.id);
+    assert_eq!(
+        client_state.attachments[0].last_session_id.as_deref(),
+        Some(last.id.as_str())
     );
 }
 

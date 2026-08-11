@@ -519,6 +519,14 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     for warning in &report.warnings {
         eprintln!("tmux-recover: warning: {warning}");
     }
+    for visibility in &report.session_visibility {
+        if visibility.ordinary_clients == 0 {
+            eprintln!(
+                "tmux-recover: restored session {} is not visible (no ordinary terminal client)",
+                visibility.session
+            );
+        }
+    }
     match report.status {
         RestoreStatus::Succeeded => {
             println!("restored {}", snapshot.id);

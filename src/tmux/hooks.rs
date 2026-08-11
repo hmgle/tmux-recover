@@ -21,6 +21,8 @@ const STRUCTURE_HOOKS: &[&str] = &[
     "after-select-pane",
     "after-select-window",
     "after-split-window",
+    "client-attached",
+    "client-detached",
     "client-session-changed",
     "session-closed",
     "session-created",

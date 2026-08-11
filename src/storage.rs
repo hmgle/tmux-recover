@@ -895,6 +895,7 @@ mod tests {
                     windows: vec![],
                 }],
                 windows: vec![],
+                client_state: None,
             },
             vec![],
         )
@@ -1263,6 +1264,7 @@ mod tests {
             &TmuxState {
                 sessions: vec![],
                 windows: vec![],
+                client_state: None,
             },
         )
         .unwrap();
@@ -1309,6 +1311,7 @@ mod tests {
             &TmuxState {
                 sessions: vec![],
                 windows: vec![],
+                client_state: None,
             },
         )
         .unwrap();
@@ -1335,6 +1338,7 @@ mod tests {
             &TmuxState {
                 sessions: vec![],
                 windows: vec![],
+                client_state: None,
             },
         )
         .unwrap();

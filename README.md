@@ -272,7 +272,11 @@ entire stdout is not one JSON document.
 
 Every real restore first captures the target server as a safety snapshot.
 Failures before the commit point restore the previous session names and client
-attachments; the result is recorded in a restore report.
+attachments; the result is recorded in a restore report. Only ordinary
+terminal clients (`client_control_mode=0`) count as visible. Saved current/last
+session selection is restored with explicit client targets, while a restored
+session with no ordinary client is reported as not visible instead of treating
+the watcher's control-mode client as a terminal.
 
 ### Restore selected programs on Linux
 
@@ -310,6 +314,9 @@ settle, but leaves an older or populated server untouched. If that check times
 out, or preflight fails before changing tmux, the previous `current` remains
 selected while the server is still a one-session/one-window/one-pane bootstrap.
 Autosave resumes normally after real structure is added.
+Automatic restore keeps its persistent control-mode client for collection, but
+that client never satisfies terminal visibility. Attach a terminal normally if
+the report says a restored session has no ordinary client.
 
 ### Import tmux-resurrect history
 
@@ -453,6 +460,8 @@ needed.
 - Existing sessions remain available during the reversible phase. Old backup
   deletion begins only after the restored state is complete and clients have
   switched.
+- Ordinary terminal client current/last sessions are saved and restored;
+  control-mode clients are excluded from visibility and client switching.
 - Captures and multi-file updates are serialized so a delayed older save cannot
   become current after a newer one.
 - Scrollback and pane contents are not saved in snapshot schema v1.

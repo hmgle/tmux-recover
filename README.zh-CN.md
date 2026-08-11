@@ -245,7 +245,10 @@ tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
 随后输出人类可读的安全快照和报告信息，因此整个 stdout 不是单个 JSON 文档。
 
 每次真实恢复都会先把目标 server 保存成安全快照。commit point 之前的失败会恢复
-原 session 名称和客户端附着状态，结果会写入 restore report。
+原 session 名称和客户端附着状态，结果会写入 restore report。只有普通终端 client
+（`client_control_mode=0`）才算可见；保存的 current/last session 会通过明确的 client
+目标恢复。某个恢复后 session 没有普通 client 时会明确报告为不可见，不会把 watcher
+的 control-mode client 当成终端。
 
 ### 在 Linux 上恢复选定程序
 
@@ -278,6 +281,8 @@ watcher 只会恢复刚创建的空白 server。默认 shell 和提示符辅助�
 结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。如果复查
 超时，或 preflight 在修改 tmux 前失败，只要 server 仍是 1 session/1 window/1 pane
 的 bootstrap，上一代 `current` 就会保持不变；加入真实结构后 autosave 自动恢复。
+后台采集所需的持久 control-mode client 可以继续存在，但不会被计入终端可见性；报告
+某个 session 没有普通 client 时，需要从真实终端正常 attach。
 
 ### 导入 tmux-resurrect 历史
 
@@ -405,6 +410,8 @@ cargo uninstall tmux-recover
 - 修改目标 server 前会校验快照 identity、对象引用、index、工作目录和 tmux layout；
 - 可逆阶段会保留现有 session；只有新状态完整建立、客户端完成切换后，才开始删除旧
   backup；
+- 普通终端 client 的 current/last session 会被保存和恢复；control-mode client 不参与
+  可见性统计和 client 切换；
 - capture 和多文件更新会串行执行，避免延迟的旧保存覆盖较新的 current；
 - snapshot schema v1 不保存 scrollback 和 pane 内容；
 - dead pane 会被抓取，但恢复时暂时拒绝，因为重建成 live shell 会改变原状态含义；

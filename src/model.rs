@@ -259,6 +259,25 @@ impl SocketIdentity {
 pub struct TmuxState {
     pub sessions: Vec<Session>,
     pub windows: Vec<Window>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_state: Option<ClientState>,
+}
+
+/// Restorable session selection from ordinary terminal clients.
+///
+/// Client names, PIDs, and TTYs are deliberately excluded because they are
+/// process-local identities and cannot be matched after a tmux server restart.
+/// Attachments are ordered from most to least recently active so a fresh set
+/// of bootstrap clients can be paired deterministically during auto-restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientState {
+    pub attachments: Vec<ClientSessionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSessionState {
+    pub session_id: String,
+    pub last_session_id: Option<String>,
 }
 
 impl TmuxState {
@@ -321,6 +340,7 @@ impl TmuxState {
                         .collect(),
                 })
                 .collect(),
+            client_state: self.client_state.as_ref(),
         }
     }
 
@@ -331,6 +351,27 @@ impl TmuxState {
             self.sessions.iter().map(|item| item.id.as_str()).collect();
         if session_ids.len() != self.sessions.len() {
             bail!("snapshot contains duplicate session IDs");
+        }
+        if let Some(client_state) = &self.client_state {
+            if client_state.attachments.is_empty() {
+                bail!("snapshot client state contains no ordinary attachments");
+            }
+            for attachment in &client_state.attachments {
+                if !session_ids.contains(attachment.session_id.as_str()) {
+                    bail!(
+                        "snapshot client state references missing session {}",
+                        attachment.session_id
+                    );
+                }
+                if let Some(last_session_id) = &attachment.last_session_id {
+                    if !session_ids.contains(last_session_id.as_str()) {
+                        bail!(
+                            "snapshot client state references missing last session {}",
+                            last_session_id
+                        );
+                    }
+                }
+            }
         }
         let window_ids: HashSet<&str> = self.windows.iter().map(|item| item.id.as_str()).collect();
         if window_ids.len() != self.windows.len() {
@@ -468,6 +509,8 @@ impl TmuxState {
 struct StructuralState<'a> {
     sessions: Vec<StructuralSession<'a>>,
     windows: Vec<StructuralWindow<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_state: Option<&'a ClientState>,
 }
 
 #[derive(Serialize)]
@@ -751,7 +794,25 @@ pub struct RestoreReport {
     pub restored_processes: usize,
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub ordinary_clients: Vec<ClientRestoreRecord>,
+    #[serde(default)]
+    pub session_visibility: Vec<SessionVisibilityRecord>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRestoreRecord {
+    pub client_name: String,
+    pub client_tty: Option<String>,
+    pub from_session: String,
+    pub to_session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionVisibilityRecord {
+    pub session: String,
+    pub ordinary_clients: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +876,37 @@ mod tests {
     }
 
     #[test]
+    fn optional_client_state_preserves_old_hashes_and_tracks_visibility() {
+        let mut state = TmuxState {
+            sessions: vec![Session {
+                id: "$0".to_owned(),
+                name: "work".to_owned(),
+                group: None,
+                created_at: None,
+                active_window_id: None,
+                last_window_id: None,
+                windows: vec![],
+            }],
+            windows: vec![],
+            client_state: None,
+        };
+        let old_json = serde_json::to_string(&state).unwrap();
+        let old_semantic_hash = state.semantic_hash().unwrap();
+        let old_structural_hash = state.structural_hash().unwrap();
+        assert!(!old_json.contains("client_state"));
+
+        state.client_state = Some(ClientState {
+            attachments: vec![ClientSessionState {
+                session_id: "$0".to_owned(),
+                last_session_id: None,
+            }],
+        });
+        state.validate().unwrap();
+        assert_ne!(state.semantic_hash().unwrap(), old_semantic_hash);
+        assert_ne!(state.structural_hash().unwrap(), old_structural_hash);
+    }
+
+    #[test]
     fn a_pane_id_reused_across_windows_is_rejected() {
         let pane = |id: &str| Pane {
             id: id.to_owned(),
@@ -873,6 +965,7 @@ mod tests {
                 window("@0", vec![pane("%0")]),
                 window("@1", vec![pane("%0")]),
             ],
+            client_state: None,
         };
         let error = format!("{:#}", state.validate().unwrap_err());
         assert!(error.contains("reuses pane %0"), "{error}");
@@ -884,6 +977,7 @@ mod tests {
                 window("@0", vec![pane("%0")]),
                 window("@1", vec![pane("%1")]),
             ],
+            client_state: None,
         };
         state.validate().unwrap();
     }
@@ -915,6 +1009,7 @@ mod tests {
                 active_pane_id: None,
                 panes: vec![],
             }],
+            client_state: None,
         };
         let error = format!("{:#}", state.validate().unwrap_err());
         assert!(error.contains("does not link"), "{error}");
@@ -962,6 +1057,7 @@ mod tests {
                 active_pane_id: panes.first().map(|pane| pane.id.clone()),
                 panes,
             }],
+            client_state: None,
         };
 
         let error = format!(

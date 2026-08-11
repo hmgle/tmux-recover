@@ -1,5 +1,14 @@
-use std::{process::Command, time::Duration};
+use std::{
+    fs::File,
+    os::unix::process::CommandExt,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
 
+use nix::{
+    fcntl::{FcntlArg, OFlag, fcntl},
+    pty::{Winsize, openpty},
+};
 use tempfile::TempDir;
 use tmux_recover::{
     config::{RestoreConfig, StorageConfig},
@@ -52,6 +61,83 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+struct AttachedClient {
+    child: Child,
+    _master: File,
+    name: String,
+}
+
+impl AttachedClient {
+    fn start(server: &TestServer, target: &str) -> Self {
+        let pty = openpty(
+            Some(&Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }),
+            None,
+        )
+        .unwrap();
+        let master = File::from(pty.master);
+        fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        let slave = File::from(pty.slave);
+        let mut command = server.tmux();
+        command
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env("TERM", "xterm-256color")
+            .args(["attach-session", "-t", target])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let mut name = None;
+        for _ in 0..100 {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("ordinary tmux client exited before attaching: {status}");
+            }
+            let clients = output(server.tmux().args([
+                "list-clients",
+                "-F",
+                "#{client_control_mode}|#{client_name}",
+            ]));
+            name = clients.lines().find_map(|line| {
+                line.strip_prefix("0|")
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            });
+            if name.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Self {
+            child,
+            _master: master,
+            name: name.expect("ordinary tmux client did not attach to the isolated server"),
+        }
+    }
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -237,6 +323,7 @@ async fn restores_special_fields_active_pane_and_zoom() {
     ]));
     success(server.tmux().args(["select-pane", "-t", second_pane]));
     success(server.tmux().args(["resize-pane", "-Z", "-t", second_pane]));
+    let source_terminal = AttachedClient::start(&server, session_id);
 
     let source = {
         let mut client = ControlClient::connect(&server.socket).await.unwrap();
@@ -284,9 +371,23 @@ async fn restores_special_fields_active_pane_and_zoom() {
         .find(|window| window.name == "main window")
         .unwrap();
     assert_pane_properties(main, &cwd_one, &cwd_two);
+    assert_eq!(
+        snapshot.state.client_state.as_ref().unwrap().attachments[0].session_id,
+        session_id
+    );
 
+    drop(source_terminal);
     server.stop();
-    success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
+    let bootstrap = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "bootstrap",
+    ]));
+    let target_terminal = AttachedClient::start(&server, bootstrap.trim());
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
     let target = capture(&mut client, &server.socket).await.unwrap();
     let config = RestoreConfig {
@@ -304,7 +405,26 @@ async fn restores_special_fields_active_pane_and_zoom() {
     );
     let report = apply(&mut client, &snapshot, &target, &plan).await;
     assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    assert_eq!(report.ordinary_clients.len(), 1, "{report:#?}");
+    assert_eq!(report.ordinary_clients[0].client_name, target_terminal.name);
+    assert_eq!(report.ordinary_clients[0].from_session, "bootstrap");
+    assert_eq!(report.ordinary_clients[0].to_session, "work:雪");
+    assert_eq!(report.session_visibility.len(), 1);
+    assert_eq!(report.session_visibility[0].session, "work:雪");
+    assert_eq!(report.session_visibility[0].ordinary_clients, 1);
     drop(client);
+
+    let clients = output(server.tmux().args([
+        "list-clients",
+        "-F",
+        "#{client_control_mode}|#{client_name}|#{session_name}",
+    ]));
+    assert!(
+        clients
+            .lines()
+            .any(|line| line == format!("0|{}|work:雪", target_terminal.name)),
+        "ordinary terminal was not switched to the restored session: {clients}"
+    );
 
     let restored = {
         let mut client = ControlClient::connect(&server.socket).await.unwrap();
@@ -360,6 +480,109 @@ async fn restores_special_fields_active_pane_and_zoom() {
     assert_eq!(auxiliary.panes.len(), 1);
     assert_eq!(auxiliary.panes[0].title.as_deref(), Some("auxiliary"));
     assert_eq!(cwd(&auxiliary.panes[0]), cwd_one);
+}
+
+#[tokio::test]
+async fn restores_ordinary_client_current_and_last_sessions() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    let current = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "2",
+        "sleep 60",
+    ]));
+    let last = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "work",
+        "sleep 60",
+    ]));
+    let source_terminal = AttachedClient::start(&server, last.trim());
+    success(server.tmux().args([
+        "switch-client",
+        "-c",
+        &source_terminal.name,
+        "-t",
+        current.trim(),
+    ]));
+    let source = {
+        let mut control = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut control, &server.socket).await.unwrap()
+    };
+    let snapshot = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "client-state-test".to_owned(),
+        },
+        source.origin,
+        source.state,
+        source.diagnostics,
+    )
+    .unwrap();
+    let saved_client = &snapshot.state.client_state.as_ref().unwrap().attachments[0];
+    assert_eq!(saved_client.session_id, current.trim());
+    assert_eq!(saved_client.last_session_id.as_deref(), Some(last.trim()));
+
+    drop(source_terminal);
+    server.stop();
+    let bootstrap = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{session_id}",
+        "-s",
+        "work",
+    ]));
+    let target_terminal = AttachedClient::start(&server, bootstrap.trim());
+    let mut control = ControlClient::connect(&server.socket).await.unwrap();
+    let target = capture(&mut control, &server.socket).await.unwrap();
+    let config = RestoreConfig::default();
+    let options = restore_config_options(&config, false, false, None, false, None);
+    let plan = preflight(&snapshot, &target, &options).unwrap();
+    let report = apply(&mut control, &snapshot, &target, &plan).await;
+    assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    assert_eq!(
+        report
+            .session_visibility
+            .iter()
+            .find(|visibility| visibility.session == "2")
+            .unwrap()
+            .ordinary_clients,
+        1
+    );
+    assert_eq!(
+        report
+            .session_visibility
+            .iter()
+            .find(|visibility| visibility.session == "work")
+            .unwrap()
+            .ordinary_clients,
+        0
+    );
+    let client = output(server.tmux().args([
+        "list-clients",
+        "-F",
+        "#{client_control_mode}|#{client_name}|#{session_name}|#{client_last_session}",
+    ]));
+    assert!(
+        client
+            .lines()
+            .any(|line| { line == format!("0|{}|2|work", target_terminal.name) }),
+        "ordinary client selection was not restored: {client}"
+    );
 }
 
 #[tokio::test]

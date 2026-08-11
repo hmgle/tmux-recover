@@ -895,6 +895,7 @@ mod tests {
                         import_status: None,
                     }],
                 }],
+                client_state: None,
             },
             Vec::new(),
         )
@@ -919,6 +920,7 @@ mod tests {
             state: TmuxState {
                 sessions: vec![],
                 windows: vec![],
+                client_state: None,
             },
             diagnostics: Vec::new(),
             default_shell: None,

@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::{
     config::RestoreConfig,
     model::{
-        CwdFallbackRecord, EncodedPath, Pane, ProcessCheckpoint, RestartSpec, RestoreReport,
-        RestoreStatus, Session, Snapshot, TmuxState,
+        ClientRestoreRecord, CwdFallbackRecord, EncodedPath, Pane, ProcessCheckpoint, RestartSpec,
+        RestoreReport, RestoreStatus, Session, SessionVisibilityRecord, Snapshot, TmuxState,
     },
     tmux::{capture::CaptureResult, control::ControlClient},
     util::{hostname, uid},
@@ -624,6 +624,8 @@ pub async fn apply(
             cwd_fallbacks: plan.cwd_fallbacks.clone(),
             restored_processes: success.restored_processes,
             warnings: success.warnings,
+            ordinary_clients: success.ordinary_clients,
+            session_visibility: success.session_visibility,
             error: None,
         },
         Err(failure) => RestoreReport {
@@ -640,6 +642,8 @@ pub async fn apply(
             cwd_fallbacks: plan.cwd_fallbacks.clone(),
             restored_processes: 0,
             warnings: Vec::new(),
+            ordinary_clients: Vec::new(),
+            session_visibility: Vec::new(),
             error: Some(format!("{:#}", failure.error)),
         },
     }
@@ -648,6 +652,8 @@ pub async fn apply(
 struct ApplySuccess {
     restored_processes: usize,
     warnings: Vec<String>,
+    ordinary_clients: Vec<ClientRestoreRecord>,
+    session_visibility: Vec<SessionVisibilityRecord>,
 }
 
 struct ApplyFailure {
@@ -736,13 +742,18 @@ async fn apply_inner(
         restore_zoomed_windows(&mut final_client, &snapshot.state, &built.panes).await?;
         restore_session_windows(&mut final_client, &snapshot.state, &built.sessions).await?;
         restore_pane_titles(&mut final_client, &snapshot.state, &built.panes).await?;
-        switch_clients(&mut final_client, &clients, &backups, &built, snapshot).await?;
-        Ok::<(usize, ControlClient), anyhow::Error>((restored_processes, final_client))
+        let client_result =
+            switch_clients(&mut final_client, &clients, &backups, &built, snapshot).await?;
+        Ok::<(usize, ControlClient, ClientSwitchResult), anyhow::Error>((
+            restored_processes,
+            final_client,
+            client_result,
+        ))
     }
     .await;
 
     match reversible_result {
-        Ok((restored_processes, mut final_client)) => {
+        Ok((restored_processes, mut final_client, client_result)) => {
             // Everything a user asked to restore now exists and ordinary clients
             // have been switched to it. Deleting backups is the irreversible
             // commit phase: once even one backup is gone, rolling back by deleting
@@ -765,6 +776,8 @@ async fn apply_inner(
             Ok(ApplySuccess {
                 restored_processes,
                 warnings,
+                ordinary_clients: client_result.ordinary_clients,
+                session_visibility: client_result.session_visibility,
             })
         }
         Err(error) => {
@@ -1417,29 +1430,51 @@ fn window_owners(state: &TmuxState) -> HashMap<String, Vec<(String, i32)>> {
 #[derive(Debug)]
 struct ClientAttachment {
     name: String,
+    tty: Option<String>,
     session_id: String,
     control: bool,
+    activity: i64,
 }
 
 async fn list_clients(client: &mut ControlClient) -> Result<Vec<ClientAttachment>> {
     let output = client
-        .execute("list-clients -F \"#{client_name}|#{session_id}|#{client_control_mode}\"")
+        .execute(
+            "list-clients -F \"#{client_name}|#{session_id}|#{client_control_mode}|#{client_tty}|#{client_activity}\"",
+        )
         .await?;
     output
         .into_iter()
         .map(|line| {
             let line = String::from_utf8(line).context("tmux returned invalid client name")?;
             let fields: Vec<&str> = line.split('|').collect();
-            if fields.len() != 3 {
+            if fields.len() != 5 {
                 bail!("invalid client attachment record");
             }
             Ok(ClientAttachment {
                 name: fields[0].to_owned(),
+                tty: (!fields[3].is_empty()).then(|| fields[3].to_owned()),
                 session_id: fields[1].to_owned(),
                 control: fields[2] == "1",
+                activity: fields[4]
+                    .parse()
+                    .context("tmux returned invalid client activity")?,
             })
         })
         .collect()
+}
+
+struct ClientSwitchResult {
+    ordinary_clients: Vec<ClientRestoreRecord>,
+    session_visibility: Vec<SessionVisibilityRecord>,
+}
+
+struct DesiredClient {
+    name: String,
+    tty: Option<String>,
+    from_session: String,
+    to_session: String,
+    target_id: String,
+    last_target_id: Option<String>,
 }
 
 async fn switch_clients(
@@ -1448,18 +1483,31 @@ async fn switch_clients(
     backups: &[BackupSession],
     built: &BuiltState,
     snapshot: &Snapshot,
-) -> Result<()> {
+) -> Result<ClientSwitchResult> {
     let first_session = snapshot
         .state
         .sessions
         .first()
         .context("no restored sessions")?;
-    let first_target = built
-        .sessions
-        .get(&first_session.id)
-        .context("first restored session is missing")?;
-    for attachment in clients {
-        let target = backups
+    let preferred = snapshot
+        .state
+        .client_state
+        .as_ref()
+        .map(|state| state.attachments.as_slice())
+        .unwrap_or_default();
+    let mut ordinary: Vec<_> = clients
+        .iter()
+        .filter(|attachment| !attachment.control)
+        .collect();
+    ordinary.sort_by(|left, right| {
+        right
+            .activity
+            .cmp(&left.activity)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut desired = Vec::new();
+    for (ordinary_index, attachment) in ordinary.into_iter().enumerate() {
+        let named_session = backups
             .iter()
             .find(|backup| backup.id == attachment.session_id)
             .and_then(|backup| {
@@ -1468,20 +1516,117 @@ async fn switch_clients(
                     .sessions
                     .iter()
                     .find(|session| session.name == backup.original_name)
+            });
+        let preferred_state = preferred.get(ordinary_index);
+        let target_session = preferred_state
+            .and_then(|state| {
+                snapshot
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == state.session_id)
             })
-            .and_then(|session| built.sessions.get(&session.id))
-            .unwrap_or(first_target);
-        if attachment.control {
-            continue;
-        }
-        let command = format!(
-            "switch-client -c {} -t {}",
-            quote(&attachment.name),
-            quote(target)
-        );
-        execute_empty(client, &command).await?;
+            .or(named_session)
+            .unwrap_or(first_session);
+        let target_id = built
+            .sessions
+            .get(&target_session.id)
+            .context("restored client target session is missing")?
+            .clone();
+        let last_target_id = preferred_state
+            .and_then(|state| state.last_session_id.as_ref())
+            .and_then(|session_id| built.sessions.get(session_id))
+            .filter(|last| *last != &target_id)
+            .cloned();
+        let from_session = backups
+            .iter()
+            .find(|backup| backup.id == attachment.session_id)
+            .map(|backup| backup.original_name.clone())
+            .unwrap_or_else(|| attachment.session_id.clone());
+        desired.push(DesiredClient {
+            name: attachment.name.clone(),
+            tty: attachment.tty.clone(),
+            from_session,
+            to_session: target_session.name.clone(),
+            target_id,
+            last_target_id,
+        });
     }
-    Ok(())
+
+    for target in &desired {
+        if let Some(last_target_id) = &target.last_target_id {
+            execute_empty(
+                client,
+                &format!(
+                    "switch-client -c {} -t {}",
+                    quote(&target.name),
+                    quote(last_target_id)
+                ),
+            )
+            .await?;
+        }
+        execute_empty(
+            client,
+            &format!(
+                "switch-client -c {} -t {}",
+                quote(&target.name),
+                quote(&target.target_id)
+            ),
+        )
+        .await?;
+    }
+
+    let attached = list_clients(client).await?;
+    for target in &desired {
+        let actual = attached
+            .iter()
+            .find(|attachment| !attachment.control && attachment.name == target.name)
+            .with_context(|| {
+                format!("ordinary client {} disappeared during restore", target.name)
+            })?;
+        if actual.session_id != target.target_id {
+            bail!(
+                "ordinary client {} remained on {} instead of restored session {}",
+                target.name,
+                actual.session_id,
+                target.to_session
+            );
+        }
+    }
+
+    let ordinary_clients = desired
+        .into_iter()
+        .map(|target| ClientRestoreRecord {
+            client_name: target.name,
+            client_tty: target.tty,
+            from_session: target.from_session,
+            to_session: target.to_session,
+        })
+        .collect();
+    let session_visibility = snapshot
+        .state
+        .sessions
+        .iter()
+        .map(|session| {
+            let restored_id = built.sessions.get(&session.id);
+            let ordinary_clients = restored_id.map_or(0, |restored_id| {
+                attached
+                    .iter()
+                    .filter(|attachment| {
+                        !attachment.control && attachment.session_id == *restored_id
+                    })
+                    .count()
+            });
+            SessionVisibilityRecord {
+                session: session.name.clone(),
+                ordinary_clients,
+            }
+        })
+        .collect();
+    Ok(ClientSwitchResult {
+        ordinary_clients,
+        session_visibility,
+    })
 }
 
 /// Decides whether the process checkpoint sidecar may even be read for a
@@ -1605,6 +1750,7 @@ mod tests {
                 active_pane_id: Some(panes[0].id.clone()),
                 panes,
             }],
+            client_state: None,
         }
         .tap_validated(cwd)
     }
