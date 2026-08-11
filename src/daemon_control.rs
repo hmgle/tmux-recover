@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -113,27 +114,35 @@ impl WireResponse {
 mod platform {
     use std::{
         fs,
-        future::Future,
         os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-        pin::Pin,
         sync::Arc,
     };
 
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::{UnixListener, UnixStream},
+        sync::{
+            Mutex,
+            mpsc::{self, UnboundedReceiver, UnboundedSender},
+        },
+        task::{JoinHandle, JoinSet},
         time::timeout,
     };
 
     use super::*;
 
     pub(crate) struct ControlServer {
-        listener: Arc<UnixListener>,
+        actions: UnboundedReceiver<Result<ControlAction>>,
+        task: JoinHandle<()>,
         _socket: SocketGuard,
     }
 
     impl ControlServer {
-        pub(crate) fn bind(data_dir: &Path, socket_key: &str) -> Result<Self> {
+        pub(crate) fn bind(
+            data_dir: &Path,
+            socket_key: &str,
+            status: DaemonStatus,
+        ) -> Result<Self> {
             let path = control_path(data_dir, socket_key)?;
             ensure_runtime_directory(
                 path.parent()
@@ -152,24 +161,79 @@ mod platform {
                 device: metadata.dev(),
                 inode: metadata.ino(),
             };
+            let (action_sender, actions) = mpsc::unbounded_channel();
+            let task = tokio::spawn(serve(listener, status, action_sender));
             Ok(Self {
-                listener: Arc::new(listener),
+                actions,
+                task,
                 _socket: guard,
             })
         }
 
-        pub(crate) fn next_request(
-            &self,
-            status: DaemonStatus,
-        ) -> Pin<Box<dyn Future<Output = Result<ControlAction>> + Send>> {
-            let listener = Arc::clone(&self.listener);
-            Box::pin(async move {
-                let (mut stream, _) = listener
-                    .accept()
-                    .await
-                    .context("failed to accept a daemon control request")?;
-                handle_request(&mut stream, status).await
-            })
+        pub(crate) async fn next_request(&mut self) -> Result<ControlAction> {
+            self.actions
+                .recv()
+                .await
+                .context("daemon control server stopped unexpectedly")?
+        }
+    }
+
+    impl Drop for ControlServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn serve(
+        listener: UnixListener,
+        status: DaemonStatus,
+        actions: UnboundedSender<Result<ControlAction>>,
+    ) {
+        let mut requests = JoinSet::new();
+        let lifecycle = Arc::new(Mutex::new(None));
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            requests.spawn(handle_request(
+                                stream,
+                                status.clone(),
+                                Arc::clone(&lifecycle),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = actions.send(
+                                Err(error).context("failed to accept a daemon control request")
+                            );
+                            return;
+                        }
+                    }
+                }
+                request = requests.join_next(), if !requests.is_empty() => {
+                    match request {
+                        Some(Ok(Ok(ControlAction::Continue))) => {}
+                        Some(Ok(Ok(action))) => {
+                            if actions.send(Ok(action)).is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(Err(error))) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "daemon control request failed"
+                            );
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                error = %error,
+                                "daemon control request task failed"
+                            );
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
     }
 
@@ -234,12 +298,12 @@ mod platform {
     }
 
     async fn exchange(path: &Path, action: ControlRequest) -> Result<WireResponse> {
-        let mut stream = UnixStream::connect(path).await.with_context(|| {
-            format!(
-                "no controllable tmux-recover daemon was found at {}",
-                path.display()
-            )
-        })?;
+        let mut stream = UnixStream::connect(path)
+            .await
+            .map_err(|source| ConnectError {
+                path: path.to_path_buf(),
+                source,
+            })?;
         let request = WireRequest {
             protocol_version: PROTOCOL_VERSION,
             action,
@@ -251,27 +315,28 @@ mod platform {
     }
 
     async fn handle_request(
-        stream: &mut UnixStream,
+        mut stream: UnixStream,
         status: DaemonStatus,
+        lifecycle: Arc<Mutex<Option<ControlRequest>>>,
     ) -> Result<ControlAction> {
-        let request: WireRequest = match timeout(REQUEST_TIMEOUT, read_message(stream)).await {
+        let request: WireRequest = match timeout(REQUEST_TIMEOUT, read_message(&mut stream)).await {
             Ok(Ok(request)) => request,
             Ok(Err(error)) => {
                 write_message(
-                    stream,
+                    &mut stream,
                     &WireResponse::error(format!("invalid request: {error:#}")),
                 )
                 .await?;
                 return Ok(ControlAction::Continue);
             }
             Err(_) => {
-                write_message(stream, &WireResponse::error("request timed out")).await?;
+                write_message(&mut stream, &WireResponse::error("request timed out")).await?;
                 return Ok(ControlAction::Continue);
             }
         };
         if request.protocol_version != PROTOCOL_VERSION {
             write_message(
-                stream,
+                &mut stream,
                 &WireResponse::error(format!(
                     "unsupported control protocol {}, expected {}",
                     request.protocol_version, PROTOCOL_VERSION
@@ -281,19 +346,49 @@ mod platform {
             return Ok(ControlAction::Continue);
         }
 
-        let (response, action) = match request.action {
-            ControlRequest::Status => (WireResponse::status(status), ControlAction::Continue),
-            ControlRequest::Stop => (
-                WireResponse::acknowledged(ControlRequest::Stop),
-                ControlAction::Stop,
-            ),
-            ControlRequest::Reload => (
-                WireResponse::acknowledged(ControlRequest::Reload),
-                ControlAction::Reload,
-            ),
-        };
-        write_message(stream, &response).await?;
-        Ok(action)
+        match request.action {
+            ControlRequest::Status => {
+                write_message(&mut stream, &WireResponse::status(status)).await?;
+                Ok(ControlAction::Continue)
+            }
+            action @ (ControlRequest::Stop | ControlRequest::Reload) => {
+                let mut pending = lifecycle.lock().await;
+                if let Some(pending) = *pending {
+                    write_message(
+                        &mut stream,
+                        &WireResponse::error(format!("{} already requested", pending.as_str())),
+                    )
+                    .await?;
+                    return Ok(ControlAction::Continue);
+                }
+                write_message(&mut stream, &WireResponse::acknowledged(action)).await?;
+                *pending = Some(action);
+                Ok(match action {
+                    ControlRequest::Stop => ControlAction::Stop,
+                    ControlRequest::Reload => ControlAction::Reload,
+                    ControlRequest::Status => unreachable!(),
+                })
+            }
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("no controllable tmux-recover daemon was found at {path}")]
+    struct ConnectError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    }
+
+    pub fn is_daemon_unavailable(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<ConnectError>().is_some_and(|error| {
+                matches!(
+                    error.source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            })
+        })
     }
 
     async fn read_message<T>(stream: &mut UnixStream) -> Result<T>
@@ -390,22 +485,21 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    use std::{future::Future, pin::Pin};
-
     use super::*;
 
     pub(crate) struct ControlServer;
 
     impl ControlServer {
-        pub(crate) fn bind(_data_dir: &Path, _socket_key: &str) -> Result<Self> {
+        pub(crate) fn bind(
+            _data_dir: &Path,
+            _socket_key: &str,
+            _status: DaemonStatus,
+        ) -> Result<Self> {
             bail!("daemon control is only supported on Unix")
         }
 
-        pub(crate) fn next_request(
-            &self,
-            _status: DaemonStatus,
-        ) -> Pin<Box<dyn Future<Output = Result<ControlAction>> + Send>> {
-            Box::pin(async { bail!("daemon control is only supported on Unix") })
+        pub(crate) async fn next_request(&mut self) -> Result<ControlAction> {
+            bail!("daemon control is only supported on Unix")
         }
     }
 
@@ -416,10 +510,14 @@ mod platform {
     ) -> Result<Option<DaemonStatus>> {
         bail!("daemon control is only supported on Unix")
     }
+
+    pub fn is_daemon_unavailable(_error: &anyhow::Error) -> bool {
+        false
+    }
 }
 
 pub(crate) use platform::ControlServer;
-pub use platform::request;
+pub use platform::{is_daemon_unavailable, request};
 
 fn control_path(data_dir: &Path, socket_key: &str) -> Result<PathBuf> {
     let data_dir = canonical_or_absolute(data_dir)?;
@@ -436,11 +534,24 @@ fn control_path(data_dir: &Path, socket_key: &str) -> Result<PathBuf> {
     hasher.update(&[0]);
     hasher.update(socket_key.as_bytes());
     let key = &hasher.finalize().to_hex()[..24];
-    Ok(PathBuf::from(format!(
-        "/tmp/tmux-recover-{}/{}.sock",
-        uid(),
-        key
-    )))
+    Ok(
+        runtime_directory(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?
+            .join(format!("{key}.sock")),
+    )
+}
+
+fn runtime_directory(xdg_runtime_dir: Option<&OsStr>) -> Result<PathBuf> {
+    if let Some(value) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            bail!(
+                "XDG_RUNTIME_DIR must be an absolute path, got {}",
+                path.display()
+            );
+        }
+        return Ok(path.join("tmux-recover"));
+    }
+    Ok(PathBuf::from(format!("/tmp/tmux-recover-{}", uid())))
 }
 
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf> {
@@ -467,26 +578,20 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let socket = data.path().join("tmux.sock");
         let expected = status(&socket);
-        let server = ControlServer::bind(data.path(), "socket-key").unwrap();
-        let server_request = tokio::spawn(server.next_request(expected.clone()));
+        let _server = ControlServer::bind(data.path(), "socket-key", expected.clone()).unwrap();
 
         let actual = request(data.path(), "socket-key", ControlRequest::Status)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(
-            server_request.await.unwrap().unwrap(),
-            ControlAction::Continue
-        );
     }
 
     #[tokio::test]
     async fn stop_is_acknowledged_before_the_server_returns_the_action() {
         let data = tempfile::tempdir().unwrap();
         let socket = data.path().join("tmux.sock");
-        let server = ControlServer::bind(data.path(), "socket-key").unwrap();
-        let server_request = tokio::spawn(server.next_request(status(&socket)));
+        let mut server = ControlServer::bind(data.path(), "socket-key", status(&socket)).unwrap();
 
         assert_eq!(
             request(data.path(), "socket-key", ControlRequest::Stop)
@@ -494,7 +599,43 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert_eq!(server_request.await.unwrap().unwrap(), ControlAction::Stop);
+        let error = request(data.path(), "socket-key", ControlRequest::Reload)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stop already requested"));
+        assert_eq!(server.next_request().await.unwrap(), ControlAction::Stop);
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_does_not_block_status_requests() {
+        let data = tempfile::tempdir().unwrap();
+        let socket = data.path().join("tmux.sock");
+        let expected = status(&socket);
+        let _server = ControlServer::bind(data.path(), "socket-key", expected.clone()).unwrap();
+        let path = control_path(data.path(), "socket-key").unwrap();
+        let _idle = tokio::net::UnixStream::connect(path).await.unwrap();
+
+        let actual = tokio::time::timeout(
+            Duration::from_secs(1),
+            request(data.path(), "socket-key", ControlRequest::Status),
+        )
+        .await
+        .expect("status request was blocked by an idle connection")
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn only_connect_failures_report_an_unavailable_daemon() {
+        let data = tempfile::tempdir().unwrap();
+        let error = request(data.path(), "missing", ControlRequest::Status)
+            .await
+            .unwrap_err();
+        assert!(is_daemon_unavailable(&error));
+        assert!(!is_daemon_unavailable(&anyhow::anyhow!(
+            "protocol mismatch"
+        )));
     }
 
     #[test]
@@ -514,7 +655,8 @@ mod tests {
         platform::ensure_runtime_directory(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"do not replace").unwrap();
 
-        let error = match ControlServer::bind(data.path(), "socket-key") {
+        let error = match ControlServer::bind(data.path(), "socket-key", status(Path::new("tmux")))
+        {
             Ok(_) => panic!("regular control path was replaced"),
             Err(error) => error,
         };
@@ -534,9 +676,28 @@ mod tests {
         let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
         drop(stale);
 
-        let server = ControlServer::bind(data.path(), "socket-key").unwrap();
+        let server =
+            ControlServer::bind(data.path(), "socket-key", status(Path::new("tmux"))).unwrap();
         assert!(path.exists());
         drop(server);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn runtime_directory_prefers_an_absolute_xdg_path() {
+        assert_eq!(
+            runtime_directory(Some(OsStr::new("/run/user/1000"))).unwrap(),
+            Path::new("/run/user/1000/tmux-recover")
+        );
+        assert_eq!(
+            runtime_directory(None).unwrap(),
+            PathBuf::from(format!("/tmp/tmux-recover-{}", uid()))
+        );
+    }
+
+    #[test]
+    fn runtime_directory_rejects_a_relative_xdg_path() {
+        let error = runtime_directory(Some(OsStr::new("relative/runtime"))).unwrap_err();
+        assert!(format!("{error:#}").contains("must be an absolute path"));
     }
 }

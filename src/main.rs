@@ -10,7 +10,9 @@ use clap::{Args, Parser, Subcommand};
 use tmux_recover::{
     config::{AppPaths, Config},
     daemon::DaemonExit,
-    daemon_control::{ControlRequest, DaemonStatus, request as daemon_request},
+    daemon_control::{
+        ControlRequest, DaemonStatus, is_daemon_unavailable, request as daemon_request,
+    },
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
@@ -303,17 +305,31 @@ fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
 async fn wait_for_daemon_stop(data_dir: &Path, socket_key: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if daemon_request(data_dir, socket_key, ControlRequest::Status)
-            .await
-            .is_err()
-        {
-            return Ok(());
+        match daemon_request(data_dir, socket_key, ControlRequest::Status).await {
+            Ok(_) => {}
+            Err(error) if is_daemon_unavailable(&error) => return Ok(()),
+            Err(error) if daemon_connection_closed(&error) => {}
+            Err(error) => return Err(error).context("failed to confirm that the daemon stopped"),
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("daemon acknowledged stop but did not exit within 15 seconds");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn daemon_connection_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 async fn wait_for_daemon_reload(

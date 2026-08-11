@@ -1129,6 +1129,27 @@ mod tests {
         writer.join().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_lock_conflicts_through_a_symlinked_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let data = directory.path().join("data");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&data).unwrap();
+        symlink(&data, &alias).unwrap();
+        let first = SnapshotStore::for_socket(&data, "socket", &StorageConfig::default());
+        let second = SnapshotStore::for_socket(&alias, "socket", &StorageConfig::default());
+
+        let _lock = first.acquire_daemon_lock().unwrap();
+        let error = match second.acquire_daemon_lock() {
+            Ok(_) => panic!("symlink alias acquired the same daemon lock twice"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("another tmux-recover daemon already owns"));
+    }
+
     #[test]
     fn compressed_snapshots_round_trip() {
         let directory = tempdir().unwrap();

@@ -223,7 +223,9 @@ running version matches the controlling binary. It also reloads `config.toml`.
 own stop command for a supervised service. Control commands do not parse the
 configuration file, so an invalid configuration cannot prevent status or a
 clean stop. When the daemon uses `--data-dir` or `TMUX_RECOVER_DATA_DIR`, use
-the same value for its control commands.
+the same value for its control commands. Control sockets use
+`$XDG_RUNTIME_DIR/tmux-recover` when that variable is set, so the daemon and
+control command must also see the same runtime directory.
 
 ### Recover after a reboot or server exit
 

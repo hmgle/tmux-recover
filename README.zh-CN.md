@@ -203,6 +203,8 @@ systemd watcher 也仍归原 unit 管理。命令会等待替代进程重新发�
 `--stop` 有意不启动新 watcher。由 supervisor 管理时，优先使用 supervisor 自己的
 stop 命令。控制命令不会解析配置文件，因此无效配置不会阻止 status 或干净退出。
 daemon 使用 `--data-dir` 或 `TMUX_RECOVER_DATA_DIR` 时，控制命令必须使用同一个值。
+设置了 `XDG_RUNTIME_DIR` 时，控制 socket 位于 `$XDG_RUNTIME_DIR/tmux-recover`，
+因此 daemon 和控制命令也必须看到相同的 runtime directory。
 
 ### 重启或 server 退出后恢复
 

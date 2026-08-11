@@ -5,7 +5,10 @@ use std::{
 };
 
 use tempfile::TempDir;
-use tmux_recover::daemon_control::DaemonStatus;
+use tmux_recover::{
+    config::StorageConfig, daemon_control::DaemonStatus, storage::SnapshotStore,
+    util::socket_identity,
+};
 
 struct TestServer {
     _directory: TempDir,
@@ -63,6 +66,7 @@ impl IsolatedCli {
     fn new() -> Self {
         let command_config = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(command_config.path().join("config")).unwrap();
+        std::fs::create_dir(command_config.path().join("runtime")).unwrap();
         std::fs::write(
             command_config.path().join("invalid.toml"),
             "this is not valid TOML = [",
@@ -79,6 +83,10 @@ impl IsolatedCli {
         command
             .env("HOME", self.command_config.path())
             .env("XDG_CONFIG_HOME", self.command_config.path().join("config"))
+            .env(
+                "XDG_RUNTIME_DIR",
+                self.command_config.path().join("runtime"),
+            )
             .env("XDG_STATE_HOME", self.command_config.path().join("state"))
             .arg("--data-dir")
             .arg(self.data.path());
@@ -108,6 +116,33 @@ impl IsolatedCli {
             .stderr(Stdio::null());
         command.spawn().unwrap()
     }
+}
+
+#[test]
+fn control_endpoint_is_available_while_the_initial_save_is_blocked() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let cli = IsolatedCli::new();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store =
+        SnapshotStore::for_socket(cli.data.path(), &identity.key, &StorageConfig::default());
+    let mutation_lock = store.acquire_mutation_lock().unwrap();
+    let mut daemon = cli.spawn_daemon(&server.socket);
+
+    let status = wait_for_status(&cli, &server.socket);
+    assert_eq!(status.pid, daemon.id());
+    assert!(
+        !store.has_current(),
+        "initial save completed despite the held mutation lock"
+    );
+
+    drop(mutation_lock);
+    let output = cli.run(&server.socket, "--stop", &[]);
+    assert!(output.status.success(), "stop failed: {output:?}");
+    let status = daemon.wait().unwrap();
+    assert!(status.success(), "daemon did not exit cleanly: {status}");
 }
 
 #[test]

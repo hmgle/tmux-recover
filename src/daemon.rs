@@ -35,81 +35,103 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
     let identity = socket_identity(socket)?;
     let store = SnapshotStore::for_socket(data_dir, &identity.key, &config.storage);
     let _lock = store.acquire_daemon_lock()?;
-
-    let mut client = ControlClient::connect(socket).await?;
-    let initial = capture_structure(&mut client, socket).await?;
-    let mut protected_current = match bootstrap_current_to_preserve(&store, config, &initial) {
-        Ok(snapshot_id) => snapshot_id,
-        Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "could not determine whether the current snapshot needs bootstrap protection"
-            );
-            None
-        }
-    };
-    // A failed auto-restore (bad snapshot, stale cwd, whatever) must not take
-    // the whole daemon down: the server is still there and still worth
-    // watching, so log it and fall through to the normal watch loop instead
-    // of propagating the error out of `run`.
-    match auto_restore(&mut client, socket, &store, config, &initial).await {
-        Ok(true) => {
-            protected_current = None;
-            drop(client);
-            client = ControlClient::connect(socket).await?;
-        }
-        Ok(false) => {}
-        Err(AutoRestoreError::ServerUntouched(error)) => {
-            tracing::error!(
-                error = %format!("{error:#}"),
-                "automatic restore was skipped; the server is unchanged and still being watched"
-            );
-        }
-        Err(AutoRestoreError::ServerMutated(error)) => {
-            // Do not claim the server is unchanged here: apply() may have
-            // created or killed sessions before failing, and rollback may have
-            // stopped partway. Reconnect so hooks and the next capture see
-            // whatever actually survived.
-            tracing::error!(
-                error = %format!("{error:#}"),
-                "automatic restore failed after changing the server; reconnecting and continuing to watch"
-            );
-            protected_current = None;
-            drop(client);
-            client = ControlClient::connect(socket).await?;
-        }
-    }
-
-    let mut hook_events_enabled = install_hooks_or_fallback(
-        &mut client,
-        config.autosave.hook_slot,
-        config.autosave.poll_interval,
-    )
-    .await?;
-    client.take_notifications();
-    let initial_save = save_if_changed(
-        &mut client,
-        socket,
-        &store,
-        config,
-        "daemon_start",
-        protected_current.as_deref(),
-    )
-    .await?;
-    match initial_save {
-        SaveOutcome::ProtectedBootstrap => {
-            if let Some(snapshot_id) = protected_current.as_deref() {
+    let status = DaemonStatus::running(socket);
+    let mut control = ControlServer::bind(data_dir, &identity.key, status)?;
+    let startup = async {
+        let mut client = ControlClient::connect(socket).await?;
+        let initial = capture_structure(&mut client, socket).await?;
+        let mut protected_current = match bootstrap_current_to_preserve(&store, config, &initial) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(error) => {
                 tracing::warn!(
-                    snapshot = snapshot_id,
-                    "preserving the previous current snapshot while the new server remains an unresolved bootstrap"
+                    error = %format!("{error:#}"),
+                    "could not determine whether the current snapshot needs bootstrap protection"
+                );
+                None
+            }
+        };
+        // A failed auto-restore (bad snapshot, stale cwd, whatever) must not take
+        // the whole daemon down: the server is still there and still worth
+        // watching, so log it and fall through to the normal watch loop instead
+        // of propagating the error out of `run`.
+        match auto_restore(&mut client, socket, &store, config, &initial).await {
+            Ok(true) => {
+                protected_current = None;
+                drop(client);
+                client = ControlClient::connect(socket).await?;
+            }
+            Ok(false) => {}
+            Err(AutoRestoreError::ServerUntouched(error)) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "automatic restore was skipped; the server is unchanged and still being watched"
                 );
             }
+            Err(AutoRestoreError::ServerMutated(error)) => {
+                // Do not claim the server is unchanged here: apply() may have
+                // created or killed sessions before failing, and rollback may have
+                // stopped partway. Reconnect so hooks and the next capture see
+                // whatever actually survived.
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "automatic restore failed after changing the server; reconnecting and continuing to watch"
+                );
+                protected_current = None;
+                drop(client);
+                client = ControlClient::connect(socket).await?;
+            }
         }
-        SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
+
+        let hook_events_enabled = install_hooks_or_fallback(
+            &mut client,
+            config.autosave.hook_slot,
+            config.autosave.poll_interval,
+        )
+        .await?;
+        client.take_notifications();
+        let initial_save = save_if_changed(
+            &mut client,
+            socket,
+            &store,
+            config,
+            "daemon_start",
+            protected_current.as_deref(),
+        )
+        .await?;
+        match initial_save {
+            SaveOutcome::ProtectedBootstrap => {
+                if let Some(snapshot_id) = protected_current.as_deref() {
+                    tracing::warn!(
+                        snapshot = snapshot_id,
+                        "preserving the previous current snapshot while the new server remains an unresolved bootstrap"
+                    );
+                }
+            }
+            SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
+        }
+        Ok::<_, anyhow::Error>((client, hook_events_enabled, protected_current))
+    };
+    tokio::pin!(startup);
+
+    let mut requested_exit = None;
+    let (mut client, mut hook_events_enabled, mut protected_current) = loop {
+        tokio::select! {
+            result = &mut startup => break result?,
+            request = control.next_request() => {
+                let action = request.context("daemon control server failed during startup")?;
+                let exit = match action {
+                    ControlAction::Continue => continue,
+                    ControlAction::Stop => DaemonExit::Stop,
+                    ControlAction::Reload => DaemonExit::Reload,
+                };
+                requested_exit.get_or_insert(exit);
+            }
+        }
+    };
+    if let Some(exit) = requested_exit {
+        log_exit(socket, exit);
+        return Ok(exit);
     }
-    let control = ControlServer::bind(data_dir, &identity.key)?;
-    let status = DaemonStatus::running(socket);
-    let mut control_request = control.next_request(status.clone());
     tracing::info!(socket = %socket.display(), "tmux-recover daemon is watching server");
 
     let mut poll = tokio::time::interval(config.autosave.poll_interval);
@@ -128,16 +150,15 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         tokio::pin!(timer);
 
         tokio::select! {
-            request = &mut control_request => {
+            request = control.next_request() => {
                 match request {
                     Ok(ControlAction::Continue) => {}
                     Ok(ControlAction::Stop) => break DaemonExit::Stop,
                     Ok(ControlAction::Reload) => break DaemonExit::Reload,
                     Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "daemon control request failed");
+                        return Err(error).context("daemon control server failed");
                     }
                 }
-                control_request = control.next_request(status.clone());
             }
             notification = client.next_notification() => {
                 let notification = notification?;
@@ -219,6 +240,11 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         }
     };
 
+    log_exit(socket, exit);
+    Ok(exit)
+}
+
+fn log_exit(socket: &Path, exit: DaemonExit) {
     match exit {
         DaemonExit::Stop => {
             tracing::info!(socket = %socket.display(), "tmux-recover daemon stopped");
@@ -227,7 +253,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             tracing::info!(socket = %socket.display(), "tmux-recover daemon is reloading");
         }
     }
-    Ok(exit)
 }
 
 /// Identifies a previous-generation `current` that must remain addressable if

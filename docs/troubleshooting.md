@@ -35,11 +35,11 @@ tmux-recover --data-dir /path/to/data daemon \
   --socket /tmp/tmux-1000/default --status
 ```
 
-An endpoint error usually means the socket or data directory differs, the
-watcher has not completed startup, or it predates the daemon control protocol.
-Check the exact process and running version with the service manager or TPM
-log. Do not use a broad `pkill` command when more than one socket may be
-watched.
+An endpoint error usually means the socket or data directory differs, the CLI
+and watcher have different `XDG_RUNTIME_DIR` values, or the watcher predates the
+daemon control protocol. Check the exact process, environment, and running
+version with the service manager or TPM log. Do not use a broad `pkill` command
+when more than one socket may be watched.
 
 For a legacy systemd watcher, restart its exact instance after installing the
 new binary:

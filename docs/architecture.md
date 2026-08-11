@@ -35,14 +35,17 @@ Capturing inside the lock is intentional: if an older capture waited for the
 lock after a newer save, publishing it afterwards would move `current`
 backwards even though every individual file write was atomic.
 
-After initialization, each watcher also binds a private Unix control socket
-under `/tmp/tmux-recover-<uid>/`. The directory must be owned by the current
-uid and inaccessible to group and other users. The endpoint filename hashes
-both the canonical data directory and socket identity, so two watchers for the
-same tmux server but different `--data-dir` values remain independently
-addressable. Startup holds the daemon lock before replacing a stale socket and
-refuses to remove a non-socket path. Shutdown removes only the socket inode the
-process originally bound.
+After taking its daemon lock, each watcher binds a private Unix control socket
+under `$XDG_RUNTIME_DIR/tmux-recover/`, falling back to
+`/tmp/tmux-recover-<uid>/` when `XDG_RUNTIME_DIR` is unset. The directory must
+be owned by the current uid and inaccessible to group and other users. The
+endpoint filename hashes both the canonical data directory and socket identity,
+so two watchers for the same tmux server but different `--data-dir` values
+remain independently addressable. Startup holds the daemon lock before
+replacing a stale socket and refuses to remove a non-socket path. Shutdown
+removes only the socket inode the process originally bound.
+Equivalent symlink spellings of one data directory still open the same lock
+inode, so the second watcher fails before it can replace the control socket.
 
 The versioned JSON control protocol supports status, stop, and reload. Status
 reports the PID, tool version, startup time, and encoded tmux socket path. Stop
@@ -53,7 +56,10 @@ and supervisor ownership while loading the binary now present on disk and
 parsing configuration again. The client waits for a different startup time and
 requires the new watcher to report the same version as the controlling binary.
 Control commands locate the endpoint without loading `config.toml`, so a
-malformed configuration cannot prevent status or a clean stop.
+malformed configuration cannot prevent status or a clean stop. The listener
+serves connections concurrently and is available during automatic restore and
+the initial save. Stop or reload requested during that phase is acknowledged,
+then applied after the startup transaction finishes.
 
 TPM startup first runs an `--if-empty` capture synchronously under that same
 mutation lock. It creates the first recovery point only when neither a current
