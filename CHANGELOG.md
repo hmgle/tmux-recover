@@ -24,6 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   path, and leaves structural snapshots unaffected.
 - Keep daemon control commands independent of configuration parsing so a bad
   configuration cannot prevent status or a clean stop.
+- Retry a daemon control accept that fails on descriptor or memory exhaustion
+  instead of ending the watcher, retry an interrupted one immediately, and keep
+  reporting any other accept failure.
 
 ## [0.2.0] - 2026-08-10
 

@@ -13,6 +13,8 @@ use crate::{model::EncodedPath, util::uid};
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: u64 = 4_096;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
+const ACCEPT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,23 +193,54 @@ mod platform {
     ) {
         let mut requests = JoinSet::new();
         let lifecycle = Arc::new(Mutex::new(None));
+        let mut backoff = ACCEPT_RETRY_MIN_BACKOFF;
+        let mut retry_at: Option<tokio::time::Instant> = None;
         loop {
+            // Backing off belongs in its own branch rather than a sleep inside
+            // the accept arm: an acknowledged stop or reload is delivered from
+            // the request branch, and sleeping in place would hold it back for
+            // the length of the delay.
+            let retry_deadline = retry_at
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+            let retry = tokio::time::sleep_until(retry_deadline);
+            tokio::pin!(retry);
+
             tokio::select! {
-                accepted = listener.accept() => {
+                () = &mut retry, if retry_at.is_some() => retry_at = None,
+                accepted = listener.accept(), if retry_at.is_none() => {
                     match accepted {
                         Ok((stream, _)) => {
+                            backoff = ACCEPT_RETRY_MIN_BACKOFF;
                             requests.spawn(handle_request(
                                 stream,
                                 status.clone(),
                                 Arc::clone(&lifecycle),
                             ));
                         }
-                        Err(error) => {
-                            let _ = actions.send(
-                                Err(error).context("failed to accept a daemon control request")
-                            );
-                            return;
-                        }
+                        Err(error) => match accept_recovery(&error) {
+                            AcceptRecovery::Retry => {
+                                tracing::debug!(
+                                    error = %error,
+                                    "retrying an interrupted daemon control accept"
+                                );
+                            }
+                            AcceptRecovery::Backoff => {
+                                tracing::warn!(
+                                    error = %error,
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "failed to accept a daemon control request; retrying later"
+                                );
+                                retry_at = Some(tokio::time::Instant::now() + backoff);
+                                backoff = (backoff * 2).min(ACCEPT_RETRY_MAX_BACKOFF);
+                            }
+                            AcceptRecovery::Report => {
+                                let _ = actions.send(
+                                    Err(error)
+                                        .context("failed to accept a daemon control request")
+                                );
+                                return;
+                            }
+                        },
                     }
                 }
                 request = requests.join_next(), if !requests.is_empty() => {
@@ -389,6 +422,32 @@ mod platform {
                 )
             })
         })
+    }
+
+    /// How a failed accept should be handled. The control endpoint is a
+    /// convenience and saving snapshots is the job, so only a listener that has
+    /// stopped working is worth ending the watcher for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AcceptRecovery {
+        /// The pending connection went away, or a signal interrupted the call.
+        /// The listener is fine, so the next accept must not be delayed.
+        Retry,
+        /// Descriptor or memory exhaustion, which clears on its own. Waiting
+        /// for it to pass beats spinning on a call that cannot succeed yet.
+        Backoff,
+        /// Anything else describes a listener that has stopped working, which
+        /// leaves the daemon running without a reachable control endpoint.
+        Report,
+    }
+
+    pub(super) fn accept_recovery(error: &std::io::Error) -> AcceptRecovery {
+        match error.raw_os_error() {
+            Some(libc::ECONNABORTED | libc::EINTR) => AcceptRecovery::Retry,
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                AcceptRecovery::Backoff
+            }
+            _ => AcceptRecovery::Report,
+        }
     }
 
     async fn read_message<T>(stream: &mut UnixStream) -> Result<T>
@@ -636,6 +695,42 @@ mod tests {
         assert!(!is_daemon_unavailable(&anyhow::anyhow!(
             "protocol mismatch"
         )));
+    }
+
+    #[test]
+    fn accept_failures_are_classified_by_what_they_describe() {
+        use platform::{AcceptRecovery, accept_recovery};
+
+        for interrupted in [libc::ECONNABORTED, libc::EINTR] {
+            let error = std::io::Error::from_raw_os_error(interrupted);
+            assert_eq!(
+                accept_recovery(&error),
+                AcceptRecovery::Retry,
+                "{interrupted} leaves the listener usable: {error}"
+            );
+        }
+        for shortage in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let error = std::io::Error::from_raw_os_error(shortage);
+            assert_eq!(
+                accept_recovery(&error),
+                AcceptRecovery::Backoff,
+                "{shortage} is a resource shortage: {error}"
+            );
+        }
+        // EPERM is a policy denial rather than a shortage, so it is reported
+        // instead of being retried forever under a misleading description.
+        for reported in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EPERM] {
+            let error = std::io::Error::from_raw_os_error(reported);
+            assert_eq!(
+                accept_recovery(&error),
+                AcceptRecovery::Report,
+                "{reported} describes a listener that stopped working: {error}"
+            );
+        }
+        assert_eq!(
+            accept_recovery(&std::io::Error::other("not an errno")),
+            AcceptRecovery::Report
+        );
     }
 
     #[test]

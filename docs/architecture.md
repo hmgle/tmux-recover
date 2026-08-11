@@ -61,6 +61,15 @@ serves connections concurrently and is available during automatic restore and
 the initial save. Stop or reload requested during that phase is acknowledged,
 then applied after the startup transaction finishes.
 
+An accept failure that reports descriptor or memory exhaustion is retried after
+an exponential backoff instead of ending the watcher: continuing to save
+snapshots matters more than reaching the control endpoint. An interrupted or
+aborted accept leaves the listener usable and is retried immediately. The delay
+is its own branch of the accept loop, so backing off never holds back an
+acknowledged stop or reload. Any other accept failure, including a policy denial
+that would not clear, describes a listener that has stopped working, so it is
+reported and the daemon exits for its supervisor to restart.
+
 TPM startup first runs an `--if-empty` capture synchronously under that same
 mutation lock. It creates the first recovery point only when neither a current
 pointer nor any snapshot body exists. Existing history makes it a read-only
