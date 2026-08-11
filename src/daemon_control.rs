@@ -15,6 +15,8 @@ const MAX_MESSAGE_BYTES: u64 = 4_096;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
 const ACCEPT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const REBIND_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
+const REBIND_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,10 +135,25 @@ mod platform {
 
     use super::*;
 
-    pub(crate) struct ControlServer {
+    struct ControlInstance {
         actions: UnboundedReceiver<Result<ControlAction>>,
         task: JoinHandle<()>,
         _socket: SocketGuard,
+    }
+
+    impl Drop for ControlInstance {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    pub(crate) struct ControlServer {
+        data_dir: PathBuf,
+        socket_key: String,
+        status: DaemonStatus,
+        instance: Option<ControlInstance>,
+        retry_at: Option<tokio::time::Instant>,
+        backoff: Duration,
     }
 
     impl ControlServer {
@@ -145,45 +162,108 @@ mod platform {
             socket_key: &str,
             status: DaemonStatus,
         ) -> Result<Self> {
-            let path = control_path(data_dir, socket_key)?;
-            ensure_runtime_directory(
-                path.parent()
-                    .context("daemon control socket has no parent directory")?,
-            )?;
-            remove_stale_socket(&path)?;
-
-            let listener = UnixListener::bind(&path).with_context(|| {
-                format!("failed to bind daemon control socket {}", path.display())
-            })?;
-            let metadata = fs::symlink_metadata(&path).with_context(|| {
-                format!("failed to inspect daemon control socket {}", path.display())
-            })?;
-            let guard = SocketGuard {
-                path,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            };
-            let (action_sender, actions) = mpsc::unbounded_channel();
-            let task = tokio::spawn(serve(listener, status, action_sender));
+            let instance = bind_instance(data_dir, socket_key, status.clone())?;
             Ok(Self {
-                actions,
-                task,
-                _socket: guard,
+                data_dir: data_dir.to_path_buf(),
+                socket_key: socket_key.to_owned(),
+                status,
+                instance: Some(instance),
+                retry_at: None,
+                backoff: REBIND_RETRY_MIN_BACKOFF,
             })
         }
 
-        pub(crate) async fn next_request(&mut self) -> Result<ControlAction> {
-            self.actions
-                .recv()
-                .await
-                .context("daemon control server stopped unexpectedly")?
+        /// Waits for a lifecycle action while keeping the auxiliary control
+        /// plane self-healing. A broken endpoint must never cancel startup or
+        /// stop the daemon's primary snapshot work.
+        pub(crate) async fn next_request(&mut self) -> ControlAction {
+            loop {
+                if let Some(instance) = self.instance.as_mut() {
+                    let event = instance.actions.recv().await;
+                    match event {
+                        Some(Ok(action)) => return action,
+                        Some(Err(error)) => self.record_failure(error),
+                        None => self.record_failure(anyhow::anyhow!(
+                            "daemon control request task stopped unexpectedly"
+                        )),
+                    }
+                    continue;
+                }
+
+                let retry_at = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
+                tokio::time::sleep_until(retry_at).await;
+                match bind_instance(&self.data_dir, &self.socket_key, self.status.clone()) {
+                    Ok(instance) => {
+                        self.instance = Some(instance);
+                        self.retry_at = None;
+                        self.backoff = REBIND_RETRY_MIN_BACKOFF;
+                        tracing::info!("restored the daemon control endpoint");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            backoff_ms = self.backoff.as_millis() as u64,
+                            "failed to restore the daemon control endpoint; retrying"
+                        );
+                        self.schedule_retry();
+                    }
+                }
+            }
+        }
+
+        fn record_failure(&mut self, error: anyhow::Error) {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "daemon control endpoint failed; snapshot watching continues"
+            );
+            self.instance = None;
+            self.schedule_retry();
+        }
+
+        fn schedule_retry(&mut self) {
+            self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
+            self.backoff = (self.backoff * 2).min(REBIND_RETRY_MAX_BACKOFF);
+        }
+
+        #[cfg(test)]
+        pub(super) fn abort_for_test(&mut self) {
+            self.instance
+                .as_mut()
+                .expect("control server has no active instance")
+                .task
+                .abort();
         }
     }
 
-    impl Drop for ControlServer {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
+    fn bind_instance(
+        data_dir: &Path,
+        socket_key: &str,
+        status: DaemonStatus,
+    ) -> Result<ControlInstance> {
+        let path = control_path(data_dir, socket_key)?;
+        ensure_runtime_directory(
+            path.parent()
+                .context("daemon control socket has no parent directory")?,
+        )?;
+        remove_stale_socket(&path)?;
+
+        let listener = UnixListener::bind(&path)
+            .with_context(|| format!("failed to bind daemon control socket {}", path.display()))?;
+        let metadata = fs::symlink_metadata(&path).with_context(|| {
+            format!("failed to inspect daemon control socket {}", path.display())
+        })?;
+        let guard = SocketGuard {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let (action_sender, actions) = mpsc::unbounded_channel();
+        let task = tokio::spawn(serve(listener, status, action_sender));
+        Ok(ControlInstance {
+            actions,
+            task,
+            _socket: guard,
+        })
     }
 
     async fn serve(
@@ -206,6 +286,30 @@ mod platform {
             tokio::pin!(retry);
 
             tokio::select! {
+                biased;
+                request = requests.join_next(), if !requests.is_empty() => {
+                    match request {
+                        Some(Ok(Ok(ControlAction::Continue))) => {}
+                        Some(Ok(Ok(action))) => {
+                            if actions.send(Ok(action)).is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(Err(error))) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "daemon control request failed"
+                            );
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                error = %error,
+                                "daemon control request task failed"
+                            );
+                        }
+                        None => {}
+                    }
+                }
                 () = &mut retry, if retry_at.is_some() => retry_at = None,
                 accepted = listener.accept(), if retry_at.is_none() => {
                     match accepted {
@@ -241,29 +345,6 @@ mod platform {
                                 return;
                             }
                         },
-                    }
-                }
-                request = requests.join_next(), if !requests.is_empty() => {
-                    match request {
-                        Some(Ok(Ok(ControlAction::Continue))) => {}
-                        Some(Ok(Ok(action))) => {
-                            if actions.send(Ok(action)).is_err() {
-                                return;
-                            }
-                        }
-                        Some(Ok(Err(error))) => {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "daemon control request failed"
-                            );
-                        }
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                error = %error,
-                                "daemon control request task failed"
-                            );
-                        }
-                        None => {}
                     }
                 }
             }
@@ -571,8 +652,8 @@ mod platform {
             bail!("daemon control is only supported on Unix")
         }
 
-        pub(crate) async fn next_request(&mut self) -> Result<ControlAction> {
-            bail!("daemon control is only supported on Unix")
+        pub(crate) async fn next_request(&mut self) -> ControlAction {
+            std::future::pending().await
         }
     }
 
@@ -694,7 +775,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("stop already requested"));
-        assert_eq!(server.next_request().await.unwrap(), ControlAction::Stop);
+        assert_eq!(server.next_request().await, ControlAction::Stop);
+    }
+
+    #[tokio::test]
+    async fn a_failed_control_task_rebinds_without_ending_the_action_wait() {
+        let data = tempfile::tempdir().unwrap();
+        let socket = data.path().join("tmux.sock");
+        let expected = status(&socket);
+        let mut server = ControlServer::bind(data.path(), "socket-key", expected.clone()).unwrap();
+        server.abort_for_test();
+        let action = tokio::spawn(async move { server.next_request().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(Some(actual)) =
+                request(data.path(), "socket-key", ControlRequest::Status).await
+            {
+                assert_eq!(actual, expected);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control endpoint was not rebound"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        request(data.path(), "socket-key", ControlRequest::Stop)
+            .await
+            .unwrap();
+        assert_eq!(action.await.unwrap(), ControlAction::Stop);
     }
 
     #[tokio::test]

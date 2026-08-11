@@ -25,8 +25,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Keep daemon control commands independent of configuration parsing so a bad
   configuration cannot prevent status or a clean stop.
 - Retry a daemon control accept that fails on descriptor or memory exhaustion
-  instead of ending the watcher, retry an interrupted one immediately, and keep
-  reporting any other accept failure.
+  instead of ending the watcher, retry an interrupted one immediately, and
+  rebuild a failed control endpoint without cancelling startup or autosave.
 - Report a clean stop when the daemon closes an in-flight control request while
   exiting, whether it sent nothing or only part of a response, and keep stop and
   reload waiting while the daemon is still finishing the startup transaction

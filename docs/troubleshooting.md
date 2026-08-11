@@ -41,6 +41,10 @@ daemon control protocol. Check the exact process, environment, and running
 version with the service manager or TPM log. Do not use a broad `pkill` command
 when more than one socket may be watched.
 
+If the log reports a failed control endpoint, snapshot watching continues while
+the daemon retries a private endpoint rebind. Fix a persistent runtime-directory
+or policy error; no daemon restart is required once binding can succeed again.
+
 For a legacy systemd watcher, restart its exact instance after installing the
 new binary:
 

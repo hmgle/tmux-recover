@@ -78,8 +78,10 @@ snapshots matters more than reaching the control endpoint. An interrupted or
 aborted accept leaves the listener usable and is retried immediately. The delay
 is its own branch of the accept loop, so backing off never holds back an
 acknowledged stop or reload. Any other accept failure, including a policy denial
-that would not clear, describes a listener that has stopped working, so it is
-reported and the daemon exits for its supervisor to restart.
+that would not clear, drops the failed listener and schedules a complete endpoint
+rebind with its own exponential backoff. Control failures are logged, but they
+never cancel the startup transaction or stop snapshot watching; this preserves
+the data plane even for a detached TPM watcher without a process supervisor.
 
 TPM startup first runs an `--if-empty` capture synchronously under that same
 mutation lock. It creates the first recovery point only when neither a current

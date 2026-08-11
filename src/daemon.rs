@@ -118,8 +118,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         tokio::select! {
             result = &mut startup => break result?,
             request = control.next_request() => {
-                let action = request.context("daemon control server failed during startup")?;
-                let exit = match action {
+                let exit = match request {
                     ControlAction::Continue => continue,
                     ControlAction::Stop => DaemonExit::Stop,
                     ControlAction::Reload => DaemonExit::Reload,
@@ -152,12 +151,9 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         tokio::select! {
             request = control.next_request() => {
                 match request {
-                    Ok(ControlAction::Continue) => {}
-                    Ok(ControlAction::Stop) => break DaemonExit::Stop,
-                    Ok(ControlAction::Reload) => break DaemonExit::Reload,
-                    Err(error) => {
-                        return Err(error).context("daemon control server failed");
-                    }
+                    ControlAction::Continue => {}
+                    ControlAction::Stop => break DaemonExit::Stop,
+                    ControlAction::Reload => break DaemonExit::Reload,
                 }
             }
             notification = client.next_notification() => {
