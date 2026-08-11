@@ -1663,9 +1663,17 @@ async fn switch_client_if_present(
     let Err(error) = execute_empty(client, &command).await else {
         return Ok(true);
     };
-    let attached = list_clients(client)
-        .await
-        .with_context(|| format!("failed to inventory clients after {operation}"))?;
+    let attached = match list_clients(client).await {
+        Ok(attached) => attached,
+        Err(inventory_error) => {
+            return Err(client_switch_inventory_error(
+                error,
+                inventory_error,
+                &target.name,
+                operation,
+            ));
+        }
+    };
     if ordinary_client_is_attached(&attached, &target.name) {
         return Err(error).with_context(|| {
             format!(
@@ -1679,6 +1687,17 @@ async fn switch_client_if_present(
         target.name
     ));
     Ok(false)
+}
+
+fn client_switch_inventory_error(
+    switch_error: anyhow::Error,
+    inventory_error: anyhow::Error,
+    client_name: &str,
+    operation: &str,
+) -> anyhow::Error {
+    switch_error.context(format!(
+        "failed to switch ordinary client {client_name} while {operation}; subsequent client inventory also failed: {inventory_error:#}"
+    ))
 }
 
 fn ordinary_client_is_attached(clients: &[ClientAttachment], name: &str) -> bool {
@@ -2365,5 +2384,19 @@ mod tests {
         let target = bootstrap_target(cwd);
         let error = preflight(&snapshot, &target, &options(&[], None)).unwrap_err();
         assert!(format!("{error:#}").contains("cannot currently be restored"));
+    }
+
+    #[test]
+    fn client_switch_and_inventory_errors_are_both_reported() {
+        let error = client_switch_inventory_error(
+            anyhow::anyhow!("switch failed"),
+            anyhow::anyhow!("inventory failed"),
+            "/dev/pts/7",
+            "restoring its current session",
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("switch failed"), "{message}");
+        assert!(message.contains("inventory failed"), "{message}");
+        assert!(message.contains("/dev/pts/7"), "{message}");
     }
 }
