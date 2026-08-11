@@ -30,7 +30,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Report a clean stop when the daemon closes an in-flight control request while
   exiting, whether it sent nothing or only part of a response, and keep stop and
   reload waiting while the daemon is still finishing the startup transaction
-  that both are applied after.
+  that both are applied after. Lifecycle polls use their own deadline instead of
+  ending early at the ordinary one-shot request timeout.
 
 ## [0.2.0] - 2026-08-10
 

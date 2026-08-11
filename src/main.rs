@@ -12,7 +12,7 @@ use tmux_recover::{
     daemon::DaemonExit,
     daemon_control::{
         ControlRequest, DaemonStatus, is_connection_closed, is_daemon_unavailable,
-        request as daemon_request,
+        request as daemon_request, status_until as daemon_status_until,
     },
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
@@ -320,23 +320,15 @@ async fn wait_for_daemon_stop(data_dir: &Path, socket_key: &str) -> Result<()> {
     let started = tokio::time::Instant::now();
     let mut last_seen_running = started;
     loop {
-        // Bound the request by the deadline it is racing. `daemon_request` has
-        // its own ten second timeout, so an unbounded call could otherwise
-        // overshoot the deadline it is about to be checked against.
         let deadline = lifecycle_deadline(started, last_seen_running);
-        match tokio::time::timeout_at(
-            deadline,
-            daemon_request(data_dir, socket_key, ControlRequest::Status),
-        )
-        .await
-        {
-            Ok(Ok(_)) => last_seen_running = tokio::time::Instant::now(),
-            Ok(Err(error)) if is_daemon_unavailable(&error) => return Ok(()),
-            Ok(Err(error)) if is_connection_closed(&error) => {}
-            Ok(Err(error)) => {
+        match daemon_status_until(data_dir, socket_key, deadline).await {
+            Ok(Some(_)) => last_seen_running = tokio::time::Instant::now(),
+            Ok(None) => {}
+            Err(error) if is_daemon_unavailable(&error) => return Ok(()),
+            Err(error) if is_connection_closed(&error) => {}
+            Err(error) => {
                 return Err(error).context("failed to confirm that the daemon stopped");
             }
-            Err(_elapsed) => {}
         }
         let now = tokio::time::Instant::now();
         if now.duration_since(last_seen_running) >= DAEMON_LIFECYCLE_TIMEOUT {
@@ -380,13 +372,8 @@ async fn wait_for_daemon_reload(
     let mut last_seen_running = started;
     loop {
         let deadline = lifecycle_deadline(started, last_seen_running);
-        match tokio::time::timeout_at(
-            deadline,
-            daemon_request(data_dir, socket_key, ControlRequest::Status),
-        )
-        .await
-        {
-            Ok(Ok(Some(status))) if status.started_at != previous.started_at => {
+        match daemon_status_until(data_dir, socket_key, deadline).await {
+            Ok(Some(status)) if status.started_at != previous.started_at => {
                 if status.version != tmux_recover::VERSION {
                     anyhow::bail!(
                         "daemon reloaded as version {}, but the controlling binary is version {}",
@@ -396,12 +383,12 @@ async fn wait_for_daemon_reload(
                 }
                 return Ok(status);
             }
-            Ok(Ok(_)) => last_seen_running = tokio::time::Instant::now(),
-            Ok(Err(error)) if is_daemon_unavailable(&error) || is_connection_closed(&error) => {}
-            Ok(Err(error)) => {
+            Ok(Some(_)) => last_seen_running = tokio::time::Instant::now(),
+            Ok(None) => {}
+            Err(error) if is_daemon_unavailable(&error) || is_connection_closed(&error) => {}
+            Err(error) => {
                 return Err(error).context("failed to confirm that the daemon reloaded");
             }
-            Err(_elapsed) => {}
         }
         let now = tokio::time::Instant::now();
         if now.duration_since(last_seen_running) >= DAEMON_LIFECYCLE_TIMEOUT {

@@ -64,7 +64,8 @@ can wait on the mutation lock, a stop or reload client treats the original
 generation still answering as progress: silence from every generation is bounded
 by a short deadline measured from the last answer, while a daemon that keeps
 answering is bounded by a longer overall one. Each poll is capped by whichever
-deadline it is racing, so the reported wait is the wait that elapsed.
+deadline it is racing rather than the ordinary one-shot request timeout, so the
+reported wait is the wait that elapsed.
 
 Responses are newline-terminated frames. A frame that arrives without its
 terminator was cut short by a peer that went away mid-write, so it is raised as

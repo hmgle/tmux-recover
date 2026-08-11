@@ -385,6 +385,33 @@ mod platform {
                     path.display()
                 )
             })??;
+        validate_response(response, action)
+    }
+
+    /// Polls status until the caller's lifecycle deadline. Unlike `request`,
+    /// this does not layer the ordinary one-shot timeout inside that deadline.
+    pub async fn status_until(
+        data_dir: &Path,
+        socket_key: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<DaemonStatus>> {
+        let path = control_path(data_dir, socket_key)?;
+        let response = match tokio::time::timeout_at(
+            deadline,
+            exchange(&path, ControlRequest::Status),
+        )
+        .await
+        {
+            Ok(response) => response?,
+            Err(_) => return Ok(None),
+        };
+        validate_response(response, ControlRequest::Status)
+    }
+
+    fn validate_response(
+        response: WireResponse,
+        action: ControlRequest,
+    ) -> Result<Option<DaemonStatus>> {
         if response.protocol_version != PROTOCOL_VERSION {
             bail!(
                 "daemon control protocol {} is incompatible with client protocol {}",
@@ -665,13 +692,21 @@ mod platform {
         bail!("daemon control is only supported on Unix")
     }
 
+    pub async fn status_until(
+        _data_dir: &Path,
+        _socket_key: &str,
+        _deadline: tokio::time::Instant,
+    ) -> Result<Option<DaemonStatus>> {
+        bail!("daemon control is only supported on Unix")
+    }
+
     pub fn is_daemon_unavailable(_error: &anyhow::Error) -> bool {
         false
     }
 }
 
 pub(crate) use platform::ControlServer;
-pub use platform::{is_daemon_unavailable, request};
+pub use platform::{is_daemon_unavailable, request, status_until};
 
 /// Reports whether a control request failed because the peer went away partway
 /// through it. A daemon that is shutting down closes accepted connections, so
@@ -826,6 +861,37 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_status_poll_honors_its_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let path = control_path(data.path(), "socket-key").unwrap();
+        platform::ensure_runtime_directory(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let holding = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let result = status_until(
+            data.path(),
+            "socket-key",
+            started + Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        holding.abort();
+        let _ = holding.await;
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(result, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "lifecycle status poll used the ordinary request timeout"
+        );
     }
 
     #[tokio::test]
