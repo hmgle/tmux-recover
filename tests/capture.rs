@@ -1,18 +1,20 @@
 use std::{
     fs::File,
-    io::Read,
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     time::Duration,
 };
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
 use tmux_recover::tmux::{
     capture::{capture, capture_structure},
     control::ControlClient,
 };
+
+mod support;
+
+use support::PtyDrain;
 
 struct TestServer {
     directory: TempDir,
@@ -62,7 +64,7 @@ impl Drop for TestServer {
 
 struct AttachedClient {
     child: Child,
-    _master: File,
+    drain: PtyDrain,
     name: String,
 }
 
@@ -79,7 +81,6 @@ impl AttachedClient {
         )
         .unwrap();
         let master = File::from(pty.master);
-        fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
         let slave = File::from(pty.slave);
         let mut command = server.tmux();
         command
@@ -105,11 +106,13 @@ impl AttachedClient {
             });
         }
         let mut child = command.spawn().unwrap();
+        drop(command);
+        let mut drain = PtyDrain::start(master);
         let mut name = None;
         for _ in 0..100 {
             if let Some(status) = child.try_wait().unwrap() {
-                let mut output = String::new();
-                let _ = master.try_clone().unwrap().read_to_string(&mut output);
+                drain.join();
+                let output = drain.output();
                 panic!("ordinary tmux client exited before attaching: {status}: {output:?}");
             }
             let output = command_output(server.tmux().args([
@@ -127,12 +130,16 @@ impl AttachedClient {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let name = name.expect("ordinary tmux client did not attach to the isolated server");
-        Self {
-            child,
-            _master: master,
-            name,
-        }
+        let name = name.unwrap_or_else(|| {
+            let _ = child.kill();
+            let _ = child.wait();
+            drain.join();
+            panic!(
+                "ordinary tmux client did not attach to the isolated server: {:?}",
+                drain.output()
+            );
+        });
+        Self { child, drain, name }
     }
 }
 
@@ -140,6 +147,7 @@ impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.drain.join();
     }
 }
 

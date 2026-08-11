@@ -1,15 +1,12 @@
 use std::{
     fs::File,
-    io::Read,
+    io::Write,
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     time::Duration,
 };
 
-use nix::{
-    fcntl::{FcntlArg, OFlag, fcntl},
-    pty::{Winsize, openpty},
-};
+use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
 use tmux_recover::{
     config::{RestoreConfig, StorageConfig},
@@ -19,6 +16,10 @@ use tmux_recover::{
     tmux::{capture::capture, control::ControlClient},
     util::socket_identity,
 };
+
+mod support;
+
+use support::PtyDrain;
 
 struct TestServer {
     directory: TempDir,
@@ -67,7 +68,7 @@ impl Drop for TestServer {
 
 struct AttachedClient {
     child: Child,
-    _master: File,
+    drain: PtyDrain,
     name: String,
 }
 
@@ -84,7 +85,6 @@ impl AttachedClient {
         )
         .unwrap();
         let master = File::from(pty.master);
-        fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
         let slave = File::from(pty.slave);
         let mut command = server.tmux();
         command
@@ -107,10 +107,16 @@ impl AttachedClient {
             });
         }
         let mut child = command.spawn().unwrap();
+        drop(command);
+        let mut drain = PtyDrain::start(master);
         let mut name = None;
         for _ in 0..100 {
             if let Some(status) = child.try_wait().unwrap() {
-                panic!("ordinary tmux client exited before attaching: {status}");
+                drain.join();
+                panic!(
+                    "ordinary tmux client exited before attaching: {status}: {:?}",
+                    drain.output()
+                );
             }
             let clients = output(server.tmux().args([
                 "list-clients",
@@ -127,11 +133,16 @@ impl AttachedClient {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self {
-            child,
-            _master: master,
-            name: name.expect("ordinary tmux client did not attach to the isolated server"),
-        }
+        let name = name.unwrap_or_else(|| {
+            let _ = child.kill();
+            let _ = child.wait();
+            drain.join();
+            panic!(
+                "ordinary tmux client did not attach to the isolated server: {:?}",
+                drain.output()
+            );
+        });
+        Self { child, drain, name }
     }
 }
 
@@ -139,6 +150,7 @@ impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.drain.join();
     }
 }
 
@@ -267,7 +279,7 @@ fn dry_run_warns_before_a_foreground_restore_can_prompt() {
         command
     };
 
-    let (dry_run_succeeded, dry_run_output) = run_on_pty(restore_command(true));
+    let (dry_run_succeeded, dry_run_output) = run_on_pty(restore_command(true), b"");
     assert!(dry_run_succeeded, "{dry_run_output}");
     assert!(
         dry_run_output.contains("warning:")
@@ -275,7 +287,7 @@ fn dry_run_warns_before_a_foreground_restore_can_prompt() {
         "dry-run did not expose the foreground restore warning: {dry_run_output}"
     );
 
-    let (restore_succeeded, restore_output) = run_on_pty(restore_command(false));
+    let (restore_succeeded, restore_output) = run_on_pty(restore_command(false), b"n\n");
     assert!(!restore_succeeded, "{restore_output}");
     assert!(
         restore_output.contains("real restore would destroy its calling pane"),
@@ -997,7 +1009,21 @@ fn success(command: &mut Command) {
     );
 }
 
-fn run_on_pty(mut command: Command) -> (bool, String) {
+#[test]
+fn run_on_pty_drains_large_output_while_child_runs() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "i=0; while [ \"$i\" -lt 4096 ]; do printf 0123456789abcdef; i=$((i + 1)); done",
+    ]);
+
+    let (succeeded, output) = run_on_pty(command, b"");
+
+    assert!(succeeded);
+    assert_eq!(output.len(), 65_536);
+}
+
+fn run_on_pty(mut command: Command, input: &[u8]) -> (bool, String) {
     let pty = openpty(
         Some(&Winsize {
             ws_row: 24,
@@ -1008,33 +1034,24 @@ fn run_on_pty(mut command: Command) -> (bool, String) {
         None,
     )
     .unwrap();
-    let mut master = File::from(pty.master);
+    let master = File::from(pty.master);
+    let mut writer = master.try_clone().unwrap();
     let slave = File::from(pty.slave);
     command
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
-    let status = command.status().unwrap();
-    fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match master.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => output.extend_from_slice(&buffer[..count]),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(nix::libc::EIO) =>
-            {
-                break;
-            }
-            Err(error) => panic!("failed to read command PTY: {error}"),
-        }
+    let mut child = command.spawn().unwrap();
+    drop(command);
+    let mut drain = PtyDrain::start(master);
+    if !input.is_empty() {
+        writer.write_all(input).unwrap();
+        writer.flush().unwrap();
     }
-    (
-        status.success(),
-        String::from_utf8_lossy(&output).into_owned(),
-    )
+    drop(writer);
+    let status = child.wait().unwrap();
+    drain.join();
+    (status.success(), drain.output())
 }
 
 fn cwd(pane: &tmux_recover::model::Pane) -> std::path::PathBuf {
