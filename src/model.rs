@@ -301,6 +301,15 @@ impl TmuxState {
     }
 
     fn structural_view(&self) -> StructuralState<'_> {
+        let client_state = self.client_state.as_ref().map(|state| {
+            let mut attachments: Vec<_> = state.attachments.iter().collect();
+            attachments.sort_by(|left, right| {
+                left.session_id
+                    .cmp(&right.session_id)
+                    .then_with(|| left.last_session_id.cmp(&right.last_session_id))
+            });
+            StructuralClientState { attachments }
+        });
         StructuralState {
             sessions: self
                 .sessions
@@ -340,7 +349,7 @@ impl TmuxState {
                         .collect(),
                 })
                 .collect(),
-            client_state: self.client_state.as_ref(),
+            client_state,
         }
     }
 
@@ -510,7 +519,12 @@ struct StructuralState<'a> {
     sessions: Vec<StructuralSession<'a>>,
     windows: Vec<StructuralWindow<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    client_state: Option<&'a ClientState>,
+    client_state: Option<StructuralClientState<'a>>,
+}
+
+#[derive(Serialize)]
+struct StructuralClientState<'a> {
+    attachments: Vec<&'a ClientSessionState>,
 }
 
 #[derive(Serialize)]
@@ -904,6 +918,46 @@ mod tests {
         state.validate().unwrap();
         assert_ne!(state.semantic_hash().unwrap(), old_semantic_hash);
         assert_ne!(state.structural_hash().unwrap(), old_structural_hash);
+    }
+
+    #[test]
+    fn client_activity_order_does_not_change_the_structural_hash() {
+        let session = |id: &str, name: &str| Session {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            group: None,
+            created_at: None,
+            active_window_id: None,
+            last_window_id: None,
+            windows: vec![],
+        };
+        let mut state = TmuxState {
+            sessions: vec![session("$0", "first"), session("$1", "second")],
+            windows: vec![],
+            client_state: Some(ClientState {
+                attachments: vec![
+                    ClientSessionState {
+                        session_id: "$1".to_owned(),
+                        last_session_id: Some("$0".to_owned()),
+                    },
+                    ClientSessionState {
+                        session_id: "$0".to_owned(),
+                        last_session_id: None,
+                    },
+                ],
+            }),
+        };
+        state.validate().unwrap();
+        let semantic_hash = state.semantic_hash().unwrap();
+        let structural_hash = state.structural_hash().unwrap();
+
+        state.client_state.as_mut().unwrap().attachments.reverse();
+        assert_ne!(state.semantic_hash().unwrap(), semantic_hash);
+        assert_eq!(state.structural_hash().unwrap(), structural_hash);
+
+        state.client_state.as_mut().unwrap().attachments[0].last_session_id = Some("$1".to_owned());
+        state.validate().unwrap();
+        assert_ne!(state.structural_hash().unwrap(), structural_hash);
     }
 
     #[test]

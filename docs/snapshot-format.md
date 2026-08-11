@@ -20,6 +20,9 @@ client names, PIDs, and TTYs. It is absent when no ordinary terminal client was
 attached and when reading snapshots written before this field existed. Keeping
 it optional preserves schema 1 compatibility and the hashes of old snapshots.
 Each referenced current or last session must exist in the same snapshot.
+The semantic hash preserves this recent-activity order. The structural hash
+used for autosave dedup sorts attachments by current and last session IDs, so
+activity-only reordering does not create a new history entry.
 
 The snapshot id is not an arbitrary label. Validation recomputes it from the
 UTC creation timestamp in `%Y%m%dT%H%M%S%.6fZ` format (microsecond precision)

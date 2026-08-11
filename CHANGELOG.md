@@ -45,6 +45,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Keep a completed restore live when an ordinary terminal detaches during
   client switching, and report the vanished client as a warning instead of a
   failed or incomplete rollback.
+- Canonicalize ordinary-client attachments in the structural hash so switching
+  activity between terminals does not create redundant autosave history.
 
 ## [0.2.0] - 2026-08-10
 

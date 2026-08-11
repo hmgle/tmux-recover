@@ -125,6 +125,15 @@ cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
 current snapshot, so an idle server does not produce a new snapshot on every
 poll or scan `/proc` on every poll.
 
+The full snapshot keeps ordinary-client attachments in recent-activity order
+for best-effort pairing after a restart. The structural projection sorts those
+attachments by current and last session IDs before hashing. Alternating input
+between two terminals therefore does not create history by itself, while an
+attach, detach, or changed session selection still changes the projection.
+Because an unchanged projection is not committed, recent-activity order is
+refreshed in durable history only alongside a real client-session or structural
+change.
+
 Retention independently cross-checks each history filename against the ID in
 its snapshot body. A store shared by the daemon and its clones caches that body
 ID behind a metadata fingerprint (size and modification time, plus device,
