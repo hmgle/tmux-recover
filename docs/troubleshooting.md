@@ -81,6 +81,15 @@ invalid, the old process has already exited and the replacement will report the
 parse error in its normal service or TPM log. Fix the file, then use the
 supervisor or TPM startup script to start the watcher again.
 
+## Stop or reload takes a long time to return
+
+Both are acknowledged immediately but applied only after the daemon finishes
+its startup transaction, so a watcher still waiting on the mutation lock keeps
+the command waiting too. Release whatever holds the lock, usually another
+`save` or `restore`, and the command finishes on its own. When the wait is
+reported as the daemon still finishing startup, the watcher was neither stopped
+nor replaced.
+
 ## Automatic restore cannot identify the bootstrap shell
 
 Prompt helpers or a long-running foreground command can keep the initial pane

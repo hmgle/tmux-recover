@@ -59,7 +59,18 @@ Control commands locate the endpoint without loading `config.toml`, so a
 malformed configuration cannot prevent status or a clean stop. The listener
 serves connections concurrently and is available during automatic restore and
 the initial save. Stop or reload requested during that phase is acknowledged,
-then applied after the startup transaction finishes.
+then applied after the startup transaction finishes. Because that transaction
+can wait on the mutation lock, a stop or reload client treats the original
+generation still answering as progress: silence from every generation is bounded
+by a short deadline measured from the last answer, while a daemon that keeps
+answering is bounded by a longer overall one. Each poll is capped by whichever
+deadline it is racing, so the reported wait is the wait that elapsed.
+
+Responses are newline-terminated frames. A frame that arrives without its
+terminator was cut short by a peer that went away mid-write, so it is raised as
+an end-of-stream rather than parsed and reported as malformed JSON. That keeps a
+daemon exiting under a lifecycle command recognisable as the outcome the command
+is waiting for.
 
 An accept failure that reports descriptor or memory exhaustion is retried after
 an exponential backoff instead of ending the watcher: continuing to save

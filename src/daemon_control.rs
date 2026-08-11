@@ -462,8 +462,22 @@ mod platform {
         if bytes.len() as u64 > MAX_MESSAGE_BYTES {
             bail!("daemon control message exceeds {MAX_MESSAGE_BYTES} bytes");
         }
-        if bytes.is_empty() {
-            bail!("daemon control peer closed without sending a message");
+        // Every message is newline terminated, so a frame without one was cut
+        // short by a peer that went away mid-write. Both that and reading
+        // nothing at all stay `io::Error`s so a peer shutting down remains
+        // recognisable as a closed connection rather than a protocol failure:
+        // the stop and reload waits treat a daemon exiting under them as the
+        // outcome they are waiting for.
+        if bytes.last() != Some(&b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                if bytes.is_empty() {
+                    "daemon control peer closed without sending a message"
+                } else {
+                    "daemon control peer closed partway through a message"
+                },
+            )
+            .into());
         }
         while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
             bytes.pop();
@@ -577,6 +591,24 @@ mod platform {
 
 pub(crate) use platform::ControlServer;
 pub use platform::{is_daemon_unavailable, request};
+
+/// Reports whether a control request failed because the peer went away partway
+/// through it. A daemon that is shutting down closes accepted connections, so
+/// this is an expected outcome while polling for a stop or a reload rather than
+/// a reason to report the request as failed.
+pub fn is_connection_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
 
 fn control_path(data_dir: &Path, socket_key: &str) -> Result<PathBuf> {
     let data_dir = canonical_or_absolute(data_dir)?;
@@ -695,6 +727,68 @@ mod tests {
         assert!(!is_daemon_unavailable(&anyhow::anyhow!(
             "protocol mismatch"
         )));
+    }
+
+    #[tokio::test]
+    async fn a_peer_closing_mid_request_reports_a_closed_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let path = control_path(data.path(), "socket-key").unwrap();
+        platform::ensure_runtime_directory(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // Mimics a daemon torn down mid-request: the request is consumed so the
+        // client's write succeeds, then the connection closes without a
+        // response. The client sees a clean EOF rather than a reset.
+        let accepting = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0, "the client sent no request to consume");
+        });
+
+        let error = request(data.path(), "socket-key", ControlRequest::Status)
+            .await
+            .unwrap_err();
+        accepting.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(is_connection_closed(&error), "{error:#}");
+        assert!(!is_daemon_unavailable(&error), "{error:#}");
+        assert!(!is_connection_closed(&anyhow::anyhow!("protocol mismatch")));
+    }
+
+    #[tokio::test]
+    async fn a_peer_closing_mid_response_reports_a_closed_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let data = tempfile::tempdir().unwrap();
+        let path = control_path(data.path(), "socket-key").unwrap();
+        platform::ensure_runtime_directory(path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // A daemon killed partway through writing its response leaves a frame
+        // with no terminating newline. Parsing that as JSON would report a
+        // protocol failure for what is really a connection that went away.
+        let accepting = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0, "the client sent no request to consume");
+            stream.write_all(b"{\"protocol_ve").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let error = request(data.path(), "socket-key", ControlRequest::Status)
+            .await
+            .unwrap_err();
+        accepting.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(is_connection_closed(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("partway through a message"),
+            "{error:#}"
+        );
     }
 
     #[test]

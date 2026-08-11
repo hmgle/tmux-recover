@@ -11,7 +11,8 @@ use tmux_recover::{
     config::{AppPaths, Config},
     daemon::DaemonExit,
     daemon_control::{
-        ControlRequest, DaemonStatus, is_daemon_unavailable, request as daemon_request,
+        ControlRequest, DaemonStatus, is_connection_closed, is_daemon_unavailable,
+        request as daemon_request,
     },
     model::{ProcessCheckpoint, ProcessCheckpointOrigin, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
@@ -19,6 +20,15 @@ use tmux_recover::{
     tmux::{capture::capture_structure, control::ControlClient, resolve_socket},
     util::socket_identity,
 };
+
+/// How long a lifecycle command waits for a daemon it can no longer reach to
+/// come back or disappear, measured from the last time any generation answered.
+const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on a stop or reload whose daemon is still answering. Both are
+/// applied only after the startup transaction finishes, and that transaction
+/// can wait on the mutation lock for as long as another command holds it.
+const DAEMON_PENDING_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(name = "tmux-recover", version, about)]
@@ -302,46 +312,81 @@ fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Waits for the daemon acknowledging a stop to exit.
+///
+/// The stop is applied only after the daemon finishes its startup transaction,
+/// so the original process still answering is progress rather than a stall.
 async fn wait_for_daemon_stop(data_dir: &Path, socket_key: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    let mut last_seen_running = started;
     loop {
-        match daemon_request(data_dir, socket_key, ControlRequest::Status).await {
-            Ok(_) => {}
-            Err(error) if is_daemon_unavailable(&error) => return Ok(()),
-            Err(error) if daemon_connection_closed(&error) => {}
-            Err(error) => return Err(error).context("failed to confirm that the daemon stopped"),
+        // Bound the request by the deadline it is racing. `daemon_request` has
+        // its own ten second timeout, so an unbounded call could otherwise
+        // overshoot the deadline it is about to be checked against.
+        let deadline = lifecycle_deadline(started, last_seen_running);
+        match tokio::time::timeout_at(
+            deadline,
+            daemon_request(data_dir, socket_key, ControlRequest::Status),
+        )
+        .await
+        {
+            Ok(Ok(_)) => last_seen_running = tokio::time::Instant::now(),
+            Ok(Err(error)) if is_daemon_unavailable(&error) => return Ok(()),
+            Ok(Err(error)) if is_connection_closed(&error) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("failed to confirm that the daemon stopped");
+            }
+            Err(_elapsed) => {}
         }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("daemon acknowledged stop but did not exit within 15 seconds");
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_seen_running) >= DAEMON_LIFECYCLE_TIMEOUT {
+            anyhow::bail!(
+                "daemon acknowledged stop but did not exit within {} seconds",
+                DAEMON_LIFECYCLE_TIMEOUT.as_secs()
+            );
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if now.duration_since(started) >= DAEMON_PENDING_LIFECYCLE_TIMEOUT {
+            anyhow::bail!(
+                "daemon acknowledged stop but was still finishing its startup transaction after \
+                 {} seconds; it exits once that finishes",
+                DAEMON_PENDING_LIFECYCLE_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(DAEMON_LIFECYCLE_POLL_INTERVAL).await;
     }
 }
 
-fn daemon_connection_closed(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        })
-    })
+/// The earlier of the two deadlines a lifecycle wait is bounded by: silence
+/// from every generation, and an overall cap on a daemon that keeps answering.
+fn lifecycle_deadline(
+    started: tokio::time::Instant,
+    last_seen_running: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (last_seen_running + DAEMON_LIFECYCLE_TIMEOUT).min(started + DAEMON_PENDING_LIFECYCLE_TIMEOUT)
 }
 
+/// Waits for the replacement process that `previous` re-executes into.
+///
+/// A daemon that is still finishing its startup transaction acknowledges the
+/// reload and applies it afterwards, so the old process answering with its
+/// original startup time is progress, not a stall: it keeps the window for the
+/// replacement open. Only silence from both generations is bounded tightly.
 async fn wait_for_daemon_reload(
     data_dir: &Path,
     socket_key: &str,
     previous: &DaemonStatus,
 ) -> Result<DaemonStatus> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    let mut last_seen_running = started;
     loop {
-        if let Ok(Some(status)) = daemon_request(data_dir, socket_key, ControlRequest::Status).await
+        let deadline = lifecycle_deadline(started, last_seen_running);
+        match tokio::time::timeout_at(
+            deadline,
+            daemon_request(data_dir, socket_key, ControlRequest::Status),
+        )
+        .await
         {
-            if status.started_at != previous.started_at {
+            Ok(Ok(Some(status))) if status.started_at != previous.started_at => {
                 if status.version != tmux_recover::VERSION {
                     anyhow::bail!(
                         "daemon reloaded as version {}, but the controlling binary is version {}",
@@ -351,14 +396,29 @@ async fn wait_for_daemon_reload(
                 }
                 return Ok(status);
             }
+            Ok(Ok(_)) => last_seen_running = tokio::time::Instant::now(),
+            Ok(Err(error)) if is_daemon_unavailable(&error) || is_connection_closed(&error) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("failed to confirm that the daemon reloaded");
+            }
+            Err(_elapsed) => {}
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_seen_running) >= DAEMON_LIFECYCLE_TIMEOUT {
             anyhow::bail!(
-                "daemon acknowledged reload but did not return as tmux-recover {} within 15 seconds",
-                tmux_recover::VERSION
+                "daemon acknowledged reload but did not return as tmux-recover {} within {} seconds",
+                tmux_recover::VERSION,
+                DAEMON_LIFECYCLE_TIMEOUT.as_secs()
             );
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if now.duration_since(started) >= DAEMON_PENDING_LIFECYCLE_TIMEOUT {
+            anyhow::bail!(
+                "daemon acknowledged reload but was still finishing its startup transaction after \
+                 {} seconds; it applies the reload once that finishes",
+                DAEMON_PENDING_LIFECYCLE_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(DAEMON_LIFECYCLE_POLL_INTERVAL).await;
     }
 }
 

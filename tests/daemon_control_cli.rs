@@ -146,6 +146,77 @@ fn control_endpoint_is_available_while_the_initial_save_is_blocked() {
 }
 
 #[test]
+fn stop_requested_during_a_blocked_startup_is_applied_once_it_finishes() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let cli = IsolatedCli::new();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store =
+        SnapshotStore::for_socket(cli.data.path(), &identity.key, &StorageConfig::default());
+    let mutation_lock = store.acquire_mutation_lock().unwrap();
+    let mut daemon = cli.spawn_daemon(&server.socket);
+
+    let status = wait_for_status(&cli, &server.socket);
+    assert_eq!(status.pid, daemon.id());
+
+    // The daemon acknowledges the stop straight away but exits only after its
+    // startup transaction finishes, so the client must keep waiting while the
+    // original process is still answering.
+    let unlock = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        drop(mutation_lock);
+    });
+    let output = cli.run(&server.socket, "--stop", &[]);
+    unlock.join().unwrap();
+    assert!(output.status.success(), "stop failed: {output:?}");
+
+    let status = daemon.wait().unwrap();
+    assert!(status.success(), "daemon did not exit cleanly: {status}");
+}
+
+#[test]
+fn reload_requested_during_a_blocked_startup_is_applied_once_it_finishes() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let cli = IsolatedCli::new();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store =
+        SnapshotStore::for_socket(cli.data.path(), &identity.key, &StorageConfig::default());
+    let mutation_lock = store.acquire_mutation_lock().unwrap();
+    let mut daemon = cli.spawn_daemon(&server.socket);
+
+    let first = wait_for_status(&cli, &server.socket);
+    assert_eq!(first.pid, daemon.id());
+
+    // The daemon acknowledges the reload immediately but applies it only after
+    // its startup transaction finishes, so the client must keep waiting while
+    // the original generation is still answering.
+    let unlock = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        drop(mutation_lock);
+    });
+    let output = cli.run(&server.socket, "--reload", &[]);
+    unlock.join().unwrap();
+    assert!(output.status.success(), "reload failed: {output:?}");
+
+    let reloaded = wait_for_status_change(&cli, &server.socket, &first);
+    assert_eq!(
+        reloaded.pid, first.pid,
+        "reload must preserve the supervisor PID"
+    );
+    assert_eq!(reloaded.version, env!("CARGO_PKG_VERSION"));
+
+    let output = cli.run(&server.socket, "--stop", &[]);
+    assert!(output.status.success(), "stop failed: {output:?}");
+    let status = daemon.wait().unwrap();
+    assert!(status.success(), "daemon did not exit cleanly: {status}");
+}
+
+#[test]
 fn daemon_status_stop_and_reload_control_the_exact_instance() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
