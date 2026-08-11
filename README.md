@@ -236,6 +236,16 @@ tmux-recover restore current --dry-run
 tmux-recover restore current
 ```
 
+If the real restore is launched from a pane in the target server, use the TPM
+restore binding or run it outside that pane's foreground lifetime:
+
+```sh
+tmux run-shell -b 'tmux-recover restore current'
+```
+
+The CLI rejects a foreground invocation that would destroy its own calling
+pane before the durable report can be written.
+
 The second command can replace only a fresh one-session/one-window/one-pane
 bootstrap. If the target server already contains real work, review an explicit
 replacement plan first:

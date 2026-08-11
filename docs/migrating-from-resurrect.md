@@ -150,9 +150,15 @@ Imported history remains available after the cutover:
 ```sh
 tmux-recover restore --from-imports SNAPSHOT --dry-run --replace
 # Run only after reviewing the dry-run and confirming the target socket.
-tmux-recover restore --from-imports SNAPSHOT --replace --yes
+tmux run-shell -b \
+  'tmux-recover restore --from-imports SNAPSHOT --replace --yes'
 tmux-recover save --label imported-checkpoint-restored --pin
 ```
+
+Use the background `run-shell` form when invoking the restore from the target
+server; a foreground CLI restore is rejected if it would destroy its own pane.
+Afterwards, inspect the restore output/report for sessions with zero ordinary
+clients before testing notification or terminal-focus integrations.
 
 The final command records the restored state in native history so future
 manual and automatic restores no longer need `--from-imports`.

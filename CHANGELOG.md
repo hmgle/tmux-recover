@@ -21,6 +21,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Reject foreground restores that would destroy their calling pane before the
+  durable report is written.
 - Defer Linux `/proc` process metadata collection until a structural save or a
   due process checkpoint needs it. An empty `restore.process_allowlist` now
   disables process capture, removes the live sidecar from every mutating entry

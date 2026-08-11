@@ -184,6 +184,11 @@ a warning instead of attempting a rollback that could discard both old and new
 state. A pre-restore safety snapshot is marked separately from user pins and is
 retained by the bounded `retention.safety_snapshots` policy.
 
+A foreground CLI restore started inside a pane that the same transaction would
+destroy is rejected before mutation. The restore key and `tmux run-shell -b`
+run outside that pane's foreground terminal lifetime, allowing the transaction
+to finish and its report to become durable.
+
 Process restart metadata is collected from `/proc` on Linux only when
 `restore.process_allowlist` is non-empty and the capture path needs it. It is
 never executed unless `--restore-processes` is present and the executable

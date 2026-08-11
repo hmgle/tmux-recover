@@ -133,9 +133,14 @@ TPM 集成只能在 tmux server 已存在后启动 watcher。tmux-recover 不会
 ```sh
 tmux-recover restore --from-imports SNAPSHOT --dry-run --replace
 # 仅在检查 dry-run 并确认目标 socket 后执行。
-tmux-recover restore --from-imports SNAPSHOT --replace --yes
+tmux run-shell -b \
+  'tmux-recover restore --from-imports SNAPSHOT --replace --yes'
 tmux-recover save --label imported-checkpoint-restored --pin
 ```
+
+从目标 server 内发起恢复时使用后台 `run-shell` 形式；如果前台 CLI 会销毁自己的 pane，
+它会拒绝执行。恢复后，在测试通知跳转或终端聚焦集成前，先检查输出/report 中是否有
+普通 client 数量为 0 的 session。
 
 最后一条命令会把恢复后的状态写入 native 历史，之后手动或自动恢复不再需要
 `--from-imports`。

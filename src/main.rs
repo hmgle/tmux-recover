@@ -18,7 +18,7 @@ use tmux_recover::{
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
     tmux::{capture::capture_structure, control::ControlClient, resolve_socket},
-    util::socket_identity,
+    util::{socket_from_tmux_env, socket_identity},
 };
 
 /// How long a lifecycle command waits for a daemon it can no longer reach to
@@ -491,6 +491,7 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     if args.replace && !args.yes {
         confirm_replace()?;
     }
+    ensure_restore_caller_survives(&target, &identity.key)?;
 
     let _mutation_lock = target_store.acquire_mutation_lock()?;
     target_store
@@ -540,6 +541,54 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
             )
         }
     }
+}
+
+fn ensure_restore_caller_survives(
+    target: &tmux_recover::tmux::capture::CaptureResult,
+    target_socket_key: &str,
+) -> Result<()> {
+    let has_terminal = std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal();
+    let caller_socket_key = socket_from_tmux_env()
+        .and_then(|socket| socket_identity(&socket).ok())
+        .map(|identity| identity.key);
+    let caller_pane = std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|pane| !pane.is_empty());
+    if foreground_restore_would_destroy_caller(
+        &target.state,
+        target_socket_key,
+        has_terminal,
+        caller_socket_key.as_deref(),
+        caller_pane.as_deref(),
+    ) {
+        let caller_pane = caller_pane.expect("checked caller pane");
+        anyhow::bail!(
+            "restore would destroy its calling pane {caller_pane} before the durable report is written; run it through the tmux-recover restore key or `tmux run-shell -b 'tmux-recover restore ...'`"
+        );
+    }
+    Ok(())
+}
+
+fn foreground_restore_would_destroy_caller(
+    state: &tmux_recover::model::TmuxState,
+    target_socket_key: &str,
+    has_terminal: bool,
+    caller_socket_key: Option<&str>,
+    caller_pane: Option<&str>,
+) -> bool {
+    has_terminal
+        && caller_socket_key == Some(target_socket_key)
+        && caller_pane.is_some_and(|pane| state_contains_pane(state, pane))
+}
+
+fn state_contains_pane(state: &tmux_recover::model::TmuxState, pane_id: &str) -> bool {
+    state
+        .windows
+        .iter()
+        .flat_map(|window| &window.panes)
+        .any(|pane| pane.id == pane_id)
 }
 
 fn print_restore_plan(plan: &tmux_recover::restore::RestorePlan, json: bool) -> Result<()> {
@@ -856,4 +905,77 @@ async fn selected_store(
         &identity.key,
         &config.storage,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use tmux_recover::model::{Pane, PaneCwd, TmuxState, Window};
+
+    use super::foreground_restore_would_destroy_caller;
+
+    fn state_with_pane(pane_id: &str) -> TmuxState {
+        TmuxState {
+            sessions: vec![],
+            windows: vec![Window {
+                id: "@0".to_owned(),
+                name: "window".to_owned(),
+                layout: String::new(),
+                visible_layout: None,
+                width: 80,
+                height: 24,
+                zoomed: false,
+                automatic_rename: None,
+                active_pane_id: Some(pane_id.to_owned()),
+                panes: vec![Pane {
+                    id: pane_id.to_owned(),
+                    index: 0,
+                    title: None,
+                    cwd: PaneCwd::inspect(None),
+                    current_command: None,
+                    start_command: None,
+                    start_path: None,
+                    pid: None,
+                    tty: None,
+                    dead: false,
+                    dead_status: None,
+                    restart: None,
+                    import_status: None,
+                }],
+            }],
+            client_state: None,
+        }
+    }
+
+    #[test]
+    fn foreground_restore_is_rejected_only_for_its_own_target_pane() {
+        let state = state_with_pane("%7");
+        assert!(foreground_restore_would_destroy_caller(
+            &state,
+            "socket-a",
+            true,
+            Some("socket-a"),
+            Some("%7")
+        ));
+        assert!(!foreground_restore_would_destroy_caller(
+            &state,
+            "socket-a",
+            false,
+            Some("socket-a"),
+            Some("%7")
+        ));
+        assert!(!foreground_restore_would_destroy_caller(
+            &state,
+            "socket-a",
+            true,
+            Some("socket-b"),
+            Some("%7")
+        ));
+        assert!(!foreground_restore_would_destroy_caller(
+            &state,
+            "socket-a",
+            true,
+            Some("socket-a"),
+            Some("%8")
+        ));
+    }
 }

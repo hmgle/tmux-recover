@@ -215,6 +215,15 @@ tmux-recover restore current --dry-run
 tmux-recover restore current
 ```
 
+如果真实恢复命令从目标 server 的 pane 内启动，请使用 TPM 恢复按键，或让命令脱离该
+pane 的前台终端生命周期运行：
+
+```sh
+tmux run-shell -b 'tmux-recover restore current'
+```
+
+如果恢复会在 durable report 写入前销毁调用它的 pane，CLI 会在修改 tmux 前拒绝执行。
+
 第二条命令只能替换刚创建的 1 session / 1 window / 1 pane 空白 server。如果目标
 server 已经有真实工作，必须先检查显式替换计划：
 

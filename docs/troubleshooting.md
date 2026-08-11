@@ -287,6 +287,20 @@ Use the snapshot ID from `tmux-recover list`, rather than `current`, when the
 continuous daemon has already saved the manually created window as the latest
 snapshot.
 
+## Foreground restore would destroy its calling pane
+
+A real restore started interactively inside the same target server may need to
+delete the pane that is running the command. tmux-recover rejects that case
+before mutation so it cannot terminate midway and omit the durable report. Use
+the TPM restore binding, or run an already reviewed non-interactive restore as
+a tmux background job:
+
+```sh
+tmux-recover restore SNAPSHOT --dry-run --replace
+tmux run-shell -b \
+  'tmux-recover restore SNAPSHOT --replace --yes'
+```
+
 ## Autosave reports an occupied hook slot
 
 Another tmux configuration entry is using the configured indexed hook slot.
