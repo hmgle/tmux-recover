@@ -64,7 +64,13 @@ struct IsolatedCli {
 
 impl IsolatedCli {
     fn new() -> Self {
-        let command_config = tempfile::tempdir().unwrap();
+        // macOS places its default temporary directory under a long
+        // /var/folders path. Keep XDG_RUNTIME_DIR short enough for the
+        // platform's smaller Unix-domain socket path limit.
+        let command_config = tempfile::Builder::new()
+            .prefix("tmux-recover-")
+            .tempdir_in("/tmp")
+            .unwrap();
         std::fs::create_dir_all(command_config.path().join("config")).unwrap();
         std::fs::create_dir(command_config.path().join("runtime")).unwrap();
         std::fs::write(
