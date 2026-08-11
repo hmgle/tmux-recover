@@ -1,4 +1,4 @@
-use std::{cmp::max, path::Path, time::Duration};
+use std::{cmp::max, future::Future, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
@@ -111,22 +111,8 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         }
         Ok::<_, anyhow::Error>((client, hook_events_enabled, protected_current))
     };
-    tokio::pin!(startup);
-
-    let mut requested_exit = None;
-    let (mut client, mut hook_events_enabled, mut protected_current) = loop {
-        tokio::select! {
-            result = &mut startup => break result?,
-            request = control.next_request() => {
-                let exit = match request {
-                    ControlAction::Continue => continue,
-                    ControlAction::Stop => DaemonExit::Stop,
-                    ControlAction::Reload => DaemonExit::Reload,
-                };
-                requested_exit.get_or_insert(exit);
-            }
-        }
-    };
+    let ((mut client, mut hook_events_enabled, mut protected_current), requested_exit) =
+        finish_startup(startup, &mut control).await?;
     if let Some(exit) = requested_exit {
         log_exit(socket, exit);
         return Ok(exit);
@@ -151,7 +137,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         tokio::select! {
             request = control.next_request() => {
                 match request {
-                    ControlAction::Continue => {}
                     ControlAction::Stop => break DaemonExit::Stop,
                     ControlAction::Reload => break DaemonExit::Reload,
                 }
@@ -238,6 +223,26 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
 
     log_exit(socket, exit);
     Ok(exit)
+}
+
+async fn finish_startup<T>(
+    startup: impl Future<Output = Result<T>>,
+    control: &mut ControlServer,
+) -> Result<(T, Option<DaemonExit>)> {
+    tokio::pin!(startup);
+    let mut requested_exit = None;
+    loop {
+        tokio::select! {
+            result = &mut startup => return Ok((result?, requested_exit)),
+            request = control.next_request() => {
+                let exit = match request {
+                    ControlAction::Stop => DaemonExit::Stop,
+                    ControlAction::Reload => DaemonExit::Reload,
+                };
+                requested_exit.get_or_insert(exit);
+            }
+        }
+    }
 }
 
 fn log_exit(socket: &Path, exit: DaemonExit) {
@@ -716,6 +721,7 @@ async fn shutdown_signal() -> Result<()> {
 mod tests {
     use crate::{
         config::{AutosaveConfig, StorageConfig},
+        daemon_control::{ControlRequest, is_daemon_unavailable, request as daemon_request},
         model::{
             EncodedPath, Origin, Pane, PaneCwd, RestartSpec, Session, SocketIdentity, TmuxState,
             Window, WindowLink,
@@ -726,6 +732,44 @@ mod tests {
     use super::*;
 
     const SOCKET_KEY: &str = "socket-key";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_failure_during_startup_is_rebound_without_cancelling_it() {
+        let data = tempfile::tempdir().unwrap();
+        let socket = data.path().join("tmux.sock");
+        let expected = DaemonStatus::running(&socket);
+        let mut control = ControlServer::bind(data.path(), SOCKET_KEY, expected.clone()).unwrap();
+        control.abort_for_test().await;
+
+        let error = daemon_request(data.path(), SOCKET_KEY, ControlRequest::Status)
+            .await
+            .unwrap_err();
+        assert!(is_daemon_unavailable(&error), "{error:#}");
+
+        let startup = async {
+            loop {
+                match daemon_request(data.path(), SOCKET_KEY, ControlRequest::Status).await {
+                    Ok(Some(status)) => return Ok::<_, anyhow::Error>(status),
+                    Err(error) if is_daemon_unavailable(&error) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(None) => panic!("status response was empty"),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        let (actual, requested_exit) = tokio::time::timeout(
+            Duration::from_secs(1),
+            finish_startup(startup, &mut control),
+        )
+        .await
+        .expect("control endpoint was not rebound during startup")
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(requested_exit, None);
+    }
 
     fn config(process_checkpoint_interval: Duration) -> Config {
         Config {

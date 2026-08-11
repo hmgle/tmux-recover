@@ -49,23 +49,26 @@ inode, so the second watcher fails before it can replace the control socket.
 
 The versioned JSON control protocol supports status, stop, and reload. Status
 reports the PID, tool version, startup time, and encoded tmux socket path. Stop
-acknowledges the request before leaving the normal daemon loop and releasing
-its locks. Reload does the same cleanup, then the top-level process re-executes
-its original executable argument and command line. Re-exec preserves the PID
-and supervisor ownership while loading the binary now present on disk and
-parsing configuration again. The client waits for a different startup time and
-requires the new watcher to report the same version as the controlling binary.
-Control commands locate the endpoint without loading `config.toml`, so a
-malformed configuration cannot prevent status or a clean stop. The listener
+reserves its lifecycle action in state owned by the long-lived control server
+before writing the acknowledgement. Completing or cancelling that request task
+publishes the reserved action, so rebuilding a failed listener cannot turn an
+acknowledged command into a no-op. The daemon then leaves its normal loop and
+releases its locks. Reload does the same cleanup, then the top-level process
+re-executes its original executable argument and command line. Re-exec preserves
+the PID and supervisor ownership while loading the binary now present on disk
+and parsing configuration again. The client waits for a different startup time
+and requires the new watcher to report the same version as the controlling
+binary. Control commands locate the endpoint without loading `config.toml`, so
+a malformed configuration cannot prevent status or a clean stop. The listener
 serves connections concurrently and is available during automatic restore and
 the initial save. Stop or reload requested during that phase is acknowledged,
 then applied after the startup transaction finishes. Because that transaction
 can wait on the mutation lock, a stop or reload client treats the original
-generation still answering as progress: silence from every generation is bounded
-by a short deadline measured from the last answer, while a daemon that keeps
-answering is bounded by a longer overall one. Each poll is capped by whichever
-deadline it is racing rather than the ordinary one-shot request timeout, so the
-reported wait is the wait that elapsed.
+generation still answering as progress: silence from every generation is
+bounded by a short deadline measured from the last answer, while a daemon that
+keeps answering is bounded by a longer overall one. Each poll is capped by
+whichever deadline it is racing rather than the ordinary one-shot request
+timeout, so the reported wait is the wait that elapsed.
 
 Responses are newline-terminated frames. A frame that arrives without its
 terminator was cut short by a peer that went away mid-write, so it is raised as

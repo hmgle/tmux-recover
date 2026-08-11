@@ -38,7 +38,6 @@ impl ControlRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlAction {
-    Continue,
     Stop,
     Reload,
 }
@@ -119,16 +118,13 @@ mod platform {
     use std::{
         fs,
         os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::{UnixListener, UnixStream},
-        sync::{
-            Mutex,
-            mpsc::{self, UnboundedReceiver, UnboundedSender},
-        },
+        sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
         task::{JoinHandle, JoinSet},
         time::timeout,
     };
@@ -136,7 +132,7 @@ mod platform {
     use super::*;
 
     struct ControlInstance {
-        actions: UnboundedReceiver<Result<ControlAction>>,
+        failures: UnboundedReceiver<anyhow::Error>,
         task: JoinHandle<()>,
         _socket: SocketGuard,
     }
@@ -151,6 +147,8 @@ mod platform {
         data_dir: PathBuf,
         socket_key: String,
         status: DaemonStatus,
+        lifecycle: Arc<LifecycleState>,
+        lifecycle_actions: UnboundedReceiver<ControlAction>,
         instance: Option<ControlInstance>,
         retry_at: Option<tokio::time::Instant>,
         backoff: Duration,
@@ -162,11 +160,19 @@ mod platform {
             socket_key: &str,
             status: DaemonStatus,
         ) -> Result<Self> {
-            let instance = bind_instance(data_dir, socket_key, status.clone())?;
+            let (action_sender, lifecycle_actions) = mpsc::unbounded_channel();
+            let lifecycle = Arc::new(LifecycleState {
+                pending: Mutex::new(None),
+                actions: action_sender,
+            });
+            let instance =
+                bind_instance(data_dir, socket_key, status.clone(), Arc::clone(&lifecycle))?;
             Ok(Self {
                 data_dir: data_dir.to_path_buf(),
                 socket_key: socket_key.to_owned(),
                 status,
+                lifecycle,
+                lifecycle_actions,
                 instance: Some(instance),
                 retry_at: None,
                 backoff: REBIND_RETRY_MIN_BACKOFF,
@@ -179,10 +185,15 @@ mod platform {
         pub(crate) async fn next_request(&mut self) -> ControlAction {
             loop {
                 if let Some(instance) = self.instance.as_mut() {
-                    let event = instance.actions.recv().await;
-                    match event {
-                        Some(Ok(action)) => return action,
-                        Some(Err(error)) => self.record_failure(error),
+                    let failure = tokio::select! {
+                        biased;
+                        action = self.lifecycle_actions.recv() => {
+                            return action.expect("daemon lifecycle action channel closed");
+                        }
+                        failure = instance.failures.recv() => failure,
+                    };
+                    match failure {
+                        Some(error) => self.record_failure(error),
                         None => self.record_failure(anyhow::anyhow!(
                             "daemon control request task stopped unexpectedly"
                         )),
@@ -191,8 +202,19 @@ mod platform {
                 }
 
                 let retry_at = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
-                tokio::time::sleep_until(retry_at).await;
-                match bind_instance(&self.data_dir, &self.socket_key, self.status.clone()) {
+                tokio::select! {
+                    biased;
+                    action = self.lifecycle_actions.recv() => {
+                        return action.expect("daemon lifecycle action channel closed");
+                    }
+                    () = tokio::time::sleep_until(retry_at) => {}
+                }
+                match bind_instance(
+                    &self.data_dir,
+                    &self.socket_key,
+                    self.status.clone(),
+                    Arc::clone(&self.lifecycle),
+                ) {
                     Ok(instance) => {
                         self.instance = Some(instance);
                         self.retry_at = None;
@@ -226,12 +248,14 @@ mod platform {
         }
 
         #[cfg(test)]
-        pub(super) fn abort_for_test(&mut self) {
-            self.instance
+        pub(crate) async fn abort_for_test(&mut self) {
+            let task = &mut self
+                .instance
                 .as_mut()
                 .expect("control server has no active instance")
-                .task
-                .abort();
+                .task;
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -239,6 +263,7 @@ mod platform {
         data_dir: &Path,
         socket_key: &str,
         status: DaemonStatus,
+        lifecycle: Arc<LifecycleState>,
     ) -> Result<ControlInstance> {
         let path = control_path(data_dir, socket_key)?;
         ensure_runtime_directory(
@@ -257,10 +282,10 @@ mod platform {
             device: metadata.dev(),
             inode: metadata.ino(),
         };
-        let (action_sender, actions) = mpsc::unbounded_channel();
-        let task = tokio::spawn(serve(listener, status, action_sender));
+        let (failure_sender, failures) = mpsc::unbounded_channel();
+        let task = tokio::spawn(serve(listener, status, lifecycle, failure_sender));
         Ok(ControlInstance {
-            actions,
+            failures,
             task,
             _socket: guard,
         })
@@ -269,10 +294,10 @@ mod platform {
     async fn serve(
         listener: UnixListener,
         status: DaemonStatus,
-        actions: UnboundedSender<Result<ControlAction>>,
+        lifecycle: Arc<LifecycleState>,
+        failures: UnboundedSender<anyhow::Error>,
     ) {
         let mut requests = JoinSet::new();
-        let lifecycle = Arc::new(Mutex::new(None));
         let mut backoff = ACCEPT_RETRY_MIN_BACKOFF;
         let mut retry_at: Option<tokio::time::Instant> = None;
         loop {
@@ -289,12 +314,7 @@ mod platform {
                 biased;
                 request = requests.join_next(), if !requests.is_empty() => {
                     match request {
-                        Some(Ok(Ok(ControlAction::Continue))) => {}
-                        Some(Ok(Ok(action))) => {
-                            if actions.send(Ok(action)).is_err() {
-                                return;
-                            }
-                        }
+                        Some(Ok(Ok(()))) => {}
                         Some(Ok(Err(error))) => {
                             tracing::warn!(
                                 error = %format!("{error:#}"),
@@ -338,9 +358,9 @@ mod platform {
                                 backoff = (backoff * 2).min(ACCEPT_RETRY_MAX_BACKOFF);
                             }
                             AcceptRecovery::Report => {
-                                let _ = actions.send(
-                                    Err(error)
-                                        .context("failed to accept a daemon control request")
+                                let _ = failures.send(
+                                    anyhow::Error::from(error)
+                                        .context("failed to accept a daemon control request"),
                                 );
                                 return;
                             }
@@ -348,6 +368,73 @@ mod platform {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) struct LifecycleState {
+        pending: Mutex<Option<ControlRequest>>,
+        actions: UnboundedSender<ControlAction>,
+    }
+
+    impl LifecycleState {
+        pub(super) fn reserve(
+            self: &Arc<Self>,
+            request: ControlRequest,
+        ) -> std::result::Result<LifecycleDelivery, ControlRequest> {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = *pending {
+                return Err(pending);
+            }
+            *pending = Some(request);
+            Ok(LifecycleDelivery {
+                action: Some(match request {
+                    ControlRequest::Stop => ControlAction::Stop,
+                    ControlRequest::Reload => ControlAction::Reload,
+                    ControlRequest::Status => unreachable!(),
+                }),
+                actions: self.actions.clone(),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn lifecycle_for_test() -> (Arc<LifecycleState>, UnboundedReceiver<ControlAction>) {
+        let (actions, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(LifecycleState {
+                pending: Mutex::new(None),
+                actions,
+            }),
+            receiver,
+        )
+    }
+
+    /// Commits a reserved lifecycle action even if its request task is
+    /// cancelled while writing the acknowledgement. Once an acknowledgement
+    /// can be observed, endpoint recovery must not be able to lose the action.
+    pub(super) struct LifecycleDelivery {
+        action: Option<ControlAction>,
+        actions: UnboundedSender<ControlAction>,
+    }
+
+    impl LifecycleDelivery {
+        fn deliver(mut self) {
+            self.send();
+        }
+
+        fn send(&mut self) {
+            if let Some(action) = self.action.take() {
+                let _ = self.actions.send(action);
+            }
+        }
+    }
+
+    impl Drop for LifecycleDelivery {
+        fn drop(&mut self) {
+            self.send();
         }
     }
 
@@ -458,8 +545,8 @@ mod platform {
     async fn handle_request(
         mut stream: UnixStream,
         status: DaemonStatus,
-        lifecycle: Arc<Mutex<Option<ControlRequest>>>,
-    ) -> Result<ControlAction> {
+        lifecycle: Arc<LifecycleState>,
+    ) -> Result<()> {
         let request: WireRequest = match timeout(REQUEST_TIMEOUT, read_message(&mut stream)).await {
             Ok(Ok(request)) => request,
             Ok(Err(error)) => {
@@ -468,11 +555,11 @@ mod platform {
                     &WireResponse::error(format!("invalid request: {error:#}")),
                 )
                 .await?;
-                return Ok(ControlAction::Continue);
+                return Ok(());
             }
             Err(_) => {
                 write_message(&mut stream, &WireResponse::error("request timed out")).await?;
-                return Ok(ControlAction::Continue);
+                return Ok(());
             }
         };
         if request.protocol_version != PROTOCOL_VERSION {
@@ -484,31 +571,29 @@ mod platform {
                 )),
             )
             .await?;
-            return Ok(ControlAction::Continue);
+            return Ok(());
         }
 
         match request.action {
             ControlRequest::Status => {
                 write_message(&mut stream, &WireResponse::status(status)).await?;
-                Ok(ControlAction::Continue)
+                Ok(())
             }
             action @ (ControlRequest::Stop | ControlRequest::Reload) => {
-                let mut pending = lifecycle.lock().await;
-                if let Some(pending) = *pending {
-                    write_message(
-                        &mut stream,
-                        &WireResponse::error(format!("{} already requested", pending.as_str())),
-                    )
-                    .await?;
-                    return Ok(ControlAction::Continue);
-                }
+                let delivery = match lifecycle.reserve(action) {
+                    Ok(delivery) => delivery,
+                    Err(pending) => {
+                        write_message(
+                            &mut stream,
+                            &WireResponse::error(format!("{} already requested", pending.as_str())),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
                 write_message(&mut stream, &WireResponse::acknowledged(action)).await?;
-                *pending = Some(action);
-                Ok(match action {
-                    ControlRequest::Stop => ControlAction::Stop,
-                    ControlRequest::Reload => ControlAction::Reload,
-                    ControlRequest::Status => unreachable!(),
-                })
+                delivery.deliver();
+                Ok(())
             }
         }
     }
@@ -795,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_is_acknowledged_before_the_server_returns_the_action() {
+    async fn acknowledged_stop_survives_control_task_failure() {
         let data = tempfile::tempdir().unwrap();
         let socket = data.path().join("tmux.sock");
         let mut server = ControlServer::bind(data.path(), "socket-key", status(&socket)).unwrap();
@@ -810,6 +895,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("stop already requested"));
+        server.abort_for_test().await;
         assert_eq!(server.next_request().await, ControlAction::Stop);
     }
 
@@ -819,7 +905,7 @@ mod tests {
         let socket = data.path().join("tmux.sock");
         let expected = status(&socket);
         let mut server = ControlServer::bind(data.path(), "socket-key", expected.clone()).unwrap();
-        server.abort_for_test();
+        server.abort_for_test().await;
         let action = tokio::spawn(async move { server.next_request().await });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -841,6 +927,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(action.await.unwrap(), ControlAction::Stop);
+    }
+
+    #[test]
+    fn cancelling_an_accepted_lifecycle_request_delivers_its_action() {
+        let (lifecycle, mut actions) = platform::lifecycle_for_test();
+        let delivery = lifecycle.reserve(ControlRequest::Stop).unwrap();
+
+        // Dropping this guard models the request task being cancelled while it
+        // is writing an acknowledgement. The action was already accepted and
+        // must outlive the disposable listener task.
+        drop(delivery);
+
+        assert_eq!(actions.try_recv().unwrap(), ControlAction::Stop);
+        assert!(matches!(
+            lifecycle.reserve(ControlRequest::Reload),
+            Err(ControlRequest::Stop)
+        ));
     }
 
     #[tokio::test]
