@@ -292,9 +292,10 @@ snapshot.
 
 A real restore started interactively inside the same target server may need to
 delete the pane that is running the command. tmux-recover rejects that case
-before mutation so it cannot terminate midway and omit the durable report. Use
-the TPM restore binding, or run an already reviewed non-interactive restore as
-a tmux background job:
+before confirmation or mutation so it cannot terminate midway and omit the
+durable report. The dry-run plan includes the same condition as a warning. Use
+the TPM restore binding, or run an already reviewed non-interactive restore as a
+tmux background job:
 
 ```sh
 tmux-recover restore SNAPSHOT --dry-run --replace

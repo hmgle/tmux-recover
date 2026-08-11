@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    io::Read,
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     time::Duration,
@@ -216,6 +217,73 @@ fn real_restore_with_an_empty_allowlist_removes_the_process_checkpoint() {
     assert!(
         store.read_process_checkpoint().unwrap().is_none(),
         "a real restore must remove stale process metadata while capture is disabled"
+    );
+}
+
+#[test]
+fn dry_run_warns_before_a_foreground_restore_can_prompt() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    let pane = output(server.tmux().args([
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "current",
+        "sleep 60",
+    ]));
+    let data = tempfile::tempdir().unwrap();
+    let save = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .arg("--data-dir")
+        .arg(data.path())
+        .args(["save", "--socket"])
+        .arg(&server.socket)
+        .output()
+        .unwrap();
+    assert!(
+        save.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+
+    let tmux_env = format!("{},0,0", server.socket.display());
+    let restore_command = |dry_run: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tmux-recover"));
+        command
+            .env("TMUX", &tmux_env)
+            .env("TMUX_PANE", pane.trim())
+            .arg("--data-dir")
+            .arg(data.path())
+            .args(["restore", "current", "--replace", "--socket"])
+            .arg(&server.socket);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        command
+    };
+
+    let (dry_run_succeeded, dry_run_output) = run_on_pty(restore_command(true));
+    assert!(dry_run_succeeded, "{dry_run_output}");
+    assert!(
+        dry_run_output.contains("warning:")
+            && dry_run_output.contains("real restore would destroy its calling pane"),
+        "dry-run did not expose the foreground restore warning: {dry_run_output}"
+    );
+
+    let (restore_succeeded, restore_output) = run_on_pty(restore_command(false));
+    assert!(!restore_succeeded, "{restore_output}");
+    assert!(
+        restore_output.contains("real restore would destroy its calling pane"),
+        "real restore did not reject its calling pane: {restore_output}"
+    );
+    assert!(
+        !restore_output.contains("Replace the existing tmux server state?"),
+        "restore prompted before rejecting its calling pane: {restore_output}"
     );
 }
 
@@ -927,6 +995,46 @@ fn success(command: &mut Command) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_on_pty(mut command: Command) -> (bool, String) {
+    let pty = openpty(
+        Some(&Winsize {
+            ws_row: 24,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+        None,
+    )
+    .unwrap();
+    let mut master = File::from(pty.master);
+    let slave = File::from(pty.slave);
+    command
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    let status = command.status().unwrap();
+    fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match master.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(nix::libc::EIO) =>
+            {
+                break;
+            }
+            Err(error) => panic!("failed to read command PTY: {error}"),
+        }
+    }
+    (
+        status.success(),
+        String::from_utf8_lossy(&output).into_owned(),
+    )
 }
 
 fn cwd(pane: &tmux_recover::model::Pane) -> std::path::PathBuf {

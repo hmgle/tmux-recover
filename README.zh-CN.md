@@ -222,7 +222,9 @@ pane 的前台终端生命周期运行：
 tmux run-shell -b 'tmux-recover restore current'
 ```
 
-如果恢复会在 durable report 写入前销毁调用它的 pane，CLI 会在修改 tmux 前拒绝执行。
+如果真实恢复会在 durable report 写入前销毁调用它的 pane，dry-run 会把该问题写入
+warning；真实执行会在交互确认前拒绝。此时使用上述按键或后台形式，让 report 能完整
+写入。
 
 第二条命令只能替换刚创建的 1 session / 1 window / 1 pane 空白 server。如果目标
 server 已经有真实工作，必须先检查显式替换计划：

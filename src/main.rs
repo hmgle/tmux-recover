@@ -487,14 +487,20 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     );
     let mut plan = preflight(&snapshot, &target, &options)?;
     plan.warnings.extend(process_warnings);
+    let caller_survival_issue = restore_caller_survival_issue(&target, &identity.key);
+    if let Some(issue) = &caller_survival_issue {
+        plan.warnings.push(issue.clone());
+    }
     print_restore_plan(&plan, args.json)?;
     if args.dry_run {
         return Ok(());
     }
+    if let Some(issue) = caller_survival_issue {
+        anyhow::bail!(issue);
+    }
     if args.replace && !args.yes {
         confirm_replace()?;
     }
-    ensure_restore_caller_survives(&target, &identity.key)?;
 
     let _mutation_lock = target_store.acquire_mutation_lock()?;
     target_store
@@ -563,10 +569,10 @@ fn session_visibility_notice(visibility: &[SessionVisibilityRecord]) -> Option<S
     }
 }
 
-fn ensure_restore_caller_survives(
+fn restore_caller_survival_issue(
     target: &tmux_recover::tmux::capture::CaptureResult,
     target_socket_key: &str,
-) -> Result<()> {
+) -> Option<String> {
     let has_terminal = std::io::stdin().is_terminal()
         || std::io::stdout().is_terminal()
         || std::io::stderr().is_terminal();
@@ -584,11 +590,11 @@ fn ensure_restore_caller_survives(
         caller_pane.as_deref(),
     ) {
         let caller_pane = caller_pane.expect("checked caller pane");
-        anyhow::bail!(
-            "restore would destroy its calling pane {caller_pane} before the durable report is written; run it through the tmux-recover restore key or `tmux run-shell -b 'tmux-recover restore ...'`"
-        );
+        return Some(format!(
+            "real restore would destroy its calling pane {caller_pane} before the durable report is written; run it through the tmux-recover restore key or `tmux run-shell -b 'tmux-recover restore ...'`"
+        ));
     }
-    Ok(())
+    None
 }
 
 fn foreground_restore_would_destroy_caller(

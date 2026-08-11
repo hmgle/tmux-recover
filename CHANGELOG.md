@@ -49,6 +49,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   activity between terminals does not create redundant autosave history.
 - Summarize restored sessions without ordinary terminal clients on one line
   while retaining per-session counts in the restore report.
+- Include a self-destructive foreground invocation in dry-run warnings and
+  reject the real restore before asking for replacement confirmation.
 
 ## [0.2.0] - 2026-08-10
 

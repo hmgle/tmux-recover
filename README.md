@@ -243,8 +243,9 @@ restore binding or run it outside that pane's foreground lifetime:
 tmux run-shell -b 'tmux-recover restore current'
 ```
 
-The CLI rejects a foreground invocation that would destroy its own calling
-pane before the durable report can be written.
+A dry-run includes a warning when the real restore would destroy its own
+calling pane. The real invocation is rejected before interactive confirmation,
+so use the binding or background form above to let the durable report finish.
 
 The second command can replace only a fresh one-session/one-window/one-pane
 bootstrap. If the target server already contains real work, review an explicit
