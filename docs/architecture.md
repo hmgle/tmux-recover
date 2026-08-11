@@ -46,6 +46,10 @@ replacing a stale socket and refuses to remove a non-socket path. Shutdown
 removes only the socket inode the process originally bound.
 Equivalent symlink spellings of one data directory still open the same lock
 inode, so the second watcher fails before it can replace the control socket.
+Runtime-directory validation and the first socket bind are startup
+prerequisites: any failure is returned instead of starting an unreachable
+watcher. The self-healing behavior below applies after that first endpoint has
+been established.
 
 The versioned JSON control protocol supports status, stop, and reload. Status
 reports the PID, tool version, startup time, and encoded tmux socket path. Stop
@@ -83,9 +87,10 @@ aborted accept leaves the listener usable and is retried immediately. The delay
 is its own branch of the accept loop, so backing off never holds back an
 acknowledged stop or reload. Any other accept failure, including a policy denial
 that would not clear, drops the failed listener and schedules a complete endpoint
-rebind with its own exponential backoff. Control failures are logged, but they
-never cancel the startup transaction or stop snapshot watching; this preserves
-the data plane even for a detached TPM watcher without a process supervisor.
+rebind with its own exponential backoff. After the required initial bind,
+control failures are logged but never cancel the startup transaction or stop
+snapshot watching; this preserves the data plane even for a detached TPM
+watcher without a process supervisor.
 
 TPM startup first runs an `--if-empty` capture synchronously under that same
 mutation lock. It creates the first recovery point only when neither a current

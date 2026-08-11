@@ -599,7 +599,7 @@ mod platform {
     }
 
     #[derive(Debug, thiserror::Error)]
-    #[error("no controllable tmux-recover daemon was found at {path}")]
+    #[error("could not reach the tmux-recover daemon control endpoint at {path}")]
     struct ConnectError {
         path: PathBuf,
         #[source]
@@ -1004,6 +1004,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_daemon_unavailable(&error));
+        assert!(
+            format!("{error:#}")
+                .contains("could not reach the tmux-recover daemon control endpoint")
+        );
         assert!(!is_daemon_unavailable(&anyhow::anyhow!(
             "protocol mismatch"
         )));
