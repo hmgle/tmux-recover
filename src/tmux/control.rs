@@ -36,9 +36,10 @@ struct CommandRunnerUnavailable {
     detail: String,
 }
 
-/// True when a one-shot client stopped before it completed every requested
-/// command. This normally means the target tmux server has exited or its socket
-/// can no longer be reached, so a daemon should release its lock and stop.
+/// True when a one-shot client could not start or its control stream ended
+/// without `%exit`. This normally means the target tmux server has exited or
+/// its socket can no longer be reached, so a daemon should release its lock and
+/// stop.
 pub fn command_runner_is_unavailable(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -99,7 +100,6 @@ impl CommandRunner {
 
         let response = match parse_one_shot_output(&output.stdout, block_count) {
             Ok(response) => response,
-            Err(OneShotParseError::Command(error)) => return Err(error),
             Err(OneShotParseError::Protocol(error)) => return Err(error),
             Err(OneShotParseError::Incomplete(detail)) => {
                 return Err(CommandRunnerUnavailable { detail }.into());
@@ -117,6 +117,27 @@ impl CommandRunner {
                 stderr
             };
             return Err(CommandRunnerUnavailable { detail }.into());
+        }
+        if response.blocks.len() >= block_count && !response.errors.is_empty() {
+            for error in &response.errors {
+                tracing::debug!(
+                    target: "tmux_recover::control",
+                    socket = %self.socket.display(),
+                    after_blocks = error.after_blocks,
+                    error = %error.detail,
+                    status = %output.status,
+                    "ignore a likely hook error after receiving the minimum result block count"
+                );
+            }
+            return Ok(response.blocks);
+        }
+        if let Some(error) = response.errors.first() {
+            bail!(
+                "tmux command sequence failed after {} complete control blocks \
+                 (expected {block_count} commands): {}",
+                error.after_blocks,
+                error.detail
+            );
         }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -140,11 +161,16 @@ impl CommandRunner {
 
 struct OneShotResponse {
     blocks: Vec<Vec<Vec<u8>>>,
+    errors: Vec<OneShotCommandError>,
     saw_exit: bool,
 }
 
+struct OneShotCommandError {
+    after_blocks: usize,
+    detail: String,
+}
+
 enum OneShotParseError {
-    Command(anyhow::Error),
     Protocol(anyhow::Error),
     Incomplete(String),
 }
@@ -156,6 +182,7 @@ fn parse_one_shot_output(
     let lines = split_lines(stdout);
     let mut lines = lines.into_iter();
     let mut blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(block_count);
+    let mut errors = Vec::new();
     let mut saw_exit = false;
 
     while let Some(line) = lines.next() {
@@ -186,11 +213,11 @@ fn parse_one_shot_output(
                     } else {
                         detail
                     };
-                    return Err(OneShotParseError::Command(anyhow::anyhow!(
-                        "tmux command sequence failed after {} complete control blocks \
-                         (expected {block_count} commands): {detail}",
-                        blocks.len()
-                    )));
+                    errors.push(OneShotCommandError {
+                        after_blocks: blocks.len(),
+                        detail,
+                    });
+                    break;
                 }
                 if line.starts_with(b"%exit") {
                     return Err(OneShotParseError::Incomplete(
@@ -211,7 +238,11 @@ fn parse_one_shot_output(
         }
     }
 
-    Ok(OneShotResponse { blocks, saw_exit })
+    Ok(OneShotResponse {
+        blocks,
+        errors,
+        saw_exit,
+    })
 }
 
 pub struct ControlClient {
@@ -529,7 +560,7 @@ fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OneShotParseError, parse_one_shot_output, split_lines};
+    use super::{parse_one_shot_output, split_lines};
 
     #[test]
     fn splits_command_output_without_a_synthetic_trailing_record() {
@@ -564,20 +595,19 @@ mod tests {
     }
 
     #[test]
-    fn reports_one_shot_command_errors_after_completed_blocks() {
-        let error = parse_one_shot_output(
-            b"%begin 1 2 0\none\n%end 1 2 0\n%begin 1 3 0\nno target\n%error 1 3 0\n%exit\n",
-            3,
+    fn records_one_shot_command_errors_and_continues_parsing() {
+        let response = parse_one_shot_output(
+            b"%begin 1 2 0\none\n%end 1 2 0\n%begin 1 3 0\nno target\n%error 1 3 0\n%begin 1 4 0\ntwo\n%end 1 4 0\n%exit\n",
+            2,
         )
-        .err()
-        .expect("failing control output was accepted");
-        let OneShotParseError::Command(error) = error else {
-            panic!("command failure was misclassified as a protocol failure");
-        };
+        .unwrap_or_else(|_| panic!("complete control output with an error was rejected"));
+        assert!(response.saw_exit);
         assert_eq!(
-            error.to_string(),
-            "tmux command sequence failed after 1 complete control blocks (expected 3 commands): \
-             no target"
+            response.blocks,
+            vec![vec![b"one".to_vec()], vec![b"two".to_vec()]]
         );
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].after_blocks, 1);
+        assert_eq!(response.errors[0].detail, "no target");
     }
 }

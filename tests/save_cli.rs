@@ -179,6 +179,32 @@ fn save_ignores_output_blocks_from_command_hooks() {
 }
 
 #[test]
+fn save_ignores_errors_from_command_hooks() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("tmux")
+            .args(["-S"])
+            .arg(&server.socket)
+            .args([
+                "set-option",
+                "-go",
+                "after-list-sessions[779]",
+                "list-panes -t no-such-window",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert!(save(data.path(), &server.socket, &[]).starts_with("saved "));
+    assert_eq!(snapshots(data.path()).len(), 1);
+}
+
+#[test]
 fn empty_allowlist_saves_without_process_metadata_and_removes_the_sidecar() {
     let Some(server) = Server::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");

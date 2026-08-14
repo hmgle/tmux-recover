@@ -307,6 +307,69 @@ async fn daemon_ignores_output_blocks_from_capture_command_hooks() {
 }
 
 #[tokio::test]
+async fn daemon_ignores_errors_from_capture_command_hooks() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    assert!(
+        server
+            .tmux()
+            .args([
+                "set-option",
+                "-go",
+                "after-list-sessions[900]",
+                "list-panes -t no-such-window",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(80),
+            poll_interval: Duration::from_secs(30),
+            ..AutosaveConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    wait_until(Duration::from_secs(5), || store.has_current()).await;
+    assert!(!task.is_finished(), "daemon exited during initial capture");
+    assert!(
+        server
+            .tmux()
+            .args(["rename-window", "-t", "daemon:0", "hook-error"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(5), || {
+        store
+            .load_current()
+            .is_ok_and(|snapshot| snapshot.state.windows[0].name == "hook-error")
+    })
+    .await;
+    assert!(
+        !task.is_finished(),
+        "daemon exited after an autosave capture"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn daemon_reports_legacy_hooks_without_removing_them() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");

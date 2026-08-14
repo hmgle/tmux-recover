@@ -135,6 +135,48 @@ async fn one_shot_runner_tolerates_blocks_from_command_hooks() {
 }
 
 #[tokio::test]
+async fn one_shot_runner_tolerates_errors_from_command_hooks() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    assert!(
+        server
+            .tmux()
+            .args([
+                "set-option",
+                "-go",
+                "after-list-panes[900]",
+                "list-panes -t no-such-window",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut runner = CommandRunner::new(&server.socket);
+    let blocks = runner
+        .execute_blocks(
+            [
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}",
+                ";",
+                "display-message",
+                "-p",
+                "after-hook-error",
+            ],
+            2,
+        )
+        .await
+        .expect("a failing hook was treated as a requested command failure");
+
+    assert_eq!(blocks.len(), 2);
+    assert!(String::from_utf8_lossy(&blocks[0][0]).starts_with('%'));
+    assert_eq!(blocks[1], vec![b"after-hook-error".to_vec()]);
+}
+
+#[tokio::test]
 async fn complete_one_shot_response_with_too_few_blocks_is_not_unavailable() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");

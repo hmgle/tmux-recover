@@ -638,6 +638,24 @@ mod tests {
         assert!(!argument.contains("\\012"));
     }
 
+    #[test]
+    fn capture_block_selection_rejects_missing_record_types() {
+        let blocks = vec![
+            vec![b"S|session".to_vec()],
+            vec![b"hook one".to_vec()],
+            vec![b"hook two".to_vec()],
+            vec![b"hook three".to_vec()],
+            vec![b"hook four".to_vec()],
+        ];
+
+        let error = select_capture_blocks(blocks)
+            .expect_err("extra hook blocks concealed a missing window result");
+        assert_eq!(
+            error.to_string(),
+            "tmux capture did not return a window block"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn capture_keys_temporary_socket_aliases_by_canonical_path() {
