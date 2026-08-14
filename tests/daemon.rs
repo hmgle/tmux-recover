@@ -811,8 +811,8 @@ async fn hook_event_saves_changed_state() {
 }
 
 #[tokio::test]
-async fn automatic_window_rename_saves_within_debounce() {
-    let Some(server) = TestServer::start_shell() else {
+async fn window_renamed_notification_saves_within_debounce() {
+    let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
         return;
     };
@@ -835,65 +835,42 @@ async fn automatic_window_rename_saves_within_debounce() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_for_default_shell_pane(&server, "daemon:0.0").await;
-    wait_until(Duration::from_secs(15), || store.has_current()).await;
+    wait_until(HOOK_CAPTURE_TIMEOUT, || store.has_current()).await;
+    // A manual rename emits both after-rename-window and window-renamed. Remove
+    // only the former daemon hook so this save proves the notification hook is
+    // independently wired; automatic rename reaches the same notification.
+    let command_hook = format!("after-rename-window[{}]", config.autosave.hook_slot);
     assert!(
         server
             .tmux()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                "daemon:0",
-                "#{automatic-rename}",
-            ])
-            .output()
-            .is_ok_and(|output| output.status.success() && output.stdout == b"1\n")
+            .args(["set-hook", "-gu", &command_hook])
+            .status()
+            .unwrap()
+            .success()
     );
-
-    let started = tokio::time::Instant::now();
-    loop {
-        assert!(
-            server
-                .tmux()
-                .args(["send-keys", "-t", "daemon:0.0", "sleep 60", "Enter"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let current = server
-            .tmux()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                "daemon:0.0",
-                "#{pane_current_command}",
-            ])
-            .output();
-        if current.is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n") {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "shell never started the automatic-rename probe"
-        );
-    }
-    // tmux schedules automatic rename independently of the daemon. Start the
-    // hook-delivery assertion only after tmux itself exposes the new name.
-    wait_until(Duration::from_secs(20), || {
+    let notification_hook = format!("window-renamed[{}]", config.autosave.hook_slot);
+    let installed = server
+        .tmux()
+        .args(["show-hooks", "-g", &notification_hook])
+        .output()
+        .unwrap();
+    assert!(installed.status.success());
+    assert!(
+        String::from_utf8_lossy(&installed.stdout)
+            .contains("wait-for -S tmux-recover:state-changed")
+    );
+    assert!(
         server
             .tmux()
-            .args(["display-message", "-p", "-t", "daemon:0", "#{window_name}"])
-            .output()
-            .is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n")
-    })
-    .await;
+            .args(["rename-window", "-t", "daemon:0", "notification-rename"])
+            .status()
+            .unwrap()
+            .success()
+    );
     wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
-            .is_ok_and(|snapshot| snapshot.state.windows[0].name == "sleep")
+            .is_ok_and(|snapshot| snapshot.state.windows[0].name == "notification-rename")
     })
     .await;
 
