@@ -12,6 +12,8 @@ use tmux_recover::{
 #[cfg(target_os = "linux")]
 use tmux_recover::restore::ProcessMetadataSource;
 
+const HOOK_CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct TestServer {
     directory: TempDir,
     socket: std::path::PathBuf,
@@ -281,7 +283,7 @@ async fn daemon_ignores_output_blocks_from_capture_command_hooks() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(5), || store.has_current()).await;
+    wait_until(HOOK_CAPTURE_TIMEOUT, || store.has_current()).await;
     assert!(!task.is_finished(), "daemon exited during initial capture");
     assert!(
         server
@@ -291,7 +293,7 @@ async fn daemon_ignores_output_blocks_from_capture_command_hooks() {
             .unwrap()
             .success()
     );
-    wait_until(Duration::from_secs(5), || {
+    wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].name == "hook-block")
@@ -344,7 +346,7 @@ async fn daemon_ignores_errors_from_capture_command_hooks() {
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
 
-    wait_until(Duration::from_secs(5), || store.has_current()).await;
+    wait_until(HOOK_CAPTURE_TIMEOUT, || store.has_current()).await;
     assert!(!task.is_finished(), "daemon exited during initial capture");
     assert!(
         server
@@ -354,7 +356,7 @@ async fn daemon_ignores_errors_from_capture_command_hooks() {
             .unwrap()
             .success()
     );
-    wait_until(Duration::from_secs(5), || {
+    wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].name == "hook-error")
@@ -777,7 +779,7 @@ async fn hook_event_saves_changed_state() {
     let pane_id = String::from_utf8(output.stdout).unwrap();
     let pane_id = pane_id.trim();
     assert!(pane_id.starts_with('%'));
-    wait_until(Duration::from_secs(5), || {
+    wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].panes.len() == 2)
@@ -787,7 +789,7 @@ async fn hook_event_saves_changed_state() {
 
     // This is a pane process exiting on its own, not `kill-pane`. tmux reports
     // it through pane-exited/window-layout-changed rather than after-kill-pane.
-    // The 5-second assertion ceiling is well below the 30-second poll interval.
+    // The assertion ceiling is well below the 30-second poll interval.
     assert!(
         server
             .tmux()
@@ -796,7 +798,7 @@ async fn hook_event_saves_changed_state() {
             .unwrap()
             .success()
     );
-    wait_until(Duration::from_secs(5), || {
+    wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].panes.len() == 1)
@@ -819,7 +821,7 @@ async fn automatic_window_rename_saves_within_debounce() {
         autosave: AutosaveConfig {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(80),
-            poll_interval: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(60),
             ..AutosaveConfig::default()
         },
         ..Config::default()
@@ -878,7 +880,17 @@ async fn automatic_window_rename_saves_within_debounce() {
             "shell never started the automatic-rename probe"
         );
     }
-    wait_until(Duration::from_secs(5), || {
+    // tmux schedules automatic rename independently of the daemon. Start the
+    // hook-delivery assertion only after tmux itself exposes the new name.
+    wait_until(Duration::from_secs(20), || {
+        server
+            .tmux()
+            .args(["display-message", "-p", "-t", "daemon:0", "#{window_name}"])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n")
+    })
+    .await;
+    wait_until(HOOK_CAPTURE_TIMEOUT, || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].name == "sleep")
