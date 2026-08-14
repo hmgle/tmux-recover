@@ -171,8 +171,16 @@ async fn daemon_polls_when_an_existing_hook_slot_is_occupied() {
         "hook preflight installed a partial event hook set"
     );
 
-    task.abort();
-    let _ = task.await;
+    assert!(server.stop(), "isolated tmux server did not stop");
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("polling daemon did not notice that tmux exited")
+        .expect("polling daemon task panicked")
+        .expect_err("polling daemon kept running after tmux exited");
+    assert!(
+        format!("{result:#}").contains("tmux server became unavailable during autosave"),
+        "unexpected daemon error: {result:#}"
+    );
 }
 
 #[tokio::test]
@@ -603,7 +611,7 @@ async fn hook_event_saves_changed_state() {
         autosave: AutosaveConfig {
             debounce: Duration::from_millis(30),
             min_interval: Duration::from_millis(80),
-            poll_interval: Duration::from_secs(5),
+            poll_interval: Duration::from_secs(30),
             ..AutosaveConfig::default()
         },
         ..Config::default()
@@ -623,7 +631,15 @@ async fn hook_event_saves_changed_state() {
 
     let output = server
         .tmux()
-        .args(["split-window", "-d", "-t", "daemon:0"])
+        .args([
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "daemon:0",
+        ])
         .arg("sleep 60")
         .output()
         .unwrap();
@@ -632,13 +648,116 @@ async fn hook_event_saves_changed_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    wait_until(Duration::from_secs(15), || {
+    let pane_id = String::from_utf8(output.stdout).unwrap();
+    let pane_id = pane_id.trim();
+    assert!(pane_id.starts_with('%'));
+    wait_until(Duration::from_secs(5), || {
         store
             .load_current()
             .is_ok_and(|snapshot| snapshot.state.windows[0].panes.len() == 2)
     })
     .await;
     assert_eq!(store.list().unwrap().len(), 2);
+
+    // This is a pane process exiting on its own, not `kill-pane`. tmux reports
+    // it through pane-exited/window-layout-changed rather than after-kill-pane.
+    // The 5-second assertion ceiling is well below the 30-second poll interval.
+    assert!(
+        server
+            .tmux()
+            .args(["send-keys", "-t", pane_id, "C-c"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_until(Duration::from_secs(5), || {
+        store
+            .load_current()
+            .is_ok_and(|snapshot| snapshot.state.windows[0].panes.len() == 1)
+    })
+    .await;
+    assert_eq!(store.list().unwrap().len(), 3);
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn automatic_window_rename_saves_within_debounce() {
+    let Some(server) = TestServer::start_shell() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(80),
+            poll_interval: Duration::from_secs(30),
+            ..AutosaveConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    wait_for_default_shell_pane(&server, "daemon:0.0").await;
+    wait_until(Duration::from_secs(15), || store.has_current()).await;
+    assert!(
+        server
+            .tmux()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                "daemon:0",
+                "#{automatic-rename}",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"1\n")
+    );
+
+    let started = tokio::time::Instant::now();
+    loop {
+        assert!(
+            server
+                .tmux()
+                .args(["send-keys", "-t", "daemon:0.0", "sleep 60", "Enter"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let current = server
+            .tmux()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                "daemon:0.0",
+                "#{pane_current_command}",
+            ])
+            .output();
+        if current.is_ok_and(|output| output.status.success() && output.stdout == b"sleep\n") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shell never started the automatic-rename probe"
+        );
+    }
+    wait_until(Duration::from_secs(5), || {
+        store
+            .load_current()
+            .is_ok_and(|snapshot| snapshot.state.windows[0].name == "sleep")
+    })
+    .await;
 
     task.abort();
     let _ = task.await;

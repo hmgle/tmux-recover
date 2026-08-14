@@ -418,7 +418,20 @@ async fn wait_for_daemon_reload(
 
 #[cfg(unix)]
 fn reexec_daemon() -> Result<()> {
+    use nix::{
+        errno::Errno,
+        sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+        unistd::Pid,
+    };
     use std::os::unix::process::CommandExt;
+
+    loop {
+        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error).context("failed to reap daemon child process"),
+        }
+    }
 
     let mut args = std::env::args_os();
     let executable = args

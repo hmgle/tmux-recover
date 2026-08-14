@@ -215,6 +215,7 @@ fn reload_requested_during_a_blocked_startup_is_applied_once_it_finishes() {
         "reload must preserve the supervisor PID"
     );
     assert_eq!(reloaded.version, env!("CARGO_PKG_VERSION"));
+    assert_no_zombie_children(first.pid);
 
     let output = cli.run(&server.socket, "--stop", &[]);
     assert!(output.status.success(), "stop failed: {output:?}");
@@ -252,6 +253,32 @@ fn daemon_status_stop_and_reload_control_the_exact_instance() {
     let status = daemon.wait().unwrap();
     assert!(status.success(), "daemon did not exit cleanly: {status}");
 }
+
+#[cfg(target_os = "linux")]
+fn assert_no_zombie_children(pid: u32) {
+    thread::sleep(Duration::from_millis(200));
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+    for child in children.split_whitespace() {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{child}/status")) else {
+            continue;
+        };
+        let state = status
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .unwrap_or("State: unknown");
+        let name = status
+            .lines()
+            .find(|line| line.starts_with("Name:"))
+            .unwrap_or("Name: unknown");
+        assert!(
+            !state.contains("Z (zombie)"),
+            "child {child} is {name}, {state}"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_no_zombie_children(_pid: u32) {}
 
 fn wait_for_status(cli: &IsolatedCli, socket: &std::path::Path) -> DaemonStatus {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);

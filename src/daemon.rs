@@ -15,7 +15,7 @@ use crate::{
     storage::{CommitOutcome, SnapshotStore},
     tmux::{
         capture::{CaptureResult, capture_structure_unattached},
-        control::{CommandRunner, ControlClient},
+        control::{CommandRunner, ControlClient, command_runner_is_unavailable},
         hooks,
     },
     util::socket_identity,
@@ -131,10 +131,38 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
 
         tokio::select! {
             request = control.next_request() => {
-                match request {
-                    ControlAction::Stop => break DaemonExit::Stop,
-                    ControlAction::Reload => break DaemonExit::Reload,
+                let exit = match request {
+                    ControlAction::Stop => DaemonExit::Stop,
+                    ControlAction::Reload => DaemonExit::Reload,
+                };
+                if hook_events_enabled {
+                    match runner
+                        .execute(["wait-for", "-S", hooks::EVENT_CHANNEL])
+                        .await
+                    {
+                        Ok(output) if output.is_empty() => {
+                            if let Err(error) = hook_event.as_mut().await {
+                                tracing::warn!(
+                                    error = %format!("{error:#}"),
+                                    "tmux hook waiter failed while the daemon was exiting"
+                                );
+                            }
+                        }
+                        Ok(output) => {
+                            tracing::warn!(
+                                records = output.len(),
+                                "tmux returned unexpected output while waking the hook waiter"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "could not wake the tmux hook waiter while the daemon was exiting"
+                            );
+                        }
+                    }
                 }
+                break exit;
             }
             result = &mut hook_event => {
                 result?;
@@ -166,6 +194,11 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
                     Ok(SaveOutcome::Unchanged) => protected_current = None,
                     Ok(SaveOutcome::ProtectedBootstrap) => {}
                     Err(error) => {
+                        if command_runner_is_unavailable(&error) {
+                            return Err(error).context(
+                                "tmux server became unavailable during autosave",
+                            );
+                        }
                         tracing::error!(error = %format!("{error:#}"), "autosave failed; keeping the previous snapshot current");
                     }
                 }

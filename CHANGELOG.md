@@ -10,8 +10,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Stop the daemon from keeping a control-mode client attached to a user
   session, where it could interfere with terminal capability and colour queries
-  and suppress TUI animations. Background capture and hook management now use
-  unattached one-shot command clients.
+  and suppress TUI animations. Background capture, hook management, manual
+  saves, and restore preflight now use unattached one-shot command clients.
+- Capture pane process exits, layout notifications, automatic window renames,
+  and effective window resizes through hooks instead of waiting for the next
+  metadata poll.
+- Stop polling-only daemons after their tmux server disappears instead of
+  retaining the daemon lock and control socket indefinitely.
+- Reap the event waiter before an in-place daemon reload so repeated reloads do
+  not accumulate defunct tmux client processes.
 
 ## [0.3.0] - 2026-08-11
 

@@ -105,12 +105,15 @@ entry or rejects an occupied one without overwriting it. The static
 `wait-for -S tmux-recover:state-changed` command signals a latched channel that
 a separate waiter consumes. An identical entry from an earlier daemon is safe
 to reuse across daemon restarts. Capture and hook management run through
-`source-file -` command clients that never attach to a session; the watcher is
-therefore absent from `list-clients` while idle and cannot participate in a
-user session's terminal capability or colour queries. Other hook commands are
-preserved; the daemon warns and continues with low-frequency polling. Persistent
-hooks are not removed on shutdown, which avoids creating a symmetric
-check-versus-unset race.
+one-shot `tmux -C` command clients whose commands are passed as argv. They never
+attach to a session, so the watcher is absent from `list-clients` while idle and
+cannot participate in a user session's terminal capability or colour queries.
+Other hook commands are preserved; the daemon warns and continues with
+low-frequency polling. A polling-only daemon exits when its one-shot command
+client can no longer reach the server. Persistent hooks are not removed on
+shutdown, which avoids creating a symmetric check-versus-unset race. Before an
+in-place reload, the daemon wakes and awaits its current event waiter so the old
+tmux client process is reaped before re-exec.
 
 Older releases installed client-specific
 `display-message -c ... tmux-recover:state-changed` entries. Startup recognizes
@@ -120,13 +123,14 @@ daemon, the operator unsets the reported entries on the explicit socket or
 selects another dedicated slot. An automatic check-then-unset would recreate
 the same race by deleting a hook that another process installed in between.
 
-Structure events are debounced. cwd and pane title changes are found by a
-low-frequency poll. Capture first reads only tmux structure; process restart
-metadata is added later only when the structure changed or a process checkpoint
-is due. A capture is committed only when its structural hash (topology, layout,
-cwd, titles; excludes pid/tty/current_command/dead_status) differs from the
-current snapshot, so an idle server does not produce a new snapshot on every
-poll or scan `/proc` on every poll.
+Structure events, including pane process exits, automatic window renames, and
+layout or effective-size changes, are debounced. cwd and pane title changes are
+found by a low-frequency poll. Capture first reads only tmux structure; process
+restart metadata is added later only when the structure changed or a process
+checkpoint is due. A capture is committed only when its structural hash
+(topology, layout, cwd, titles; excludes pid/tty/current_command/dead_status)
+differs from the current snapshot, so an idle server does not produce a new
+snapshot on every poll or scan `/proc` on every poll.
 
 The full snapshot keeps ordinary-client attachments in recent-activity order
 for best-effort pairing after a restart. The structural projection sorts those

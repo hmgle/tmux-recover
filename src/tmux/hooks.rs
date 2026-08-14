@@ -24,11 +24,15 @@ const STRUCTURE_HOOKS: &[&str] = &[
     "client-attached",
     "client-detached",
     "client-session-changed",
+    "pane-exited",
     "session-closed",
     "session-created",
     "session-renamed",
     "session-window-changed",
+    "window-layout-changed",
     "window-linked",
+    "window-renamed",
+    "window-resized",
     "window-unlinked",
 ];
 
