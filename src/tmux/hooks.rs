@@ -83,8 +83,10 @@ pub async fn install(
 
     for hook in STRUCTURE_HOOKS {
         let name = format!("{hook}[{hook_slot}]");
-        let command = format!("set-option -go {name} \"{EVENT_COMMAND}\"");
-        match client.execute(&command).await {
+        match client
+            .execute(["set-option", "-go", name.as_str(), EVENT_COMMAND])
+            .await
+        {
             Ok(output) if output.is_empty() => {}
             Ok(output) => {
                 return Err(anyhow::anyhow!(
@@ -171,7 +173,7 @@ pub async fn wait_for_event(socket: &Path) -> Result<()> {
 }
 
 async fn value(client: &mut CommandRunner, name: &str) -> Result<Option<String>> {
-    let output = client.execute(&format!("show-hooks -g {name}")).await?;
+    let output = client.execute(["show-hooks", "-g", name]).await?;
     if output.len() != 1 {
         bail!(
             "tmux returned {} records for hook {name}, expected one",

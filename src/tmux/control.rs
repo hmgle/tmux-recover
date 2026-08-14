@@ -1,10 +1,12 @@
 use std::{
     collections::VecDeque,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
+use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -28,6 +30,21 @@ pub struct CommandRunner {
     socket: PathBuf,
 }
 
+#[derive(Debug, Error)]
+#[error("tmux one-shot command client became unavailable: {detail}")]
+struct CommandRunnerUnavailable {
+    detail: String,
+}
+
+/// True when a one-shot client stopped before it completed every requested
+/// command. This normally means the target tmux server has exited or its socket
+/// can no longer be reached, so a daemon should release its lock and stop.
+pub fn command_runner_is_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<CommandRunnerUnavailable>())
+}
+
 impl CommandRunner {
     pub fn new(socket: &Path) -> Self {
         Self {
@@ -35,49 +52,159 @@ impl CommandRunner {
         }
     }
 
-    pub async fn execute(&mut self, command: &str) -> Result<Vec<Vec<u8>>> {
+    pub async fn execute<I, S>(&mut self, arguments: I) -> Result<Vec<Vec<u8>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut blocks = self.execute_blocks(arguments, 1).await?;
+        Ok(blocks.pop().unwrap_or_default())
+    }
+
+    pub async fn execute_blocks<I, S>(
+        &mut self,
+        arguments: I,
+        block_count: usize,
+    ) -> Result<Vec<Vec<Vec<u8>>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let arguments: Vec<OsString> = arguments
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect();
         tracing::debug!(
             target: "tmux_recover::control",
             socket = %self.socket.display(),
-            command,
+            arguments = ?arguments,
+            blocks = block_count,
             "execute unattached tmux command"
         );
-        let mut child = Command::new("tmux")
+        let output = Command::new("tmux")
             .env_remove("TMUX")
             .arg("-S")
             .arg(&self.socket)
-            .args(["-u", "source-file", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .args(["-u", "-C"])
+            .args(&arguments)
             .kill_on_drop(true)
-            .spawn()
+            .output()
+            .await
             .with_context(|| {
                 format!(
                     "failed to execute tmux command on socket {}",
                     self.socket.display()
                 )
             })?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("tmux command stdin is unavailable")?;
-        stdin.write_all(command.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        drop(stdin);
 
-        let output = child.wait_with_output().await?;
-        if !output.status.success() {
+        let response = match parse_one_shot_output(&output.stdout, block_count) {
+            Ok(response) => response,
+            Err(OneShotParseError::Command(error)) => return Err(error),
+            Err(OneShotParseError::Protocol(detail)) => {
+                return Err(CommandRunnerUnavailable { detail }.into());
+            }
+        };
+        if !output.status.success() || !response.saw_exit || response.blocks.len() != block_count {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let detail = if stderr.is_empty() {
-                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+                format!(
+                    "{}; received {} of {block_count} command blocks{}",
+                    output.status,
+                    response.blocks.len(),
+                    if response.saw_exit {
+                        ""
+                    } else {
+                        " before the control stream closed"
+                    }
+                )
             } else {
                 stderr
             };
-            bail!("tmux command failed: {detail}");
+            return Err(CommandRunnerUnavailable { detail }.into());
         }
-        Ok(split_lines(output.stdout))
+        Ok(response.blocks)
     }
+}
+
+struct OneShotResponse {
+    blocks: Vec<Vec<Vec<u8>>>,
+    saw_exit: bool,
+}
+
+enum OneShotParseError {
+    Command(anyhow::Error),
+    Protocol(String),
+}
+
+fn parse_one_shot_output(
+    stdout: &[u8],
+    block_count: usize,
+) -> std::result::Result<OneShotResponse, OneShotParseError> {
+    let lines = split_lines(stdout);
+    let mut lines = lines.into_iter();
+    let mut blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(block_count);
+    let mut saw_exit = false;
+
+    while let Some(line) = lines.next() {
+        let header = parse_block_header(&line)
+            .map_err(|error| OneShotParseError::Protocol(format!("{error:#}")))?;
+        if let Some(header) = header {
+            // Commands supplied on the initial `tmux -C` argv are unflagged.
+            // Persistent clients use flags to distinguish later stdin commands
+            // from hooks, but applying that rule here would discard every block.
+            if header.flags != 0 {
+                return Err(OneShotParseError::Protocol(format!(
+                    "one-shot command block has unexpected flags {}",
+                    header.flags
+                )));
+            }
+            let mut output: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let Some(line) = lines.next() else {
+                    return Err(OneShotParseError::Protocol(
+                        "control output ended while a command block was pending".to_owned(),
+                    ));
+                };
+                if line.starts_with(b"%end ") {
+                    blocks.push(output);
+                    break;
+                }
+                if line.starts_with(b"%error ") {
+                    let detail = output
+                        .iter()
+                        .map(|line| String::from_utf8_lossy(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let detail = if detail.is_empty() {
+                        text_lossy(&line)
+                    } else {
+                        detail
+                    };
+                    return Err(OneShotParseError::Command(anyhow::anyhow!(
+                        "tmux command failed at step {} of {block_count}: {detail}",
+                        blocks.len() + 1
+                    )));
+                }
+                if line.starts_with(b"%exit") {
+                    return Err(OneShotParseError::Protocol(
+                        "one-shot client exited while a command block was pending".to_owned(),
+                    ));
+                }
+                output.push(line);
+            }
+            continue;
+        }
+        if line.starts_with(b"%exit") {
+            saw_exit = true;
+        } else if parse_notification(&line).is_none() {
+            return Err(OneShotParseError::Protocol(format!(
+                "unexpected control-mode line: {}",
+                text_lossy(&line)
+            )));
+        }
+    }
+
+    Ok(OneShotResponse { blocks, saw_exit })
 }
 
 pub struct ControlClient {
@@ -385,27 +512,56 @@ fn text_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn split_lines(mut bytes: Vec<u8>) -> Vec<Vec<u8>> {
+fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-    }
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     bytes.split(|byte| *byte == b'\n').map(Vec::from).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_lines;
+    use super::{OneShotParseError, parse_one_shot_output, split_lines};
 
     #[test]
     fn splits_command_output_without_a_synthetic_trailing_record() {
-        assert!(split_lines(Vec::new()).is_empty());
+        assert!(split_lines(&[]).is_empty());
         assert_eq!(
-            split_lines(b"one\ntwo\n".to_vec()),
+            split_lines(b"one\ntwo\n"),
             vec![b"one".to_vec(), b"two".to_vec()]
         );
-        assert_eq!(split_lines(b"\n".to_vec()), vec![Vec::<u8>::new()]);
+        assert_eq!(split_lines(b"\n"), vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn parses_unflagged_one_shot_command_blocks() {
+        let response = parse_one_shot_output(
+            b"%begin 1 2 0\none\n%end 1 2 0\n%begin 1 3 0\ntwo\n%end 1 3 0\n%exit\n",
+            2,
+        )
+        .unwrap_or_else(|_| panic!("valid one-shot control output was rejected"));
+        assert!(response.saw_exit);
+        assert_eq!(
+            response.blocks,
+            vec![vec![b"one".to_vec()], vec![b"two".to_vec()]]
+        );
+    }
+
+    #[test]
+    fn reports_one_shot_command_errors_with_their_step() {
+        let error = parse_one_shot_output(
+            b"%begin 1 2 0\none\n%end 1 2 0\n%begin 1 3 0\nno target\n%error 1 3 0\n%exit\n",
+            3,
+        )
+        .err()
+        .expect("failing control output was accepted");
+        let OneShotParseError::Command(error) = error else {
+            panic!("command failure was misclassified as a protocol failure");
+        };
+        assert_eq!(
+            error.to_string(),
+            "tmux command failed at step 2 of 3: no target"
+        );
     }
 }

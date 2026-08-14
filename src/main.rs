@@ -20,7 +20,11 @@ use tmux_recover::{
     },
     restore::{apply, preflight, process_checkpoint_is_offered, restore_config_options},
     storage::{CommitOutcome, SnapshotStore},
-    tmux::{capture::capture_structure, control::ControlClient, resolve_socket},
+    tmux::{
+        capture::capture_structure_unattached,
+        control::{CommandRunner, ControlClient},
+        resolve_socket,
+    },
     util::{socket_from_tmux_env, socket_identity},
 };
 
@@ -439,8 +443,8 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
         target_store.clone()
     };
     let snapshot = source_store.load(&args.snapshot)?;
-    let mut client = ControlClient::connect(&socket).await?;
-    let mut target = capture_structure(&mut client, &socket).await?;
+    let mut runner = CommandRunner::new(&socket);
+    let mut target = capture_structure_unattached(&mut runner, &socket).await?;
 
     if args.cwd_fallback.as_deref() == Some(Path::new("HOME")) {
         args.cwd_fallback = Some(
@@ -523,6 +527,7 @@ async fn restore(data_dir: &Path, config: &Config, mut args: RestoreArgs) -> Res
     target_store.prune(&config.retention)?;
     println!("safety snapshot: {}", safety_snapshot.id);
 
+    let mut client = ControlClient::connect(&socket).await?;
     let report = apply(&mut client, &snapshot, &target, &plan).await;
     let report_path = target_store.write_restore_report(&report)?;
     println!("restore report: {}", report_path.display());
@@ -695,8 +700,8 @@ async fn save(data_dir: &Path, config: &Config, args: SaveArgs) -> Result<()> {
         println!("snapshot store already initialized");
         return Ok(());
     }
-    let mut client = ControlClient::connect(&socket).await?;
-    let mut captured = capture_structure(&mut client, &socket).await?;
+    let mut runner = CommandRunner::new(&socket);
+    let mut captured = capture_structure_unattached(&mut runner, &socket).await?;
     if processes_enabled {
         captured.capture_processes();
     }

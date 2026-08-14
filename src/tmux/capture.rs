@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, ffi::OsStr, path::Path};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -33,8 +37,9 @@ pub async fn capture_structure(
     client: &mut ControlClient,
     requested_socket: &Path,
 ) -> Result<CaptureResult> {
+    let command = capture_command();
     let output = client
-        .execute_blocks(&capture_command(), 5)
+        .execute_blocks(&command.control, command.block_count)
         .await?
         .into_iter()
         .flatten()
@@ -47,7 +52,13 @@ pub async fn capture_structure_unattached(
     runner: &mut CommandRunner,
     requested_socket: &Path,
 ) -> Result<CaptureResult> {
-    let output = runner.execute(&capture_command()).await?;
+    let command = capture_command();
+    let output = runner
+        .execute_blocks(&command.arguments, command.block_count)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
     parse_capture(output, requested_socket)
 }
 
@@ -57,8 +68,31 @@ impl CaptureResult {
     }
 }
 
-fn capture_command() -> String {
-    let s = |name| escaped_format(name);
+struct CaptureCommand {
+    control: String,
+    arguments: Vec<OsString>,
+    block_count: usize,
+}
+
+struct CaptureFormats {
+    session: String,
+    window: String,
+    pane: String,
+    metadata: String,
+    client: String,
+}
+
+#[derive(Clone, Copy)]
+enum FormatSyntax {
+    // Persistent clients submit tmux command text, whose parser turns octal
+    // escapes into control characters. One-shot argv bypasses that layer, so
+    // its format argument must contain the literal characters instead.
+    ControlText,
+    Arguments,
+}
+
+fn capture_formats(syntax: FormatSyntax) -> CaptureFormats {
+    let s = |name| escaped_format(name, syntax);
     let session = format!(
         "S|{}|{}|{}|{}|{}",
         s("session_id"),
@@ -116,13 +150,90 @@ fn capture_command() -> String {
         s("session_id"),
         s("client_last_session")
     );
-    format!(
-        "list-sessions -F \"{session}\" ; list-windows -a -F \"{window}\" ; list-panes -a -F \"{pane}\" ; display-message -p -F \"{metadata}\" ; list-clients -F \"{client}\""
-    )
+    CaptureFormats {
+        session,
+        window,
+        pane,
+        metadata,
+        client,
+    }
 }
 
-fn escaped_format(name: &str) -> String {
-    format!("#{{s|%|%25|;s/[|]/%7C/;s|\\011|%09|;s|\\012|%0A|;s|\\015|%0D|:{name}}}")
+fn capture_command() -> CaptureCommand {
+    let control_formats = capture_formats(FormatSyntax::ControlText);
+    let argument_formats = capture_formats(FormatSyntax::Arguments);
+    let commands = [
+        (
+            format!("list-sessions -F \"{}\"", control_formats.session),
+            vec![
+                "list-sessions".into(),
+                "-F".into(),
+                argument_formats.session.into(),
+            ],
+        ),
+        (
+            format!("list-windows -a -F \"{}\"", control_formats.window),
+            vec![
+                "list-windows".into(),
+                "-a".into(),
+                "-F".into(),
+                argument_formats.window.into(),
+            ],
+        ),
+        (
+            format!("list-panes -a -F \"{}\"", control_formats.pane),
+            vec![
+                "list-panes".into(),
+                "-a".into(),
+                "-F".into(),
+                argument_formats.pane.into(),
+            ],
+        ),
+        (
+            format!("display-message -p -F \"{}\"", control_formats.metadata),
+            vec![
+                "display-message".into(),
+                "-p".into(),
+                "-F".into(),
+                argument_formats.metadata.into(),
+            ],
+        ),
+        (
+            format!("list-clients -F \"{}\"", control_formats.client),
+            vec![
+                "list-clients".into(),
+                "-F".into(),
+                argument_formats.client.into(),
+            ],
+        ),
+    ];
+    let control = commands
+        .iter()
+        .map(|(control, _)| control.as_str())
+        .collect::<Vec<_>>()
+        .join(" ; ");
+    let mut arguments = Vec::new();
+    for (index, (_, command)) in commands.iter().enumerate() {
+        if index != 0 {
+            arguments.push(OsString::from(";"));
+        }
+        arguments.extend(command.iter().cloned());
+    }
+    CaptureCommand {
+        control,
+        arguments,
+        block_count: commands.len(),
+    }
+}
+
+fn escaped_format(name: &str, syntax: FormatSyntax) -> String {
+    let (tab, newline, carriage_return) = match syntax {
+        FormatSyntax::ControlText => (r"\011", r"\012", r"\015"),
+        FormatSyntax::Arguments => ("\t", "\n", "\r"),
+    };
+    format!(
+        "#{{s|%|%25|;s/[|]/%7C/;s|{tab}|%09|;s|{newline}|%0A|;s|{carriage_return}|%0D|:{name}}}"
+    )
 }
 
 fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<CaptureResult> {
@@ -437,7 +548,7 @@ fn field_i64(fields: &[Vec<u8>], index: usize) -> Result<Option<i64>> {
         String::from_utf8_lossy(value)
             .parse()
             .map(Some)
-            .context("invalid tmux integer")
+            .with_context(|| format!("invalid tmux integer {:?}", String::from_utf8_lossy(value)))
     }
 }
 
@@ -479,10 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn format_encoder_is_line_safe() {
-        let format = escaped_format("pane_current_path");
-        assert!(!format.contains('\n'));
-        assert!(format.contains("\\012"));
+    fn format_encoder_uses_transport_specific_control_characters() {
+        let control = escaped_format("pane_current_path", FormatSyntax::ControlText);
+        assert!(!control.contains('\n'));
+        assert!(control.contains("\\012"));
+
+        let argument = escaped_format("pane_current_path", FormatSyntax::Arguments);
+        assert!(argument.contains('\t'));
+        assert!(argument.contains('\n'));
+        assert!(argument.contains('\r'));
+        assert!(!argument.contains("\\012"));
     }
 
     #[cfg(unix)]

@@ -325,11 +325,12 @@ settle, but leaves an older or populated server untouched. If that check times
 out, or preflight fails before changing tmux, the previous `current` remains
 selected while the server is still a one-session/one-window/one-pane bootstrap.
 Autosave resumes normally after real structure is added.
-The watcher runs capture and hook commands through unattached command clients,
-so it does not remain attached to a user session or affect that session's
-terminal capability queries. Automatic restore opens a temporary control-mode
-client only for the restore transaction and releases it afterwards. Attach a
-terminal normally if the report says a restored session has no ordinary client.
+The watcher, manual saves, and restore preflight run capture and hook commands
+through unattached command clients, so they do not attach to a user session or
+affect that session's terminal capability queries. Automatic restore opens a
+temporary control-mode client only for the restore transaction and releases it
+afterwards. Attach a terminal normally if the report says a restored session
+has no ordinary client.
 
 ### Import tmux-resurrect history
 

@@ -8,8 +8,8 @@ use std::{
 use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
 use tmux_recover::tmux::{
-    capture::{capture, capture_structure},
-    control::ControlClient,
+    capture::{capture, capture_structure, capture_structure_unattached},
+    control::{CommandRunner, ControlClient},
 };
 
 mod support;
@@ -41,7 +41,7 @@ impl TestServer {
                 "new-session",
                 "-d",
                 "-s",
-                "capture:雪",
+                "capture:雪:011:012:015",
                 "sleep 60",
             ])
             .status()
@@ -214,7 +214,7 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
     // /var alias. Compare filesystem identities while still exercising the
     // tabs, newlines, colons, and Unicode this test exists to preserve.
     let expected_cwd = cwd.canonicalize().unwrap();
-    assert_eq!(captured.state.sessions[0].name, "capture:雪");
+    assert_eq!(captured.state.sessions[0].name, "capture:雪:011:012:015");
     let window = &captured.state.windows[0];
     assert_eq!(window.automatic_rename, Some(false));
     assert_eq!(window.panes[0].title.as_deref(), Some(""));
@@ -233,6 +233,15 @@ async fn captures_empty_title_and_line_unsafe_cwd() {
             .unwrap(),
         expected_cwd
     );
+
+    // The argv form must use literal control characters in its replacement
+    // patterns. Raw `\011` would match these name digits and decode them as a
+    // tab, which can also corrupt numeric capture fields such as timestamps.
+    let mut runner = CommandRunner::new(&server.socket);
+    let unattached = capture_structure_unattached(&mut runner, &server.socket)
+        .await
+        .unwrap();
+    assert_eq!(unattached.state.sessions[0].name, "capture:雪:011:012:015");
 }
 
 #[tokio::test]
@@ -255,7 +264,7 @@ async fn captures_only_ordinary_client_session_selection() {
         "#{session_id}|#{session_name}",
     ]))
     .lines()
-    .find_map(|line| line.strip_suffix("|capture:雪"))
+    .find_map(|line| line.strip_suffix("|capture:雪:011:012:015"))
     .unwrap()
     .to_owned();
     let ordinary = AttachedClient::start(&server, &original_session_id);
@@ -282,7 +291,7 @@ async fn captures_only_ordinary_client_session_selection() {
         .state
         .sessions
         .iter()
-        .find(|session| session.name == "capture:雪")
+        .find(|session| session.name == "capture:雪:011:012:015")
         .unwrap();
     let client_state = captured.state.client_state.unwrap();
     assert_eq!(client_state.attachments.len(), 1);

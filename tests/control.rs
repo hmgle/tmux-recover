@@ -7,7 +7,7 @@
 use std::{process::Command, time::Duration};
 
 use tempfile::TempDir;
-use tmux_recover::tmux::control::ControlClient;
+use tmux_recover::tmux::control::{CommandRunner, ControlClient, command_runner_is_unavailable};
 
 struct TestServer {
     #[allow(dead_code)]
@@ -54,6 +54,40 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.tmux().arg("kill-server").status();
     }
+}
+
+#[tokio::test]
+async fn one_shot_runner_preserves_command_error_blocks() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let mut runner = CommandRunner::new(&server.socket);
+    let result = runner
+        .execute_blocks(
+            [
+                "display-message",
+                "-p",
+                "one",
+                ";",
+                "list-panes",
+                "-t",
+                "no-such-window",
+                ";",
+                "display-message",
+                "-p",
+                "three",
+            ],
+            3,
+        )
+        .await;
+
+    let error = result.expect_err("the one-shot sequence must fail");
+    assert!(!command_runner_is_unavailable(&error));
+    assert_eq!(
+        error.to_string(),
+        "tmux command failed at step 2 of 3: can't find window: no-such-window"
+    );
 }
 
 /// tmux abandons the remainder of a sequence at the first failure, so a

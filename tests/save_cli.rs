@@ -115,6 +115,44 @@ fn save_with_config(
 }
 
 #[test]
+fn save_does_not_trigger_client_attachment_hooks() {
+    let Some(server) = Server::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    for hook in [
+        "client-attached[777]",
+        "client-session-changed[777]",
+        "client-detached[777]",
+    ] {
+        assert!(
+            Command::new("tmux")
+                .args(["-S"])
+                .arg(&server.socket)
+                .args(["set-hook", "-g", hook, "set-option -g @save-client-event 1",])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    assert!(save(data.path(), &server.socket, &[]).starts_with("saved "));
+    std::thread::sleep(Duration::from_millis(100));
+    let event = Command::new("tmux")
+        .args(["-S"])
+        .arg(&server.socket)
+        .args(["show-options", "-gqv", "@save-client-event"])
+        .output()
+        .unwrap();
+    assert!(event.status.success());
+    assert!(
+        event.stdout.is_empty(),
+        "save attached a tmux client and triggered a client hook"
+    );
+}
+
+#[test]
 fn empty_allowlist_saves_without_process_metadata_and_removes_the_sidecar() {
     let Some(server) = Server::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
