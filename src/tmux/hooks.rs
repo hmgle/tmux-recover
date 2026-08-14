@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use thiserror::Error;
 use tokio::process::Command;
 
-use super::control::ControlClient;
+use super::control::CommandRunner;
 
 pub const EVENT_CHANNEL: &str = "tmux-recover:state-changed";
 pub const EVENT_COMMAND: &str = "wait-for -S tmux-recover:state-changed";
@@ -49,7 +49,7 @@ pub enum InstallError {
 /// daemon is reusable because it signals a stable channel rather than naming
 /// an ephemeral control client.
 pub async fn install(
-    client: &mut ControlClient,
+    client: &mut CommandRunner,
     hook_slot: u16,
 ) -> std::result::Result<(), InstallError> {
     let mut legacy = Vec::new();
@@ -170,7 +170,7 @@ pub async fn wait_for_event(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn value(client: &mut ControlClient, name: &str) -> Result<Option<String>> {
+async fn value(client: &mut CommandRunner, name: &str) -> Result<Option<String>> {
     let output = client.execute(&format!("show-hooks -g {name}")).await?;
     if output.len() != 1 {
         bail!(

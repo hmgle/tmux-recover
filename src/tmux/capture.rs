@@ -12,7 +12,7 @@ use crate::{
     util::{canonical_socket_path, hostname, require_tmux_37, uid},
 };
 
-use super::control::ControlClient;
+use super::control::{CommandRunner, ControlClient};
 
 const SEPARATOR: u8 = b'|';
 
@@ -39,6 +39,15 @@ pub async fn capture_structure(
         .into_iter()
         .flatten()
         .collect();
+    parse_capture(output, requested_socket)
+}
+
+/// Captures server state without attaching a tmux client to a user session.
+pub async fn capture_structure_unattached(
+    runner: &mut CommandRunner,
+    requested_socket: &Path,
+) -> Result<CaptureResult> {
+    let output = runner.execute(&capture_command()).await?;
     parse_capture(output, requested_socket)
 }
 

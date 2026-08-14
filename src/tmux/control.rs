@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, path::Path, process::Stdio};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -11,6 +15,69 @@ pub enum Notification {
     Message(String),
     Event(String),
     Exit(String),
+}
+
+/// Executes tmux commands without attaching a client to any session.
+///
+/// A long-lived control-mode client participates in session terminal state even
+/// with `ignore-size` and `no-output`. In particular, it can interfere with
+/// terminal capability and colour queries from programs running in that
+/// session. The daemon uses this runner for capture and hook management so it
+/// remains invisible to user sessions between commands.
+pub struct CommandRunner {
+    socket: PathBuf,
+}
+
+impl CommandRunner {
+    pub fn new(socket: &Path) -> Self {
+        Self {
+            socket: socket.to_path_buf(),
+        }
+    }
+
+    pub async fn execute(&mut self, command: &str) -> Result<Vec<Vec<u8>>> {
+        tracing::debug!(
+            target: "tmux_recover::control",
+            socket = %self.socket.display(),
+            command,
+            "execute unattached tmux command"
+        );
+        let mut child = Command::new("tmux")
+            .env_remove("TMUX")
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["-u", "source-file", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to execute tmux command on socket {}",
+                    self.socket.display()
+                )
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("tmux command stdin is unavailable")?;
+        stdin.write_all(command.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        drop(stdin);
+
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail = if stderr.is_empty() {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            } else {
+                stderr
+            };
+            bail!("tmux command failed: {detail}");
+        }
+        Ok(split_lines(output.stdout))
+    }
 }
 
 pub struct ControlClient {
@@ -316,4 +383,29 @@ fn parse_block_header(line: &[u8]) -> Result<Option<BlockHeader>> {
 
 fn text_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn split_lines(mut bytes: Vec<u8>) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    bytes.split(|byte| *byte == b'\n').map(Vec::from).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_lines;
+
+    #[test]
+    fn splits_command_output_without_a_synthetic_trailing_record() {
+        assert!(split_lines(Vec::new()).is_empty());
+        assert_eq!(
+            split_lines(b"one\ntwo\n".to_vec()),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        assert_eq!(split_lines(b"\n".to_vec()), vec![Vec::<u8>::new()]);
+    }
 }

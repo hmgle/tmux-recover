@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop the daemon from keeping a control-mode client attached to a user
+  session, where it could interfere with terminal capability and colour queries
+  and suppress TUI animations. Background capture and hook management now use
+  unattached one-shot command clients.
+
 ## [0.3.0] - 2026-08-11
 
 ### Added

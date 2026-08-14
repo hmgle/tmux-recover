@@ -1,6 +1,6 @@
 use std::{cmp::max, future::Future, path::Path, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{TimeDelta, Utc};
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -14,8 +14,8 @@ use crate::{
     },
     storage::{CommitOutcome, SnapshotStore},
     tmux::{
-        capture::{CaptureResult, capture_structure},
-        control::ControlClient,
+        capture::{CaptureResult, capture_structure_unattached},
+        control::{CommandRunner, ControlClient},
         hooks,
     },
     util::socket_identity,
@@ -38,8 +38,8 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
     let status = DaemonStatus::running(socket);
     let mut control = ControlServer::bind(data_dir, &identity.key, status)?;
     let startup = async {
-        let mut client = ControlClient::connect(socket).await?;
-        let initial = capture_structure(&mut client, socket).await?;
+        let mut runner = CommandRunner::new(socket);
+        let initial = capture_structure_unattached(&mut runner, socket).await?;
         let mut protected_current = match bootstrap_current_to_preserve(&store, config, &initial) {
             Ok(snapshot_id) => snapshot_id,
             Err(error) => {
@@ -54,11 +54,9 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
         // the whole daemon down: the server is still there and still worth
         // watching, so log it and fall through to the normal watch loop instead
         // of propagating the error out of `run`.
-        match auto_restore(&mut client, socket, &store, config, &initial).await {
+        match auto_restore(&mut runner, socket, &store, config, &initial).await {
             Ok(true) => {
                 protected_current = None;
-                drop(client);
-                client = ControlClient::connect(socket).await?;
             }
             Ok(false) => {}
             Err(AutoRestoreError::ServerUntouched(error)) => {
@@ -70,27 +68,24 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             Err(AutoRestoreError::ServerMutated(error)) => {
                 // Do not claim the server is unchanged here: apply() may have
                 // created or killed sessions before failing, and rollback may have
-                // stopped partway. Reconnect so hooks and the next capture see
-                // whatever actually survived.
+                // stopped partway. The next stateless capture sees whatever
+                // actually survived.
                 tracing::error!(
                     error = %format!("{error:#}"),
-                    "automatic restore failed after changing the server; reconnecting and continuing to watch"
+                    "automatic restore failed after changing the server; continuing to watch surviving state"
                 );
                 protected_current = None;
-                drop(client);
-                client = ControlClient::connect(socket).await?;
             }
         }
 
         let hook_events_enabled = install_hooks_or_fallback(
-            &mut client,
+            &mut runner,
             config.autosave.hook_slot,
             config.autosave.poll_interval,
         )
         .await?;
-        client.take_notifications();
         let initial_save = save_if_changed(
-            &mut client,
+            &mut runner,
             socket,
             &store,
             config,
@@ -109,9 +104,9 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             }
             SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
         }
-        Ok::<_, anyhow::Error>((client, hook_events_enabled, protected_current))
+        Ok::<_, anyhow::Error>((runner, hook_events_enabled, protected_current))
     };
-    let ((mut client, mut hook_events_enabled, mut protected_current), requested_exit) =
+    let ((mut runner, hook_events_enabled, mut protected_current), requested_exit) =
         finish_startup(startup, &mut control).await?;
     if let Some(exit) = requested_exit {
         log_exit(socket, exit);
@@ -141,17 +136,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
                     ControlAction::Reload => break DaemonExit::Reload,
                 }
             }
-            notification = client.next_notification() => {
-                let notification = notification?;
-                if matches!(notification, crate::tmux::control::Notification::Exit(_)) {
-                    bail!("tmux server closed its control connection");
-                }
-                let now = Instant::now();
-                pending = Some(max(
-                    now + config.autosave.debounce,
-                    last_write + config.autosave.min_interval,
-                ));
-            }
             result = &mut hook_event => {
                 result?;
                 hook_event = Box::pin(wait_for_hook_event(socket, hook_events_enabled));
@@ -168,7 +152,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             _ = &mut timer, if pending.is_some() => {
                 pending = None;
                 match save_if_changed(
-                    &mut client,
+                    &mut runner,
                     socket,
                     &store,
                     config,
@@ -183,34 +167,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
                     Ok(SaveOutcome::ProtectedBootstrap) => {}
                     Err(error) => {
                         tracing::error!(error = %format!("{error:#}"), "autosave failed; keeping the previous snapshot current");
-                        // A command that failed partway through a sequence left
-                        // blocks tmux will never send, so this connection can no
-                        // longer be read reliably. Replace it and reinstall the
-                        // persistent hooks on the replacement connection.
-                        if client.is_poisoned() {
-                            match reconnect(
-                                socket,
-                                config.autosave.hook_slot,
-                                config.autosave.poll_interval,
-                                hook_events_enabled,
-                            ).await {
-                                Ok((fresh, fresh_hook_events_enabled)) => {
-                                    client = fresh;
-                                    if fresh_hook_events_enabled != hook_events_enabled {
-                                        hook_events_enabled = fresh_hook_events_enabled;
-                                        hook_event = Box::pin(wait_for_hook_event(
-                                            socket,
-                                            hook_events_enabled,
-                                        ));
-                                    }
-                                    tracing::warn!("replaced a desynced control connection");
-                                }
-                                Err(error) => {
-                                    tracing::error!(error = %format!("{error:#}"), "could not replace the desynced control connection");
-                                    return Err(error);
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -280,7 +236,7 @@ fn bootstrap_current_to_preserve(
 }
 
 async fn auto_restore(
-    client: &mut ControlClient,
+    runner: &mut CommandRunner,
     socket: &Path,
     store: &SnapshotStore,
     config: &Config,
@@ -328,7 +284,7 @@ async fn auto_restore(
                 return Ok(false);
             }
             tokio::time::sleep(AUTO_RESTORE_SHELL_SETTLE_INTERVAL).await;
-            let target = capture_structure(client, socket)
+            let target = capture_structure_unattached(runner, socket)
                 .await
                 .context("automatic restore could not recapture the bootstrap server")?;
             if !target_is_bootstrap(&target) || !server_is_young(&target, config) {
@@ -362,7 +318,10 @@ async fn auto_restore(
     store.mark_safety(&safety.id)?;
     store.prune(&config.retention)?;
 
-    let report = apply(client, &snapshot, target, &plan).await;
+    let mut client = ControlClient::connect(socket)
+        .await
+        .context("automatic restore could not open its temporary control connection")?;
+    let report = apply(&mut client, &snapshot, target, &plan).await;
     let report_path = store.write_restore_report(&report)?;
     if report.status != RestoreStatus::Succeeded {
         // apply() has already run commands against the server, and rollback may
@@ -399,7 +358,7 @@ impl From<anyhow::Error> for AutoRestoreError {
 }
 
 async fn install_hooks_or_fallback(
-    client: &mut ControlClient,
+    client: &mut CommandRunner,
     hook_slot: u16,
     poll_interval: Duration,
 ) -> Result<bool> {
@@ -425,26 +384,6 @@ async fn wait_for_hook_event(socket: &Path, enabled: bool) -> Result<()> {
     }
 }
 
-/// Opens a replacement control connection and verifies persistent hooks when
-/// the daemon has not already fallen back to polling.
-async fn reconnect(
-    socket: &Path,
-    hook_slot: u16,
-    poll_interval: Duration,
-    hook_events_enabled: bool,
-) -> Result<(ControlClient, bool)> {
-    let mut client = ControlClient::connect(socket)
-        .await
-        .context("failed to reopen the tmux control connection")?;
-    let hook_events_enabled = if hook_events_enabled {
-        install_hooks_or_fallback(&mut client, hook_slot, poll_interval).await?
-    } else {
-        false
-    };
-    client.take_notifications();
-    Ok((client, hook_events_enabled))
-}
-
 fn server_is_young(target: &crate::tmux::capture::CaptureResult, config: &Config) -> bool {
     server_is_young_at(target, config, Utc::now().timestamp())
 }
@@ -466,7 +405,7 @@ fn server_is_young_at(
 }
 
 async fn save_if_changed(
-    client: &mut ControlClient,
+    client: &mut CommandRunner,
     socket: &Path,
     store: &SnapshotStore,
     config: &Config,
@@ -477,7 +416,7 @@ async fn save_if_changed(
     // stale daemon capture to wait behind a newer CLI save and then overwrite
     // its `current` pointer.
     let _mutation_lock = store.acquire_mutation_lock()?;
-    let captured = capture_structure(client, socket).await?;
+    let captured = capture_structure_unattached(client, socket).await?;
     save_captured(
         store,
         config,

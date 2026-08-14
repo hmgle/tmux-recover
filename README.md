@@ -287,7 +287,7 @@ attachments; the result is recorded in a restore report. Only ordinary
 terminal clients (`client_control_mode=0`) count as visible. Saved current/last
 session selection is restored with explicit client targets, while a restored
 session with no ordinary client is reported as not visible instead of treating
-the watcher's control-mode client as a terminal.
+any temporary control-mode client as a terminal.
 
 ### Restore selected programs on Linux
 
@@ -325,9 +325,11 @@ settle, but leaves an older or populated server untouched. If that check times
 out, or preflight fails before changing tmux, the previous `current` remains
 selected while the server is still a one-session/one-window/one-pane bootstrap.
 Autosave resumes normally after real structure is added.
-Automatic restore keeps its persistent control-mode client for collection, but
-that client never satisfies terminal visibility. Attach a terminal normally if
-the report says a restored session has no ordinary client.
+The watcher runs capture and hook commands through unattached command clients,
+so it does not remain attached to a user session or affect that session's
+terminal capability queries. Automatic restore opens a temporary control-mode
+client only for the restore transaction and releases it afterwards. Attach a
+terminal normally if the report says a restored session has no ordinary client.
 
 ### Import tmux-resurrect history
 

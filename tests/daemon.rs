@@ -176,6 +176,66 @@ async fn daemon_polls_when_an_existing_hook_slot_is_occupied() {
 }
 
 #[tokio::test]
+async fn daemon_does_not_attach_a_control_client_to_user_sessions() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            poll_interval: Duration::from_secs(30),
+            ..AutosaveConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+
+    wait_until(Duration::from_secs(5), || store.has_current()).await;
+    assert!(!task.is_finished(), "daemon exited during startup");
+
+    let clients = server
+        .tmux()
+        .args([
+            "list-clients",
+            "-F",
+            "#{client_name}|#{client_control_mode}|#{session_name}",
+        ])
+        .output()
+        .unwrap();
+    assert!(clients.status.success());
+    assert!(
+        clients.stdout.is_empty(),
+        "daemon left an attached tmux client: {}",
+        String::from_utf8_lossy(&clients.stdout)
+    );
+
+    let attached = server
+        .tmux()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            "daemon",
+            "#{session_attached}",
+        ])
+        .output()
+        .unwrap();
+    assert!(attached.status.success());
+    assert_eq!(String::from_utf8_lossy(&attached.stdout).trim(), "0");
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn daemon_reports_legacy_hooks_without_removing_them() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");

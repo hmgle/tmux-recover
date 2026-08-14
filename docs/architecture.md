@@ -5,7 +5,7 @@
 ```text
 tmux server/socket
     |
-    | one persistent control-mode connection
+    | unattached one-shot command connections
     v
 capture parser <--- indexed tmux hooks + 60s metadata poll
     |
@@ -104,9 +104,12 @@ installation uses `set-option -o`: the tmux server atomically sets an empty
 entry or rejects an occupied one without overwriting it. The static
 `wait-for -S tmux-recover:state-changed` command signals a latched channel that
 a separate waiter consumes. An identical entry from an earlier daemon is safe
-to reuse across control-client reconnects and daemon restarts. Other commands
-are preserved; the daemon warns and continues with low-frequency polling.
-Persistent hooks are not removed on shutdown, which avoids creating a symmetric
+to reuse across daemon restarts. Capture and hook management run through
+`source-file -` command clients that never attach to a session; the watcher is
+therefore absent from `list-clients` while idle and cannot participate in a
+user session's terminal capability or colour queries. Other hook commands are
+preserved; the daemon warns and continues with low-frequency polling. Persistent
+hooks are not removed on shutdown, which avoids creating a symmetric
 check-versus-unset race.
 
 Older releases installed client-specific
@@ -169,24 +172,24 @@ Dead panes are rejected before mutation until their state can be reproduced
 faithfully. Existing sessions are renamed to collision-free temporary backup
 names, and new sessions are built while those backups remain live.
 
-Capture inventories tmux clients separately from the persistent control-mode
-connection used by the watcher. Only `client_control_mode=0` attachments count
-as terminals or visibility. Their current and last sessions are stored in
-most-recently-active order without process-local client identity. During a
-restore, existing ordinary clients are paired in the same order and switched
-with an explicit `switch-client -c`; saved client state takes precedence over a
-coincidentally matching bootstrap session name. Older snapshots without client
-state retain the compatible name-matching fallback. The restore re-lists
-clients and verifies every still-attached client before reaching the commit
-point. A terminal that closes concurrently is omitted from the transition list
-and reported as a warning; an attached client on the wrong session remains a
-hard failure.
+Capture inventories tmux clients while excluding any control-mode client opened
+temporarily by a restore or another tool. Only `client_control_mode=0`
+attachments count as terminals or visibility. Their current and last sessions
+are stored in most-recently-active order without process-local client identity.
+During a restore, existing ordinary clients are paired in the same order and
+switched with an explicit `switch-client -c`; saved client state takes
+precedence over a coincidentally matching bootstrap session name. Older
+snapshots without client state retain the compatible name-matching fallback.
+The restore re-lists clients and verifies every still-attached client before
+reaching the commit point. A terminal that closes concurrently is omitted from
+the transition list and reported as a warning; an attached client on the wrong
+session remains a hard failure.
 
-A control client is allowed to remain attached for background collection, but
-it can never make a session visible. The durable report counts ordinary clients
-per restored session, including zero. Restore cannot manufacture a WezTerm tab
-or another terminal when no ordinary client exists, so a control-only session
-is restored successfully but reported explicitly as not visible.
+The watcher never leaves a control client attached for background collection.
+The durable report counts ordinary clients per restored session, including
+zero. Restore cannot manufacture a WezTerm tab or another terminal when no
+ordinary client exists, so a session without an ordinary attachment is restored
+successfully but reported explicitly as not visible.
 
 The point after pane properties are complete and ordinary clients have switched
 is the restore commit point. Before it, failure switches clients back, deletes

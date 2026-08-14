@@ -259,7 +259,7 @@ tmux-recover restore SNAPSHOT --replace --yes --allow-origin-mismatch
 原 session 名称和客户端附着状态，结果会写入 restore report。只有普通终端 client
 （`client_control_mode=0`）才算可见；保存的 current/last session 会通过明确的 client
 目标恢复。某个恢复后 session 没有普通 client 时会明确报告为不可见，不会把 watcher
-的 control-mode client 当成终端。
+执行事务时可能短暂存在的 control-mode client 当成终端。
 
 ### 在 Linux 上恢复选定程序
 
@@ -292,8 +292,10 @@ watcher 只会恢复刚创建的空白 server。默认 shell 和提示符辅助�
 结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。如果复查
 超时，或 preflight 在修改 tmux 前失败，只要 server 仍是 1 session/1 window/1 pane
 的 bootstrap，上一代 `current` 就会保持不变；加入真实结构后 autosave 自动恢复。
-后台采集所需的持久 control-mode client 可以继续存在，但不会被计入终端可见性；报告
-某个 session 没有普通 client 时，需要从真实终端正常 attach。
+watcher 通过不附着任何 session 的一次性命令 client 执行采集和 hook 管理，因此不会
+长期占用用户 session，也不会干扰其中程序的终端能力查询。只有真正执行自动恢复事务时
+才会短暂创建 control-mode client，并在事务结束后释放。报告某个 session 没有普通
+client 时，需要从真实终端正常 attach。
 
 ### 导入 tmux-resurrect 历史
 

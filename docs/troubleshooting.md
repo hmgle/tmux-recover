@@ -148,12 +148,16 @@ tmux -S "$socket" list-clients -F \
   'name=#{client_name} tty=#{client_tty} control=#{client_control_mode} session=#{session_name} last=#{client_last_session}'
 ```
 
-Only rows with `control=0` are real terminal clients. A persistent `control=1`
-row with an empty TTY is the watcher's collection channel; it does not make its
-session visible in WezTerm or another terminal. Current restores state this
-explicitly in `session_visibility` and print one summary naming every restored
-session whose ordinary-client count is zero. When every count is zero, the
-summary states that no restored session is visible.
+Only rows with `control=0` are real terminal clients. Current watchers do not
+keep a control-mode client attached between commands. A persistent `control=1`
+row with an empty TTY may be an older tmux-recover watcher or another automation
+client; it does not make its session visible in WezTerm or another terminal.
+Older tmux-recover watchers should be upgraded and reloaded: their attached
+client can also interfere with terminal capability and colour queries in that
+session. Current restores record visibility explicitly in `session_visibility`
+and print one summary naming every restored session whose ordinary-client count
+is zero. When every count is zero, the summary states that no restored session
+is visible.
 
 If the target session has no `control=0` row, attach it from a real terminal:
 

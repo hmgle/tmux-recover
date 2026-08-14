@@ -82,8 +82,8 @@ archives created by tmux-resurrect are not imported. Diagnostics report rows
 that were repaired, ambiguous, or unsupported rather than guessing silently.
 The resurrect `state <current> <last>` row is imported as ordinary-client
 session selection. On restore, tmux-recover switches a real terminal client to
-`last` and then `current`, reproducing both selections. A control-mode watcher
-client is never used for this purpose.
+`last` and then `current`, reproducing both selections. A temporary control-mode
+restore client is never used for this purpose.
 
 ## 3. Replace the TPM entries
 

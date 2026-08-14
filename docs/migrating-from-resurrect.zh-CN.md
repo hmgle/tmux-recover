@@ -72,7 +72,7 @@ tmux-recover restore --from-imports current --dry-run --replace
 被静默猜测。
 resurrect 的 `state <current> <last>` 行会作为普通 client 的 session 选择导入。恢复时
 tmux-recover 会让真实终端 client 先切换到 `last`、再切换到 `current`，从而同时还原
-两项状态；后台 watcher 的 control-mode client 不会被用于这个过程。
+两项状态；恢复事务短暂创建的 control-mode client 不会被用于这个过程。
 
 ## 3. 替换 TPM 条目
 
