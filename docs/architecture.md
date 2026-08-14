@@ -102,12 +102,15 @@ The daemon installs persistent indexed hook entries in `autosave.hook_slot`
 (default 901) and never writes `status-right`. Hooks are tmux array options, so
 installation uses `set-option -o`: the tmux server atomically sets an empty
 entry or rejects an occupied one without overwriting it. The static
-`wait-for -S tmux-recover:state-changed` command signals a latched channel that
-a separate waiter consumes. An identical entry from an earlier daemon is safe
-to reuse across daemon restarts. Capture and hook management run through
-one-shot `tmux -C` command clients whose commands are passed as argv. They never
-attach to a session, so the watcher is absent from `list-clients` while idle and
-cannot participate in a user session's terminal capability or colour queries.
+`wait-for -S tmux-recover:state-changed` command signals a separate waiter. The
+daemon starts that waiter before publishing its initial snapshot and starts a
+replacement synchronously before handling each event, so bursts cannot fall
+entirely into an unregistered interval. An identical entry from an earlier
+daemon is safe to reuse across daemon restarts. Capture and hook management run
+through one-shot `tmux -C` command clients whose commands are passed as argv.
+They never attach to a session, so the watcher is absent from `list-clients`
+while idle and cannot participate in a user session's terminal capability or
+colour queries.
 tmux reports commands run by an `after-*` hook as indistinguishable extra
 one-shot control blocks. Capture accepts successful hook blocks and ignores
 hook error blocks when all five requested results still complete, then selects

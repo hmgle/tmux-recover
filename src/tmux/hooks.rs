@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{future::Future, path::Path, pin::Pin, process::Stdio};
 
 use anyhow::{Context, Result, bail};
 use thiserror::Error;
@@ -8,6 +8,8 @@ use super::control::CommandRunner;
 
 pub const EVENT_CHANNEL: &str = "tmux-recover:state-changed";
 pub const EVENT_COMMAND: &str = "wait-for -S tmux-recover:state-changed";
+
+pub type EventWaiter = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 const STRUCTURE_HOOKS: &[&str] = &[
     "after-kill-pane",
@@ -154,26 +156,36 @@ pub async fn install(
     Ok(())
 }
 
-/// Waits for one latched structural event from the persistent hook set.
-pub async fn wait_for_event(socket: &Path) -> Result<()> {
+/// Starts waiting for one structural event from the persistent hook set.
+///
+/// Spawning is deliberately synchronous. Repeated `wait-for -S` calls can
+/// consume tmux's pending signal when no waiter is registered, so callers must
+/// arm the replacement before publishing readiness or doing other work.
+pub fn wait_for_event(socket: &Path) -> Result<EventWaiter> {
     let mut command = Command::new("tmux");
     command
         .env_remove("TMUX")
         .arg("-S")
         .arg(socket)
         .args(["wait-for", EVENT_CHANNEL])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = command
-        .output()
-        .await
-        .context("failed to execute tmux wait-for")?;
-    if !output.status.success() {
-        bail!(
-            "tmux hook event waiter failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+    let child = command.spawn().context("failed to execute tmux wait-for")?;
+    Ok(Box::pin(async move {
+        let output = child
+            .wait_with_output()
+            .await
+            .context("failed to wait for tmux hook event")?;
+        if !output.status.success() {
+            bail!(
+                "tmux hook event waiter failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }))
 }
 
 async fn value(client: &mut CommandRunner, name: &str) -> Result<Option<String>> {

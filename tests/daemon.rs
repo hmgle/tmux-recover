@@ -12,7 +12,7 @@ use tmux_recover::{
 #[cfg(target_os = "linux")]
 use tmux_recover::restore::ProcessMetadataSource;
 
-const HOOK_CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+const HOOK_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct TestServer {
     directory: TempDir,

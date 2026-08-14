@@ -85,6 +85,7 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             config.autosave.poll_interval,
         )
         .await?;
+        let hook_event = arm_hook_event(socket, hook_events_enabled)?;
         let initial_save = save_if_changed(
             &mut runner,
             socket,
@@ -105,11 +106,12 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
             }
             SaveOutcome::Written | SaveOutcome::Unchanged => protected_current = None,
         }
-        Ok::<_, anyhow::Error>((runner, hook_events_enabled, protected_current))
+        Ok::<_, anyhow::Error>((runner, hook_events_enabled, protected_current, hook_event))
     };
-    let ((mut runner, hook_events_enabled, mut protected_current), requested_exit) =
+    let ((mut runner, hook_events_enabled, mut protected_current, mut hook_event), requested_exit) =
         finish_startup(startup, &mut control).await?;
     if let Some(exit) = requested_exit {
+        finish_hook_waiter(&mut runner, hook_event.as_mut(), hook_events_enabled).await;
         log_exit(socket, exit);
         return Ok(exit);
     }
@@ -120,7 +122,6 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
     poll.tick().await;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let mut hook_event = Box::pin(wait_for_hook_event(socket, hook_events_enabled));
 
     let mut pending = None;
     let mut last_write = Instant::now();
@@ -136,53 +137,12 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
                     ControlAction::Stop => DaemonExit::Stop,
                     ControlAction::Reload => DaemonExit::Reload,
                 };
-                if hook_events_enabled {
-                    let deadline = Instant::now() + HOOK_WAITER_EXIT_TIMEOUT;
-                    match tokio::time::timeout_at(
-                        deadline,
-                        runner.execute(["wait-for", "-S", hooks::EVENT_CHANNEL]),
-                    ).await {
-                        Ok(Ok(output)) if output.is_empty() => {}
-                        Ok(Ok(output)) => {
-                            tracing::warn!(
-                                records = output.len(),
-                                "tmux returned unexpected output while waking the hook waiter"
-                            );
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "could not wake the tmux hook waiter while the daemon was exiting"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
-                                "timed out waking the tmux hook waiter while the daemon was exiting"
-                            );
-                        }
-                    }
-                    match tokio::time::timeout_at(deadline, hook_event.as_mut()).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "tmux hook waiter failed while the daemon was exiting"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
-                                "timed out waiting for the tmux hook waiter to exit"
-                            );
-                        }
-                    }
-                }
+                finish_hook_waiter(&mut runner, hook_event.as_mut(), hook_events_enabled).await;
                 break exit;
             }
             result = &mut hook_event => {
                 result?;
-                hook_event = Box::pin(wait_for_hook_event(socket, hook_events_enabled));
+                hook_event = arm_hook_event(socket, hook_events_enabled)?;
                 let now = Instant::now();
                 pending = Some(max(
                     now + config.autosave.debounce,
@@ -425,11 +385,63 @@ async fn install_hooks_or_fallback(
     }
 }
 
-async fn wait_for_hook_event(socket: &Path, enabled: bool) -> Result<()> {
+fn arm_hook_event(socket: &Path, enabled: bool) -> Result<hooks::EventWaiter> {
     if enabled {
-        hooks::wait_for_event(socket).await
+        hooks::wait_for_event(socket)
     } else {
-        std::future::pending().await
+        Ok(Box::pin(std::future::pending()))
+    }
+}
+
+async fn finish_hook_waiter(
+    runner: &mut CommandRunner,
+    hook_event: std::pin::Pin<&mut (dyn Future<Output = Result<()>> + Send)>,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let deadline = Instant::now() + HOOK_WAITER_EXIT_TIMEOUT;
+    match tokio::time::timeout_at(
+        deadline,
+        runner.execute(["wait-for", "-S", hooks::EVENT_CHANNEL]),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.is_empty() => {}
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                records = output.len(),
+                "tmux returned unexpected output while waking the hook waiter"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not wake the tmux hook waiter while the daemon was exiting"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
+                "timed out waking the tmux hook waiter while the daemon was exiting"
+            );
+        }
+    }
+    match tokio::time::timeout_at(deadline, hook_event).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "tmux hook waiter failed while the daemon was exiting"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
+                "timed out waiting for the tmux hook waiter to exit"
+            );
+        }
     }
 }
 

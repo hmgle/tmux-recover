@@ -26,6 +26,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Reap the event waiter before an in-place daemon reload so repeated reloads do
   not accumulate defunct tmux client processes. Retry interrupted child waits
   and bound hook-waiter cleanup during stop and reload.
+- Arm the structural-event waiter before publishing the daemon's initial
+  snapshot and before debouncing each later event, preventing bursts of tmux
+  hook signals from being lost while no waiter is registered.
 
 ## [0.3.0] - 2026-08-11
 
