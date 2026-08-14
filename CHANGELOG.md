@@ -21,7 +21,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Stop polling-only daemons after their tmux server disappears instead of
   retaining the daemon lock and control socket indefinitely.
 - Reap the event waiter before an in-place daemon reload so repeated reloads do
-  not accumulate defunct tmux client processes.
+  not accumulate defunct tmux client processes. Retry interrupted child waits
+  and bound hook-waiter cleanup during stop and reload.
 
 ## [0.3.0] - 2026-08-11
 

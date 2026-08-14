@@ -36,6 +36,10 @@ const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// can wait on the mutation lock for as long as another command holds it.
 const DAEMON_PENDING_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const DAEMON_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const DAEMON_CHILD_REAP_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "tmux-recover", version, about)]
@@ -425,9 +429,21 @@ fn reexec_daemon() -> Result<()> {
     };
     use std::os::unix::process::CommandExt;
 
+    let deadline = std::time::Instant::now() + DAEMON_CHILD_REAP_TIMEOUT;
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+            Ok(WaitStatus::StillAlive) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    anyhow::bail!(
+                        "daemon child process did not exit within {} seconds before re-exec",
+                        DAEMON_CHILD_REAP_TIMEOUT.as_secs()
+                    );
+                }
+                std::thread::sleep(DAEMON_CHILD_REAP_INTERVAL.min(deadline - now));
+            }
+            Err(Errno::ECHILD) => break,
+            Err(Errno::EINTR) => continue,
             Ok(_) => {}
             Err(error) => return Err(error).context("failed to reap daemon child process"),
         }

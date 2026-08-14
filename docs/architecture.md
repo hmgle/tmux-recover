@@ -116,8 +116,9 @@ Other hook commands are preserved; the daemon warns and continues with
 low-frequency polling. A polling-only daemon exits when its one-shot command
 client can no longer reach the server. Persistent hooks are not removed on
 shutdown, which avoids creating a symmetric check-versus-unset race. Before an
-in-place reload, the daemon wakes and awaits its current event waiter so the old
-tmux client process is reaped before re-exec.
+in-place reload, the daemon wakes and awaits its current event waiter within a
+bounded deadline, then reaps every child before re-exec. Interrupted child
+waits are retried instead of aborting the reload.
 
 Older releases installed client-specific
 `display-message -c ... tmux-recover:state-changed` entries. Startup recognizes

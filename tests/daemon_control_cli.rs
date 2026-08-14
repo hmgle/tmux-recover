@@ -247,6 +247,7 @@ fn daemon_status_stop_and_reload_control_the_exact_instance() {
         "reload must preserve the supervisor PID"
     );
     assert_eq!(reloaded.version, env!("CARGO_PKG_VERSION"));
+    assert_no_zombie_children(first_pid);
 
     let output = cli.run(&server.socket, "--stop", &[]);
     assert!(output.status.success(), "stop failed: {output:?}");

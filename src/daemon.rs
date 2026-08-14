@@ -23,6 +23,7 @@ use crate::{
 
 const AUTO_RESTORE_SHELL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTO_RESTORE_SHELL_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+const HOOK_WAITER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonExit {
@@ -136,28 +137,43 @@ pub async fn run(socket: &Path, data_dir: &Path, config: &Config) -> Result<Daem
                     ControlAction::Reload => DaemonExit::Reload,
                 };
                 if hook_events_enabled {
-                    match runner
-                        .execute(["wait-for", "-S", hooks::EVENT_CHANNEL])
-                        .await
-                    {
-                        Ok(output) if output.is_empty() => {
-                            if let Err(error) = hook_event.as_mut().await {
-                                tracing::warn!(
-                                    error = %format!("{error:#}"),
-                                    "tmux hook waiter failed while the daemon was exiting"
-                                );
-                            }
-                        }
-                        Ok(output) => {
+                    let deadline = Instant::now() + HOOK_WAITER_EXIT_TIMEOUT;
+                    match tokio::time::timeout_at(
+                        deadline,
+                        runner.execute(["wait-for", "-S", hooks::EVENT_CHANNEL]),
+                    ).await {
+                        Ok(Ok(output)) if output.is_empty() => {}
+                        Ok(Ok(output)) => {
                             tracing::warn!(
                                 records = output.len(),
                                 "tmux returned unexpected output while waking the hook waiter"
                             );
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 error = %format!("{error:#}"),
                                 "could not wake the tmux hook waiter while the daemon was exiting"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
+                                "timed out waking the tmux hook waiter while the daemon was exiting"
+                            );
+                        }
+                    }
+                    match tokio::time::timeout_at(deadline, hook_event.as_mut()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "tmux hook waiter failed while the daemon was exiting"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = HOOK_WAITER_EXIT_TIMEOUT.as_millis(),
+                                "timed out waiting for the tmux hook waiter to exit"
                             );
                         }
                     }
