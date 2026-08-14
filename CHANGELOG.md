@@ -12,6 +12,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session, where it could interfere with terminal capability and colour queries
   and suppress TUI animations. Background capture, hook management, manual
   saves, and restore preflight now use unattached one-shot command clients.
+- Tolerate extra control blocks emitted by user `after-*` hooks during
+  unattached capture instead of treating a healthy tmux server as unavailable.
+  Hook output is excluded from snapshot records by the capture format prefix.
 - Capture pane process exits, layout notifications, automatic window renames,
   and effective window resizes through hooks instead of waiting for the next
   metadata poll.

@@ -57,8 +57,8 @@ impl CommandRunner {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut blocks = self.execute_blocks(arguments, 1).await?;
-        Ok(blocks.pop().unwrap_or_default())
+        let blocks = self.execute_blocks(arguments, 1).await?;
+        Ok(blocks.into_iter().next().unwrap_or_default())
     }
 
     pub async fn execute_blocks<I, S>(
@@ -90,37 +90,49 @@ impl CommandRunner {
             .kill_on_drop(true)
             .output()
             .await
-            .with_context(|| {
-                format!(
-                    "failed to execute tmux command on socket {}",
-                    self.socket.display()
-                )
+            .map_err(|error| CommandRunnerUnavailable {
+                detail: format!(
+                    "failed to execute tmux command on socket {}: {error}",
+                    self.socket.display(),
+                ),
             })?;
 
         let response = match parse_one_shot_output(&output.stdout, block_count) {
             Ok(response) => response,
             Err(OneShotParseError::Command(error)) => return Err(error),
-            Err(OneShotParseError::Protocol(detail)) => {
+            Err(OneShotParseError::Protocol(error)) => return Err(error),
+            Err(OneShotParseError::Incomplete(detail)) => {
                 return Err(CommandRunnerUnavailable { detail }.into());
             }
         };
-        if !output.status.success() || !response.saw_exit || response.blocks.len() != block_count {
+        if !response.saw_exit {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let detail = if stderr.is_empty() {
                 format!(
-                    "{}; received {} of {block_count} command blocks{}",
+                    "{}; received {} of at least {block_count} command blocks before the control stream closed",
                     output.status,
                     response.blocks.len(),
-                    if response.saw_exit {
-                        ""
-                    } else {
-                        " before the control stream closed"
-                    }
                 )
             } else {
                 stderr
             };
             return Err(CommandRunnerUnavailable { detail }.into());
+        }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if stderr.is_empty() {
+                bail!("tmux one-shot command client exited with {}", output.status);
+            }
+            bail!(
+                "tmux one-shot command client exited with {}: {stderr}",
+                output.status
+            );
+        }
+        if response.blocks.len() < block_count {
+            bail!(
+                "tmux one-shot command returned {} command blocks, expected at least {block_count}",
+                response.blocks.len()
+            );
         }
         Ok(response.blocks)
     }
@@ -133,7 +145,8 @@ struct OneShotResponse {
 
 enum OneShotParseError {
     Command(anyhow::Error),
-    Protocol(String),
+    Protocol(anyhow::Error),
+    Incomplete(String),
 }
 
 fn parse_one_shot_output(
@@ -146,22 +159,15 @@ fn parse_one_shot_output(
     let mut saw_exit = false;
 
     while let Some(line) = lines.next() {
-        let header = parse_block_header(&line)
-            .map_err(|error| OneShotParseError::Protocol(format!("{error:#}")))?;
-        if let Some(header) = header {
-            // Commands supplied on the initial `tmux -C` argv are unflagged.
-            // Persistent clients use flags to distinguish later stdin commands
-            // from hooks, but applying that rule here would discard every block.
-            if header.flags != 0 {
-                return Err(OneShotParseError::Protocol(format!(
-                    "one-shot command block has unexpected flags {}",
-                    header.flags
-                )));
-            }
+        let header = parse_block_header(&line).map_err(OneShotParseError::Protocol)?;
+        if let Some(_header) = header {
+            // Initial argv commands and any hooks they trigger are both usually
+            // unflagged. Keep every complete block; callers can require a
+            // minimum count, but cannot infer ownership from the flags.
             let mut output: Vec<Vec<u8>> = Vec::new();
             loop {
                 let Some(line) = lines.next() else {
-                    return Err(OneShotParseError::Protocol(
+                    return Err(OneShotParseError::Incomplete(
                         "control output ended while a command block was pending".to_owned(),
                     ));
                 };
@@ -181,12 +187,13 @@ fn parse_one_shot_output(
                         detail
                     };
                     return Err(OneShotParseError::Command(anyhow::anyhow!(
-                        "tmux command failed at step {} of {block_count}: {detail}",
-                        blocks.len() + 1
+                        "tmux command sequence failed after {} complete control blocks \
+                         (expected {block_count} commands): {detail}",
+                        blocks.len()
                     )));
                 }
                 if line.starts_with(b"%exit") {
-                    return Err(OneShotParseError::Protocol(
+                    return Err(OneShotParseError::Incomplete(
                         "one-shot client exited while a command block was pending".to_owned(),
                     ));
                 }
@@ -197,7 +204,7 @@ fn parse_one_shot_output(
         if line.starts_with(b"%exit") {
             saw_exit = true;
         } else if parse_notification(&line).is_none() {
-            return Err(OneShotParseError::Protocol(format!(
+            return Err(OneShotParseError::Protocol(anyhow::anyhow!(
                 "unexpected control-mode line: {}",
                 text_lossy(&line)
             )));
@@ -549,7 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn reports_one_shot_command_errors_with_their_step() {
+    fn accepts_one_shot_command_block_flags() {
+        let response = parse_one_shot_output(b"%begin 1 2 7\none\n%end 1 2 7\n%exit\n", 1)
+            .unwrap_or_else(|_| panic!("flagged one-shot control output was rejected"));
+        assert!(response.saw_exit);
+        assert_eq!(response.blocks, vec![vec![b"one".to_vec()]]);
+    }
+
+    #[test]
+    fn reports_one_shot_command_errors_after_completed_blocks() {
         let error = parse_one_shot_output(
             b"%begin 1 2 0\none\n%end 1 2 0\n%begin 1 3 0\nno target\n%error 1 3 0\n%exit\n",
             3,
@@ -561,7 +576,8 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "tmux command failed at step 2 of 3: no target"
+            "tmux command sequence failed after 1 complete control blocks (expected 3 commands): \
+             no target"
         );
     }
 }

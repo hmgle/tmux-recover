@@ -86,8 +86,68 @@ async fn one_shot_runner_preserves_command_error_blocks() {
     assert!(!command_runner_is_unavailable(&error));
     assert_eq!(
         error.to_string(),
-        "tmux command failed at step 2 of 3: can't find window: no-such-window"
+        "tmux command sequence failed after 1 complete control blocks (expected 3 commands): \
+         can't find window: no-such-window"
     );
+}
+
+#[tokio::test]
+async fn one_shot_runner_tolerates_blocks_from_command_hooks() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    assert!(
+        server
+            .tmux()
+            .args([
+                "set-option",
+                "-go",
+                "after-list-panes[900]",
+                "wait-for -S one-shot-hook-probe",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut runner = CommandRunner::new(&server.socket);
+    let blocks = runner
+        .execute_blocks(
+            [
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}",
+                ";",
+                "display-message",
+                "-p",
+                "after-hook",
+            ],
+            2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(blocks.len(), 3);
+    assert!(String::from_utf8_lossy(&blocks[0][0]).starts_with('%'));
+    assert!(blocks[1].is_empty());
+    assert_eq!(blocks[2], vec![b"after-hook".to_vec()]);
+}
+
+#[tokio::test]
+async fn complete_one_shot_response_with_too_few_blocks_is_not_unavailable() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let mut runner = CommandRunner::new(&server.socket);
+    let error = runner
+        .execute_blocks(["display-message", "-p", "one"], 2)
+        .await
+        .expect_err("an incomplete command response was accepted");
+
+    assert!(!command_runner_is_unavailable(&error));
+    assert!(error.to_string().contains("expected at least 2"));
 }
 
 /// tmux abandons the remainder of a sequence at the first failure, so a

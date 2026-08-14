@@ -108,6 +108,10 @@ to reuse across daemon restarts. Capture and hook management run through
 one-shot `tmux -C` command clients whose commands are passed as argv. They never
 attach to a session, so the watcher is absent from `list-clients` while idle and
 cannot participate in a user session's terminal capability or colour queries.
+tmux reports commands run by an `after-*` hook as indistinguishable extra
+one-shot control blocks. Capture accepts those blocks and selects its five
+results by their fixed record prefixes, so empty or textual hook output cannot
+be mistaken for server loss or snapshot data.
 Other hook commands are preserved; the daemon warns and continues with
 low-frequency polling. A polling-only daemon exits when its one-shot command
 client can no longer reach the server. Persistent hooks are not removed on

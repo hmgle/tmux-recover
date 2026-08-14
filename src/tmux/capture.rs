@@ -53,13 +53,49 @@ pub async fn capture_structure_unattached(
     requested_socket: &Path,
 ) -> Result<CaptureResult> {
     let command = capture_command();
-    let output = runner
+    let blocks = runner
         .execute_blocks(&command.arguments, command.block_count)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        .await?;
+    let output = select_capture_blocks(blocks)?;
     parse_capture(output, requested_socket)
+}
+
+fn select_capture_blocks(blocks: Vec<Vec<Vec<u8>>>) -> Result<Vec<Vec<u8>>> {
+    let mut blocks = blocks.into_iter();
+    let mut output = Vec::new();
+
+    // One-shot argv commands and commands run by their after-* hooks have the
+    // same control block flags. Capture formats give the five requested blocks
+    // an unambiguous shape, so skip interleaved hook output by record type.
+    for (record_name, prefix) in [
+        ("session", b"S|".as_slice()),
+        ("window", b"W|".as_slice()),
+        ("pane", b"P|".as_slice()),
+        ("metadata", b"M|".as_slice()),
+    ] {
+        let block = blocks
+            .by_ref()
+            .find(|block| !block.is_empty() && block.iter().all(|line| line.starts_with(prefix)))
+            .with_context(|| format!("tmux capture did not return a {record_name} block"))?;
+        output.extend(block);
+    }
+
+    // list-clients legitimately returns an empty block. Prefer a non-empty
+    // client block when one exists; otherwise any remaining empty block is the
+    // same observable result.
+    let mut saw_empty = false;
+    for block in blocks {
+        if block.is_empty() {
+            saw_empty = true;
+        } else if block.iter().all(|line| line.starts_with(b"C|")) {
+            output.extend(block);
+            return Ok(output);
+        }
+    }
+    if saw_empty {
+        return Ok(output);
+    }
+    bail!("tmux capture did not return a client block")
 }
 
 impl CaptureResult {
