@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::Write,
-    os::unix::process::CommandExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -808,6 +808,13 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
     )
     .unwrap();
 
+    // Use our own executable: /bin/false is not available on every platform,
+    // and tmux validates default-shell before accepting the option.
+    let session_shell = server.directory.path().join("session-shell");
+    std::fs::write(&session_shell, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&session_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session_shell = session_shell.to_str().unwrap();
+
     server.stop();
     success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
     success(
@@ -815,21 +822,21 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
             .tmux()
             .args(["set-option", "-g", "default-shell", "/bin/sh"]),
     );
-    success(server.tmux().args([
-        "set-option",
-        "-t",
-        "bootstrap",
-        "default-shell",
-        "/bin/false",
-    ]));
     success(
         server
             .tmux()
             .args(["new-session", "-d", "-s", "other-target", "sleep", "60"]),
     );
+    success(server.tmux().args([
+        "set-option",
+        "-t",
+        "bootstrap",
+        "default-shell",
+        session_shell,
+    ]));
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
     let target = capture(&mut client, &server.socket).await.unwrap();
-    assert_eq!(target.default_shell.as_deref(), Some("/bin/false"));
+    assert_eq!(target.default_shell.as_deref(), Some(session_shell));
     assert_eq!(target.global_default_shell.as_deref(), Some("/bin/sh"));
     let config = RestoreConfig {
         process_allowlist: vec!["sh".to_owned()],
@@ -855,7 +862,7 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
             .lines()
             .find(|line| line.starts_with("second|"))
             .unwrap_or_else(|| panic!("second session was not restored: {panes}"));
-        if second.starts_with("second|sh|0") {
+        if second == "second|sh|0" || (cfg!(target_os = "macos") && second == "second|bash|0") {
             break;
         }
         assert!(
