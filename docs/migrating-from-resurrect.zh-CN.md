@@ -18,9 +18,8 @@ tmux-resurrect v3 和 v4 文件，但会把它们放在独立历史中，避免�
 写入间隔，并轮询 tmux 未通过 hook 暴露的变化。相应配置见
 [`config.example.toml`](../config.example.toml)。
 
-自动恢复也比 Continuum 更保守：只会在
-`restore.auto_bootstrap_max_age_seconds` 时间内替换刚创建的
-1 session / 1 window / 1 pane 空白 server；较旧或非空 server 不会被修改。
+自动恢复也比 Continuum 更保守：只会替换 1 session / 1 window / 1 pane 的空白
+server；非空 server 不会被修改。
 
 ## 1. 创建最后一份 resurrect 快照
 
@@ -119,7 +118,6 @@ tmux-recover list
 ```toml
 [restore]
 auto = true
-auto_bootstrap_max_age_seconds = 30
 ```
 
 TPM 集成只能在 tmux server 已存在后启动 watcher。tmux-recover 不会在登录或重启后

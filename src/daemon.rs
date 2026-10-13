@@ -1,4 +1,9 @@
-use std::{cmp::max, future::Future, path::Path, time::Duration};
+use std::{
+    cmp::max,
+    future::Future,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{TimeDelta, Utc};
@@ -231,7 +236,7 @@ fn bootstrap_current_to_preserve(
     config: &Config,
     target: &crate::tmux::capture::CaptureResult,
 ) -> Result<Option<String>> {
-    if !config.restore.auto || !target_is_bootstrap(target) || !server_is_young(target, config) {
+    if !config.restore.auto || !target_is_bootstrap(target) {
         return Ok(None);
     }
     let Some(current_id) = store.current_snapshot_id()? else {
@@ -269,16 +274,12 @@ async fn auto_restore(
     if snapshot.origin == initial_target.origin {
         return Ok(false);
     }
-    if !server_is_young(initial_target, config) {
-        return Ok(false);
-    }
-
     // An interactive shell can briefly report a prompt helper (git, direnv,
     // and similar programs) as pane_current_command while the tmux config is
     // still starting. Auto-restore used to sample exactly once, permanently
     // skip in that instant, and then publish the blank server as `current`.
     // Retry only while every structural bootstrap guard still holds, and for a
-    // short bound inside the configured server-age safety window.
+    // short bound.
     let mut refreshed_target = None;
     if !target_is_auto_bootstrap(initial_target) {
         if !target_is_bootstrap(initial_target) {
@@ -296,7 +297,7 @@ async fn auto_restore(
             let target = capture_structure_unattached(runner, socket)
                 .await
                 .context("automatic restore could not recapture the bootstrap server")?;
-            if !target_is_bootstrap(&target) || !server_is_young(&target, config) {
+            if !target_is_bootstrap(&target) {
                 return Ok(false);
             }
             if target_is_auto_bootstrap(&target) {
@@ -306,7 +307,17 @@ async fn auto_restore(
         }
     }
     let target = refreshed_target.as_ref().unwrap_or(initial_target);
-    let options = restore_config_options(&config.restore, false, false, None, false, None);
+    let home_fallback = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let options = restore_config_options(
+        &config.restore,
+        false,
+        false,
+        home_fallback.as_deref(),
+        false,
+        None,
+    );
     let plan =
         preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;
     let _mutation_lock = store.acquire_mutation_lock()?;
@@ -443,26 +454,6 @@ async fn finish_hook_waiter(
             );
         }
     }
-}
-
-fn server_is_young(target: &crate::tmux::capture::CaptureResult, config: &Config) -> bool {
-    server_is_young_at(target, config, Utc::now().timestamp())
-}
-
-/// `now` is a parameter so the window's boundaries can be asserted exactly.
-/// Reading the clock inside made the test racy: it sampled `Utc::now()` to build
-/// the input, and a scheduling delay before this second read pushed an
-/// on-the-boundary age one second over.
-fn server_is_young_at(
-    target: &crate::tmux::capture::CaptureResult,
-    config: &Config,
-    now: i64,
-) -> bool {
-    let Some(started_at) = target.origin.server_started_at else {
-        return false;
-    };
-    let age = now - started_at;
-    (-5..=config.restore.auto_bootstrap_max_age_seconds).contains(&age)
 }
 
 async fn save_if_changed(
@@ -830,6 +821,26 @@ mod tests {
         });
     }
 
+    #[test]
+    fn bootstrap_protection_ignores_server_age() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let current = snapshot(directory.path(), None);
+        store.commit(&current, true).unwrap();
+
+        let mut target = captured(directory.path(), None);
+        target.origin.server_pid = Some(100);
+        target.origin.server_started_at = Some(0);
+        let mut config = Config::default();
+        config.restore.auto = true;
+
+        assert_eq!(
+            bootstrap_current_to_preserve(&store, &config, &target).unwrap(),
+            Some(current.id)
+        );
+    }
+
     /// Structurally identical snapshots that differ only in what the pane is
     /// running, which is exactly the case the sidecar exists to cover.
     fn snapshot(cwd: &Path, running: Option<&str>) -> Snapshot {
@@ -900,57 +911,6 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn server_is_young_bounds_the_auto_restore_window() {
-        let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path();
-        let mut config = Config::default();
-        config.restore.auto_bootstrap_max_age_seconds = 30;
-        // A fixed instant, not `Utc::now()`: the boundary assertions below are
-        // exact, so a clock read between building the input and checking it
-        // would make them load-dependent.
-        let now = 1_700_000_000i64;
-        let target = |started_at: Option<i64>| CaptureResult {
-            origin: Origin {
-                server_started_at: started_at,
-                ..snapshot(cwd, None).origin
-            },
-            state: TmuxState {
-                sessions: vec![],
-                windows: vec![],
-                client_state: None,
-            },
-            diagnostics: Vec::new(),
-            default_shell: None,
-        };
-
-        assert!(super::server_is_young_at(&target(Some(now)), &config, now));
-        assert!(super::server_is_young_at(
-            &target(Some(now - 30)),
-            &config,
-            now
-        ));
-        assert!(
-            !super::server_is_young_at(&target(Some(now - 31)), &config, now),
-            "a server older than the window must not be auto-restored over"
-        );
-        // A small negative age absorbs clock skew between the tmux server's
-        // recorded start time and this process's clock.
-        assert!(super::server_is_young_at(
-            &target(Some(now + 5)),
-            &config,
-            now
-        ));
-        assert!(!super::server_is_young_at(
-            &target(Some(now + 6)),
-            &config,
-            now
-        ));
-        // No recorded start time means the age cannot be established, so the
-        // conservative answer is "not young".
-        assert!(!super::server_is_young_at(&target(None), &config, now));
     }
 
     #[test]

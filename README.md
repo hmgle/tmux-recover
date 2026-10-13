@@ -32,10 +32,10 @@ changes when a pre-commit step fails.
 - **Scriptable CLI:** human-readable output by default and JSON for inspection
   or automation.
 
-Linux and macOS are supported. tmux 3.7 or newer is required. Building from
-source requires Rust 1.85 or newer. Process restart metadata is opt-in and is
-currently collected only on Linux; ordinary session restore works on both
-platforms.
+Linux and macOS are supported. Development and tests target tmux 3.7 or newer;
+unusual version strings are not rejected before capture. Building from source
+requires Rust 1.85 or newer. Process restart metadata is opt-in and is currently
+collected only on Linux; ordinary session restore works on both platforms.
 
 ## Quick start
 
@@ -316,15 +316,15 @@ Automatic restore is off by default. Enable it in `config.toml`:
 ```toml
 [restore]
 auto = true
-auto_bootstrap_max_age_seconds = 30
 ```
 
-The watcher restores only a newly created, empty bootstrap server. It briefly
-rechecks a structurally empty pane while the default shell and prompt helpers
-settle, but leaves an older or populated server untouched. If that check times
-out, or preflight fails before changing tmux, the previous `current` remains
-selected while the server is still a one-session/one-window/one-pane bootstrap.
-Autosave resumes normally after real structure is added.
+The watcher restores only an empty bootstrap server: one session, one window,
+and one live default-shell pane. It briefly rechecks that structural shape
+while the shell and prompt helpers settle, but leaves a populated server
+untouched. If a saved cwd is missing, automatic restore uses `$HOME` and records
+the fallback in its report. If the check times out, or preflight fails before
+changing tmux, the previous `current` remains selected while the server is still
+a bootstrap. Autosave resumes normally after real structure is added.
 The watcher, manual saves, and restore preflight run capture and hook commands
 through unattached command clients, so they do not attach to a user session or
 affect that session's terminal capability queries. Automatic restore opens a

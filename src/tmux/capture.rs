@@ -13,7 +13,7 @@ use crate::{
         SocketIdentity, TmuxState, Window, WindowLink,
     },
     process::populate_restart_specs,
-    util::{canonical_socket_path, hostname, require_tmux_37, uid},
+    util::{canonical_socket_path, hostname, uid},
 };
 
 use super::control::{CommandRunner, ControlClient};
@@ -226,10 +226,15 @@ fn capture_command() -> CaptureCommand {
             ],
         ),
         (
-            format!("display-message -p -F \"{}\"", control_formats.metadata),
+            format!(
+                "display-message -p -t 0.0 -F \"{}\"",
+                control_formats.metadata
+            ),
             vec![
                 "display-message".into(),
                 "-p".into(),
+                "-t".into(),
+                "0.0".into(),
                 "-F".into(),
                 argument_formats.metadata.into(),
             ],
@@ -310,7 +315,6 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
 
     let metadata = metadata.context("tmux capture did not return server metadata")?;
     let tmux_version = field_string(&metadata, 1)?;
-    require_tmux_37(&tmux_version)?;
     let socket_bytes = field(&metadata, 4)?;
     let socket_path = encoded_path(socket_bytes);
     let hostname = hostname()?;
@@ -636,6 +640,19 @@ mod tests {
         assert!(argument.contains('\n'));
         assert!(argument.contains('\r'));
         assert!(!argument.contains("\\012"));
+    }
+
+    #[test]
+    fn metadata_capture_uses_an_explicit_target() {
+        let command = capture_command();
+
+        assert!(command.control.contains("display-message -p -t 0.0 -F"));
+        assert!(
+            command
+                .arguments
+                .iter()
+                .any(|argument| argument.to_string_lossy() == "0.0")
+        );
     }
 
     #[test]

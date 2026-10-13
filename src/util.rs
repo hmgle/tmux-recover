@@ -56,6 +56,10 @@ pub fn require_tmux_37(version: &str) -> Result<()> {
         .trim()
         .strip_prefix("tmux ")
         .unwrap_or(version.trim());
+    let start = value
+        .find(|character: char| character.is_ascii_digit())
+        .unwrap_or(0);
+    let value = &value[start..];
     let numeric: String = value
         .chars()
         .take_while(|character| character.is_ascii_digit() || *character == '.')
@@ -86,7 +90,10 @@ mod tests {
     fn accepts_tmux_patch_suffixes() {
         require_tmux_37("tmux 3.7b").unwrap();
         require_tmux_37("3.8").unwrap();
+        require_tmux_37("next-3.9").unwrap();
+        require_tmux_37("next-3.10").unwrap();
         assert!(require_tmux_37("tmux 3.6a").is_err());
+        assert!(require_tmux_37("next-3.6").is_err());
     }
 
     #[cfg(unix)]

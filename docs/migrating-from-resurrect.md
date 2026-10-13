@@ -21,9 +21,8 @@ changes that tmux does not expose through hooks. See
 [`config.example.toml`](../config.example.toml) for the corresponding controls.
 
 Automatic restore is deliberately narrower than Continuum's behavior. It only
-replaces a newly created, one-session/one-window/one-pane bootstrap server
-within `restore.auto_bootstrap_max_age_seconds`; older or non-empty servers are
-left untouched.
+replaces a one-session/one-window/one-pane bootstrap server; non-empty servers
+are left untouched.
 
 ## 1. Save one final resurrect snapshot
 
@@ -134,7 +133,6 @@ configuration file:
 ```toml
 [restore]
 auto = true
-auto_bootstrap_max_age_seconds = 30
 ```
 
 The TPM integration starts the watcher only after a tmux server exists.

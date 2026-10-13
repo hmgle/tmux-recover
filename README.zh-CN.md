@@ -26,8 +26,9 @@
 - **平滑迁移：**可导入 tmux-resurrect v3/v4 文件，但不会执行导入的命令文本；
 - **方便自动化：**默认输出适合人阅读，也可用 JSON 做检查或脚本处理。
 
-支持 Linux 和 macOS，要求 tmux 3.7+。源码构建要求 Rust 1.85+。进程重启元数据
-目前只在 Linux 上采集且必须显式启用；普通会话恢复在两个平台都可使用。
+支持 Linux 和 macOS。开发与测试以 tmux 3.7+ 为目标，但不会在捕获前因特殊
+版本字符串直接拒绝。源码构建要求 Rust 1.85+。进程重启元数据目前只在 Linux
+上采集且必须显式启用；普通会话恢复在两个平台都可使用。
 
 ## 快速开始
 
@@ -285,13 +286,13 @@ tmux-recover restore current --restore-processes
 ```toml
 [restore]
 auto = true
-auto_bootstrap_max_age_seconds = 30
 ```
 
-watcher 只会恢复刚创建的空白 server。默认 shell 和提示符辅助进程启动期间，它会对
-结构上仍为空白的 pane 做短暂复查；较旧或已有内容的 server 保持不变。如果复查
-超时，或 preflight 在修改 tmux 前失败，只要 server 仍是 1 session/1 window/1 pane
-的 bootstrap，上一代 `current` 就会保持不变；加入真实结构后 autosave 自动恢复。
+watcher 只会恢复空白 bootstrap server：1 个 session、1 个 window、1 个存活的
+默认 shell pane。默认 shell 和提示符辅助进程启动期间，它会对这个结构做短暂
+复查；已有内容的 server 保持不变。快照里的 cwd 缺失时，自动恢复会使用
+`$HOME`，并在报告中记录 fallback。如果复查超时，或 preflight 在修改 tmux 前
+失败，上一代 `current` 就会保持不变；加入真实结构后 autosave 自动恢复。
 watcher 通过不附着任何 session 的一次性命令 client 执行采集和 hook 管理，因此不会
 长期占用用户 session，也不会干扰其中程序的终端能力查询。只有真正执行自动恢复事务时
 才会短暂创建 control-mode client，并在事务结束后释放。报告某个 session 没有普通

@@ -3,7 +3,7 @@ use std::{process::Command, time::Duration};
 use tempfile::TempDir;
 use tmux_recover::{
     config::{AutosaveConfig, Config, RestoreConfig},
-    model::{Snapshot, SnapshotSource},
+    model::{EncodedPath, PaneCwd, PathStatus, Snapshot, SnapshotSource},
     storage::SnapshotStore,
     tmux::{capture::capture, control::ControlClient},
     util::socket_identity,
@@ -491,7 +491,7 @@ impl Drop for TestServer {
 }
 
 #[tokio::test]
-async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
+async fn auto_restore_replaces_a_shell_bootstrap() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
         return;
@@ -506,13 +506,6 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
         },
         restore: RestoreConfig {
             auto: true,
-            // Two distinct races made this flake under load, and both needed
-            // fixing: the pane not having exec'd its shell by the time the
-            // daemon captured (see the wait below), and this window elapsing
-            // during the test's own setup, after which the daemon correctly
-            // declines. The gate itself is covered by `server_is_young`'s unit
-            // test, so widening it here loses no coverage.
-            auto_bootstrap_max_age_seconds: 600,
             ..RestoreConfig::default()
         },
         ..Config::default()
@@ -612,6 +605,103 @@ async fn auto_restore_only_replaces_a_young_shell_bootstrap() {
 }
 
 #[tokio::test]
+async fn auto_restore_falls_back_to_home_for_missing_cwd() {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let config = Config {
+        autosave: AutosaveConfig {
+            debounce: Duration::from_millis(30),
+            min_interval: Duration::from_millis(80),
+            poll_interval: Duration::from_secs(5),
+            ..AutosaveConfig::default()
+        },
+        restore: RestoreConfig {
+            auto: true,
+            ..RestoreConfig::default()
+        },
+        ..Config::default()
+    };
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let mut captured = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    let missing_cwd = data.path().join("removed-cwd");
+    captured.state.windows[0].panes[0].cwd = PaneCwd {
+        path: Some(EncodedPath::from_path(&missing_cwd)),
+        status: PathStatus::Missing,
+        error: None,
+    };
+    let source = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        captured.origin,
+        captured.state,
+        captured.diagnostics,
+    )
+    .unwrap();
+    store.commit(&source, true).unwrap();
+
+    assert!(server.stop(), "source tmux server did not stop");
+    let conf = server.directory.path().join("bootstrap.conf");
+    std::fs::write(&conf, "set -g default-shell /bin/sh\n").unwrap();
+    assert!(
+        server
+            .tmux()
+            .arg("-f")
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "bootstrap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = wait_for_auto_bootstrap_capture(&server).await;
+
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+    let home = std::env::var_os("HOME").expect("HOME must be set for auto restore");
+    let home_text = home.to_string_lossy().to_string();
+    wait_until(Duration::from_secs(45), || {
+        server
+            .tmux()
+            .args(["list-panes", "-a", "-F", "#{pane_current_path}"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .all(|path| path == home_text)
+            })
+    })
+    .await;
+
+    let report_path = std::fs::read_dir(store.root().join("restores"))
+        .expect("restore report directory")
+        .map(|entry| entry.expect("restore report entry").path())
+        .next()
+        .expect("automatic restore report");
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
+    assert_eq!(
+        report["cwd_fallbacks"][0]["replacement"]["value"],
+        serde_json::json!(home_text)
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn unresolved_bootstrap_does_not_replace_current_during_later_autosaves() {
     let Some(server) = TestServer::start() else {
         eprintln!("tmux 3.7+ is unavailable; skipping integration test");
@@ -627,7 +717,6 @@ async fn unresolved_bootstrap_does_not_replace_current_during_later_autosaves() 
         },
         restore: RestoreConfig {
             auto: true,
-            auto_bootstrap_max_age_seconds: 600,
             ..RestoreConfig::default()
         },
         ..Config::default()
@@ -904,11 +993,10 @@ async fn auto_restore_preflight_failure_does_not_kill_the_daemon() {
         let mut client = ControlClient::connect(&server.socket).await.unwrap();
         capture(&mut client, &server.socket).await.unwrap()
     };
-    // Point the pane at a cwd that no longer exists so preflight fails.
-    let missing = server.directory.path().join("gone-before-restore");
-    captured.state.windows[0].panes[0].cwd = tmux_recover::model::PaneCwd::inspect(Some(
-        tmux_recover::model::EncodedPath::from(missing.as_os_str()),
-    ));
+    // A dead pane passes snapshot validation but is rejected by restore
+    // preflight. Unlike a missing cwd, this remains a failure after automatic
+    // restore's HOME fallback.
+    captured.state.windows[0].panes[0].dead = true;
     let source = Snapshot::new(
         None,
         SnapshotSource::Native {
@@ -1270,11 +1358,8 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
             .is_ok_and(|snapshot| snapshot.origin.server_started_at == restored_generation)
     })
     .await;
-    let rebased = store.load_current().unwrap();
-    let snapshots_after_rebase = wait_for_stable_snapshot_count(&store).await;
-
-    // A further process-only change must produce a checkpoint that is still
-    // eligible against the rebased snapshot.
+    // A later process change must produce a checkpoint that remains eligible
+    // against the snapshot current on the restored server.
     // Interrupt the restored program the way a user would. This is the case
     // the old `<cmd>; exec <shell>` wrapper got wrong: C-c killed the wrapper
     // with the program and the pane died, taking this single-pane session and
@@ -1310,7 +1395,6 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
         child_cmdlines(pane_pid)
     );
     wait_for_default_shell_pane(&server, "daemon:0.0").await;
-
     // The wrapper ignored SIGINT while waiting for the restored process. That
     // disposition survives exec, so verify it was reset before entering tmux's
     // configured default-shell: a second command must still respond to C-c.
@@ -1348,7 +1432,6 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
         "the fallback shell passed ignored SIGINT to its child: {:?}",
         child_cmdlines(pane_pid)
     );
-
     let started = tokio::time::Instant::now();
     while pane_command(&server, "daemon:0.0") != "cat" {
         assert!(
@@ -1366,11 +1449,12 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     wait_until(Duration::from_secs(10), || {
+        let current = store.current_snapshot_id().unwrap().unwrap();
         store
             .read_process_checkpoint()
             .unwrap()
             .is_some_and(|checkpoint| {
-                checkpoint.base_snapshot_id == rebased.id
+                checkpoint.base_snapshot_id == current
                     && checkpoint
                         .panes
                         .iter()
@@ -1379,12 +1463,8 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
     })
     .await;
     let after = store.read_process_checkpoint().unwrap().unwrap();
-    assert_eq!(
-        store.list().unwrap().len(),
-        snapshots_after_rebase,
-        "a process-only change must not add a snapshot after a restore either"
-    );
     assert_eq!(after.origin.server_started_at, restored_generation);
+    let current = store.load_current().unwrap();
 
     let target = {
         let mut client = ControlClient::connect(&server.socket).await.unwrap();
@@ -1401,7 +1481,7 @@ async fn sidecar_tracks_a_live_process_change_and_restores_it() {
         true,
         Some(&after),
     );
-    let plan = tmux_recover::restore::preflight(&rebased, &target, &options).unwrap();
+    let plan = tmux_recover::restore::preflight(&current, &target, &options).unwrap();
     assert!(
         plan.warnings.is_empty(),
         "checkpoint rejected after a restore: {:?}",

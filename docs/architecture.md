@@ -167,8 +167,8 @@ carry the new generation and be rejected as mismatched for the life of that
 server. Comparing `origin` costs at most one extra snapshot when the tool or
 tmux version changes, which is a real history boundary.
 
-When automatic restore starts against a young structural bootstrap from a new
-server generation, the daemon remembers the exact previous `current` id. If
+When automatic restore starts against a structural bootstrap from a new server
+generation, the daemon remembers the exact previous `current` id. If
 shell detection times out or restore fails before mutation, each later save
 recaptures tmux under the mutation lock and preserves that pointer while both
 the id and bootstrap shape still match. It writes neither a bootstrap snapshot

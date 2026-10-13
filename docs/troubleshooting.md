@@ -176,11 +176,12 @@ Do not use an implicit `switch-client` as a repair: a command launched through
 the watcher can otherwise address the control client and return success without
 moving any user-visible terminal.
 
-## tmux is too old
+## tmux reports an unusual version
 
-tmux-recover requires tmux 3.7 or newer. Check with `tmux -V`. Upgrade tmux
-through the operating system package manager or build a supported tmux release
-before starting the daemon.
+Development and tests target tmux 3.7 or newer, but the daemon does not reject
+an unusual version string before capture. If a tmux command is unsupported, its
+real error is written to the TPM log. Check with `tmux -V` when reporting the
+failure.
 
 ## A restore reports a missing working directory
 
@@ -278,8 +279,8 @@ remove the temporary override automatically.
 
 ## The restore key reports a non-empty bootstrap
 
-The restore key only replaces a newly created, one-session/one-window/one-pane
-bootstrap. A manually created window makes the target server real work, so the
+The restore key only replaces a one-session/one-window/one-pane bootstrap. A
+manually created window makes the target server real work, so the
 binding refuses to replace it and explains the reason in tmux's status line.
 Choose the snapshot explicitly and review the replacement first:
 

@@ -71,9 +71,6 @@ impl Config {
         if self.retention.daily_days < self.retention.hourly_days {
             bail!("retention daily_days must be greater than or equal to hourly_days");
         }
-        if self.restore.auto_bootstrap_max_age_seconds < 0 {
-            bail!("restore auto_bootstrap_max_age_seconds must not be negative");
-        }
         Ok(())
     }
 }
@@ -137,7 +134,6 @@ impl Default for RetentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RestoreConfig {
     pub auto: bool,
-    pub auto_bootstrap_max_age_seconds: i64,
     pub process_allowlist: Vec<String>,
 }
 
@@ -151,7 +147,6 @@ impl Default for RestoreConfig {
     fn default() -> Self {
         Self {
             auto: false,
-            auto_bootstrap_max_age_seconds: 30,
             process_allowlist: [
                 "vi", "vim", "view", "nvim", "emacs", "man", "less", "more", "tail", "top", "htop",
                 "irssi", "weechat", "mutt",
