@@ -747,7 +747,7 @@ async fn assert_auto_restore_rechecks_after_lock(change: ChangeWhileRestoreWaits
                 bootstrap.diagnostics.clone(),
             )
             .unwrap();
-            store.commit(&published, true).unwrap();
+            store.commit_always(&published, true).unwrap();
         }
     }
     std::fs::write(&release, "").unwrap();
