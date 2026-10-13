@@ -765,18 +765,10 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
             .tmux()
             .args(["new-session", "-d", "-s", "second", "sleep", "60"]),
     );
-    success(
-        server
-            .tmux()
-            .args(["set-option", "-t", "first", "default-shell", "/bin/false"]),
-    );
-
     let mut source = {
         let mut client = ControlClient::connect(&server.socket).await.unwrap();
         capture(&mut client, &server.socket).await.unwrap()
     };
-    assert_eq!(source.default_shell.as_deref(), Some("/bin/false"));
-    assert_eq!(source.global_default_shell.as_deref(), Some("/bin/sh"));
     let second_window_id = source
         .state
         .sessions
@@ -823,13 +815,27 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
             .tmux()
             .args(["set-option", "-g", "default-shell", "/bin/sh"]),
     );
+    success(server.tmux().args([
+        "set-option",
+        "-t",
+        "bootstrap",
+        "default-shell",
+        "/bin/false",
+    ]));
+    success(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "other-target", "sleep", "60"]),
+    );
     let mut client = ControlClient::connect(&server.socket).await.unwrap();
     let target = capture(&mut client, &server.socket).await.unwrap();
+    assert_eq!(target.default_shell.as_deref(), Some("/bin/false"));
+    assert_eq!(target.global_default_shell.as_deref(), Some("/bin/sh"));
     let config = RestoreConfig {
         process_allowlist: vec!["sh".to_owned()],
         ..RestoreConfig::default()
     };
-    let options = restore_config_options(&config, false, false, None, true, None);
+    let options = restore_config_options(&config, true, false, None, true, None);
     let plan = preflight(&snapshot, &target, &options).unwrap();
     assert_eq!(plan.process_restarts, 1);
     let report = apply(&mut client, &snapshot, &target, &plan).await;
@@ -856,6 +862,26 @@ async fn restored_processes_fall_back_to_the_global_default_shell() {
             std::time::Instant::now() < deadline,
             "restored pane did not enter the global shell: {second}"
         );
+    }
+    // Require the fallback to accept a command. The supervisor itself can
+    // briefly report `sh` before entering an incorrect shell and exiting.
+    let marker = server.directory.path().join("fallback-shell-ready");
+    let command = format!(
+        "printf ready > '{}'",
+        marker.to_str().unwrap().replace('\'', "'\\''")
+    );
+    success(
+        server
+            .tmux()
+            .args(["send-keys", "-t", "second:0.0", &command, "Enter"]),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restored fallback shell did not execute the command"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
