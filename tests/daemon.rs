@@ -604,6 +604,217 @@ async fn auto_restore_replaces_a_shell_bootstrap() {
     let _ = task.await;
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ChangeWhileRestoreWaits {
+    Window,
+    ForegroundProcess,
+    CurrentSnapshot,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_restore_rechecks_state_after_waiting_for_the_mutation_lock() {
+    for change in [
+        ChangeWhileRestoreWaits::Window,
+        ChangeWhileRestoreWaits::ForegroundProcess,
+        ChangeWhileRestoreWaits::CurrentSnapshot,
+    ] {
+        assert_auto_restore_rechecks_after_lock(change).await;
+    }
+}
+
+async fn assert_auto_restore_rechecks_after_lock(change: ChangeWhileRestoreWaits) {
+    let Some(server) = TestServer::start() else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let data = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.restore.auto = true;
+    config.restore.process_allowlist.clear();
+    let identity = socket_identity(&server.socket).unwrap();
+    let store = SnapshotStore::for_socket(data.path(), &identity.key, &config.storage);
+    let captured = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    let source = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        captured.origin,
+        captured.state,
+        captured.diagnostics,
+    )
+    .unwrap();
+    store.commit(&source, true).unwrap();
+    assert!(server.stop());
+    let conf = server.directory.path().join("bootstrap.conf");
+    std::fs::write(&conf, "set -g default-shell /bin/sh\n").unwrap();
+    assert!(
+        server
+            .tmux()
+            .arg("-f")
+            .arg(&conf)
+            .args(["new-session", "-d", "-s", "bootstrap"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bootstrap = wait_for_auto_bootstrap_capture(&server).await;
+
+    // Block the end of the initial capture, after its rows are collected.
+    // This makes the mutation below deterministic without timing a sleep or
+    // relying on Linux-specific process inspection to observe flock().
+    let ready = server.directory.path().join("capture-ready");
+    let release = server.directory.path().join("capture-release");
+    let shell_quote =
+        |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let command = format!(
+        "touch {}; attempts=0; while [ ! -e {} ] && [ $attempts -lt 200 ]; do sleep 0.05; attempts=$((attempts + 1)); done",
+        shell_quote(&ready),
+        shell_quote(&release),
+    );
+    let hook = format!("run-shell {}", tmux_recover::restore::quote(&command));
+    assert!(
+        server
+            .tmux()
+            .args(["set-hook", "-g", "after-list-clients[999]", &hook])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let lock = store.acquire_mutation_lock().unwrap();
+    let daemon_socket = server.socket.clone();
+    let daemon_data = data.path().to_path_buf();
+    let daemon_config = config.clone();
+    let task = tokio::spawn(async move {
+        tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
+    });
+    wait_until(Duration::from_secs(10), || ready.exists()).await;
+
+    match change {
+        ChangeWhileRestoreWaits::Window => {
+            assert!(
+                server
+                    .tmux()
+                    .args([
+                        "new-window",
+                        "-d",
+                        "-t",
+                        "bootstrap",
+                        "-n",
+                        "real-work",
+                        "sleep 60"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        ChangeWhileRestoreWaits::ForegroundProcess => {
+            assert!(
+                server
+                    .tmux()
+                    .args(["send-keys", "-t", "bootstrap:0.0", "sleep 60", "Enter"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            wait_until(Duration::from_secs(5), || {
+                server
+                    .tmux()
+                    .args([
+                        "display-message",
+                        "-p",
+                        "-t",
+                        "bootstrap:0.0",
+                        "#{pane_current_command}",
+                    ])
+                    .output()
+                    .is_ok_and(|output| output.stdout == b"sleep\n")
+            })
+            .await;
+        }
+        ChangeWhileRestoreWaits::CurrentSnapshot => {
+            let published = Snapshot::new(
+                Some("manual save".to_owned()),
+                SnapshotSource::Native {
+                    reason: "test".to_owned(),
+                },
+                bootstrap.origin.clone(),
+                bootstrap.state.clone(),
+                bootstrap.diagnostics.clone(),
+            )
+            .unwrap();
+            store.commit(&published, true).unwrap();
+        }
+    }
+    std::fs::write(&release, "").unwrap();
+    drop(lock);
+    wait_until(Duration::from_secs(10), || {
+        server
+            .tmux()
+            .args(["show-hooks", "-g"])
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout).contains("after-new-window[901]")
+            })
+    })
+    .await;
+    // A clean stop waits for startup, including the initial save, to finish.
+    tmux_recover::daemon_control::request(
+        data.path(),
+        &identity.key,
+        tmux_recover::daemon_control::ControlRequest::Stop,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let sessions = server
+        .tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .unwrap();
+    assert_eq!(sessions.stdout, b"bootstrap\n", "{change:?}");
+    assert!(
+        store
+            .list()
+            .unwrap()
+            .iter()
+            .all(|snapshot| !snapshot.safety),
+        "{change:?}"
+    );
+    assert!(!store.root().join("restores").exists(), "{change:?}");
+    match change {
+        ChangeWhileRestoreWaits::Window => {
+            assert!(
+                store
+                    .load_current()
+                    .unwrap()
+                    .state
+                    .windows
+                    .iter()
+                    .any(|window| window.name == "real-work")
+            );
+        }
+        ChangeWhileRestoreWaits::ForegroundProcess => {
+            assert_eq!(store.current_snapshot_id().unwrap(), Some(source.id));
+        }
+        ChangeWhileRestoreWaits::CurrentSnapshot => {
+            assert_eq!(
+                store.load_current().unwrap().label.as_deref(),
+                Some("manual save")
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn auto_restore_falls_back_to_home_for_missing_cwd() {
     let Some(server) = TestServer::start() else {

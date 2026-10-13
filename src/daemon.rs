@@ -291,7 +291,6 @@ async fn auto_restore(
     // skip in that instant, and then publish the blank server as `current`.
     // Retry only while every structural bootstrap guard still holds, and for a
     // short bound.
-    let mut refreshed_target = None;
     if !target_is_auto_bootstrap(initial_target) {
         if !target_is_bootstrap(initial_target) {
             return Ok(false);
@@ -312,12 +311,33 @@ async fn auto_restore(
                 return Ok(false);
             }
             if target_is_auto_bootstrap(&target) {
-                refreshed_target = Some(target);
                 break;
             }
         }
     }
-    let target = refreshed_target.as_ref().unwrap_or(initial_target);
+    let _mutation_lock = store.acquire_mutation_lock()?;
+    // A manual save or restore may have published a new current while we
+    // waited. Respect that decision instead of restoring our earlier source.
+    let current = store
+        .load_current()
+        .context("automatic restore could not reload the current snapshot")?;
+    if current.id != snapshot.id {
+        return Ok(false);
+    }
+    let snapshot = current;
+    // The store lock does not stop users changing tmux. Recapture after the
+    // wait so the gate, plan, and safety snapshot all describe the live target.
+    let target = capture_structure_unattached(runner, socket)
+        .await
+        .context("automatic restore could not revalidate the bootstrap server")?;
+    if compare_origins_by_server_identity(&initial_target.origin, &target.origin)
+        != ServerIdentityComparison::Same
+        || compare_origins_by_server_identity(&snapshot.origin, &target.origin)
+            != ServerIdentityComparison::Different
+        || !target_is_auto_bootstrap(&target)
+    {
+        return Ok(false);
+    }
     let home_fallback = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from);
@@ -330,8 +350,7 @@ async fn auto_restore(
         None,
     );
     let plan =
-        preflight(&snapshot, target, &options).context("automatic restore preflight failed")?;
-    let _mutation_lock = store.acquire_mutation_lock()?;
+        preflight(&snapshot, &target, &options).context("automatic restore preflight failed")?;
     let mut safety_state = target.state.clone();
     if config.restore.processes_enabled() {
         populate_restart_specs(&mut safety_state);
@@ -352,7 +371,7 @@ async fn auto_restore(
     let mut client = ControlClient::connect(socket)
         .await
         .context("automatic restore could not open its temporary control connection")?;
-    let report = apply(&mut client, &snapshot, target, &plan).await;
+    let report = apply(&mut client, &snapshot, &target, &plan).await;
     let report_path = store.write_restore_report(&report)?;
     if report.status != RestoreStatus::Succeeded {
         // apply() has already run commands against the server, and rollback may

@@ -177,7 +177,11 @@ id. If shell detection times out or restore fails before mutation, each later sa
 recaptures tmux under the mutation lock and preserves that pointer while both
 the id and bootstrap shape still match. It writes neither a bootstrap snapshot
 nor a process checkpoint in that state. A concurrent manual publication or a
-real topology change lifts the guard and normal autosave resumes.
+real topology change lifts the guard and normal autosave resumes. Before an
+automatic restore creates its plan or safety snapshot, it acquires the mutation
+lock, reloads `current`, and recaptures tmux. A changed current pointer, a
+different target generation, or a pane that is no longer a default-shell
+bootstrap cancels the restore.
 
 Restore first validates schema, snapshot id, hash, origin, graph ownership,
 non-negative window indexes, ascending contiguous pane indexes, layout
