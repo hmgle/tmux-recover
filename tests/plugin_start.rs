@@ -79,6 +79,12 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
     let data_dir = environment.path().join("data");
     let state_home = environment.path().join("state");
     let config_home = environment.path().join("config");
+    std::fs::create_dir_all(config_home.join("tmux-recover")).unwrap();
+    std::fs::write(
+        config_home.join("tmux-recover/config.toml"),
+        "[autosave]\ndebounce = 1\nmin_interval = 1\npoll_interval = 5\n",
+    )
+    .unwrap();
     let tmux_environment = format!("{},0,0", server.socket.display());
 
     let start = || {
@@ -146,9 +152,27 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
             .unwrap()
             .success()
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let renamed = loop {
+        let current = store.load_current().unwrap();
+        if current
+            .state
+            .windows
+            .iter()
+            .any(|window| window.name == "must-not-replace-initial")
+        {
+            break current;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never saved the renamed window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_ne!(renamed.id, initial.id);
     let output = start();
     assert!(output.status.success());
-    assert_eq!(store.load_current().unwrap().id, initial.id);
+    assert_eq!(store.load_current().unwrap().id, renamed.id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         std::fs::read_to_string(&daemon_lock).unwrap(),
