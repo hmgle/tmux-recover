@@ -44,6 +44,15 @@ impl Config {
             .with_context(|| format!("failed to read {}", paths.config_file.display()))?;
         let config: Self = toml::from_str(&input)
             .with_context(|| format!("failed to parse {}", paths.config_file.display()))?;
+        if config
+            .restore
+            .deprecated_auto_bootstrap_max_age_seconds
+            .is_some()
+        {
+            tracing::warn!(
+                "restore.auto_bootstrap_max_age_seconds is deprecated and ignored; automatic restore uses server-generation and bootstrap-shape guards"
+            );
+        }
         config.validate()?;
         Ok(config)
     }
@@ -135,6 +144,9 @@ impl Default for RetentionConfig {
 pub struct RestoreConfig {
     pub auto: bool,
     pub process_allowlist: Vec<String>,
+    #[serde(default, skip_serializing, alias = "auto_bootstrap_max_age_seconds")]
+    #[doc(hidden)]
+    pub deprecated_auto_bootstrap_max_age_seconds: Option<i64>,
 }
 
 impl RestoreConfig {
@@ -147,6 +159,7 @@ impl Default for RestoreConfig {
     fn default() -> Self {
         Self {
             auto: false,
+            deprecated_auto_bootstrap_max_age_seconds: None,
             process_allowlist: [
                 "vi", "vim", "view", "nvim", "emacs", "man", "less", "more", "tail", "top", "htop",
                 "irssi", "weechat", "mutt",
@@ -211,6 +224,50 @@ mod tests {
         let mut config = RestoreConfig::default();
         config.process_allowlist.clear();
         assert!(!config.processes_enabled());
+    }
+
+    #[test]
+    fn accepts_the_deprecated_auto_bootstrap_age_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            data_dir: directory.path().join("data"),
+            config_file: directory.path().join("config.toml"),
+            state_dir: directory.path().join("state"),
+        };
+        std::fs::write(
+            &paths.config_file,
+            "[restore]\nauto = true\nauto_bootstrap_max_age_seconds = 30\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&paths).unwrap();
+
+        assert!(config.restore.auto);
+        assert!(
+            config
+                .restore
+                .deprecated_auto_bootstrap_max_age_seconds
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_restore_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            data_dir: directory.path().join("data"),
+            config_file: directory.path().join("config.toml"),
+            state_dir: directory.path().join("state"),
+        };
+        std::fs::write(
+            &paths.config_file,
+            "[restore]\nauto = true\nunknown_setting = true\n",
+        )
+        .unwrap();
+
+        let error = format!("{:#}", Config::load(&paths).unwrap_err());
+
+        assert!(error.contains("unknown field"), "{error}");
     }
 
     #[test]

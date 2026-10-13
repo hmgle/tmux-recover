@@ -318,13 +318,16 @@ Automatic restore is off by default. Enable it in `config.toml`:
 auto = true
 ```
 
-The watcher restores only an empty bootstrap server: one session, one window,
-and one live default-shell pane. It briefly rechecks that structural shape
-while the shell and prompt helpers settle, but leaves a populated server
-untouched. If a saved cwd is missing, automatic restore uses `$HOME` and records
-the fallback in its report. If the check times out, or preflight fails before
-changing tmux, the previous `current` remains selected while the server is still
-a bootstrap. Autosave resumes normally after real structure is added.
+The watcher restores only an empty bootstrap server from a new server
+generation: one session, one window, and one live default-shell pane. A tool or
+tmux upgrade alone never marks the current server as new. The watcher briefly
+rechecks that structural shape while the shell and prompt helpers settle, but
+leaves a populated server untouched. If a saved cwd is missing, automatic
+restore uses `$HOME` and records the fallback in its report. If the check times
+out, or preflight fails before changing tmux, the previous `current` remains
+selected while the server is still a bootstrap. Autosave resumes normally after
+real structure is added. The former `auto_bootstrap_max_age_seconds` setting is
+accepted for compatibility but ignored.
 The watcher, manual saves, and restore preflight run capture and hook commands
 through unattached command clients, so they do not attach to a user session or
 affect that session's terminal capability queries. Automatic restore opens a

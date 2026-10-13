@@ -243,7 +243,7 @@ fn bootstrap_current_to_preserve(
         return Ok(None);
     };
     let current = store.load_current()?;
-    if current.origin == target.origin {
+    if origins_describe_same_server(&current.origin, &target.origin) {
         return Ok(None);
     }
     Ok(Some(current_id))
@@ -271,7 +271,7 @@ async fn auto_restore(
     // snapshot immediately before this daemon starts. It already describes
     // this server generation, so there is nothing to recover and no reason to
     // wait for an interactive shell to settle.
-    if snapshot.origin == initial_target.origin {
+    if origins_describe_same_server(&snapshot.origin, &initial_target.origin) {
         return Ok(false);
     }
     // An interactive shell can briefly report a prompt helper (git, direnv,
@@ -359,6 +359,36 @@ async fn auto_restore(
     }
     tracing::info!(snapshot = %snapshot.id, report = %report_path.display(), "automatically restored snapshot");
     Ok(true)
+}
+
+fn origins_describe_same_server(
+    snapshot: &crate::model::Origin,
+    target: &crate::model::Origin,
+) -> bool {
+    let Some(snapshot_socket) = snapshot.socket.as_ref() else {
+        return snapshot == target;
+    };
+    let Some(target_socket) = target.socket.as_ref() else {
+        return snapshot == target;
+    };
+    let Some(snapshot_pid) = snapshot.server_pid else {
+        return snapshot == target;
+    };
+    let Some(target_pid) = target.server_pid else {
+        return snapshot == target;
+    };
+    let Some(snapshot_started) = snapshot.server_started_at else {
+        return snapshot == target;
+    };
+    let Some(target_started) = target.server_started_at else {
+        return snapshot == target;
+    };
+    snapshot.hostname == target.hostname
+        && snapshot.uid == target.uid
+        && snapshot.os == target.os
+        && snapshot_socket.key == target_socket.key
+        && snapshot_pid == target_pid
+        && snapshot_started == target_started
 }
 
 /// Distinguishes failures that left the server untouched from failures that
@@ -839,6 +869,28 @@ mod tests {
             bootstrap_current_to_preserve(&store, &config, &target).unwrap(),
             Some(current.id)
         );
+    }
+
+    #[test]
+    fn same_server_generation_ignores_capture_metadata_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut target = captured(directory.path(), None);
+        target.origin = snapshot(directory.path(), None).origin;
+        target.origin.tool_version = "new-tool".to_owned();
+        target.origin.tmux_version = Some("tmux next-3.9".to_owned());
+        target.origin.socket = Some(SocketIdentity {
+            path: EncodedPath::from_path(Path::new("/tmp/socket-alias")),
+            key: SOCKET_KEY.to_owned(),
+        });
+
+        let source = snapshot(directory.path(), None);
+        assert!(origins_describe_same_server(&source.origin, &target.origin));
+
+        target.origin.server_pid = Some(100);
+        assert!(!origins_describe_same_server(
+            &source.origin,
+            &target.origin
+        ));
     }
 
     /// Structurally identical snapshots that differ only in what the pane is

@@ -226,15 +226,9 @@ fn capture_command() -> CaptureCommand {
             ],
         ),
         (
-            format!(
-                "display-message -p -t 0.0 -F \"{}\"",
-                control_formats.metadata
-            ),
+            format!("list-sessions -F \"{}\"", control_formats.metadata),
             vec![
-                "display-message".into(),
-                "-p".into(),
-                "-t".into(),
-                "0.0".into(),
+                "list-sessions".into(),
                 "-F".into(),
                 argument_formats.metadata.into(),
             ],
@@ -290,7 +284,11 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
             Some(b"S") => parse_session(&fields, &mut sessions)?,
             Some(b"W") => parse_window(&fields, &mut sessions, &mut windows)?,
             Some(b"P") => pane_rows.push(fields),
-            Some(b"M") => metadata = Some(fields),
+            Some(b"M") => {
+                if metadata.is_none() {
+                    metadata = Some(fields);
+                }
+            }
             Some(b"C") => client_rows.push(fields),
             _ => bail!("unknown tmux capture record"),
         }
@@ -643,16 +641,16 @@ mod tests {
     }
 
     #[test]
-    fn metadata_capture_uses_an_explicit_target() {
+    fn metadata_capture_does_not_require_a_current_target() {
         let command = capture_command();
 
-        assert!(command.control.contains("display-message -p -t 0.0 -F"));
-        assert!(
-            command
-                .arguments
-                .iter()
-                .any(|argument| argument.to_string_lossy() == "0.0")
-        );
+        assert!(command.control.contains("list-sessions -F \"M|"));
+        assert!(command.arguments.windows(2).any(|arguments| {
+            arguments[0] == std::ffi::OsStr::new("-F")
+                && arguments[1]
+                    .to_str()
+                    .is_some_and(|format| format.starts_with("M|"))
+        }));
     }
 
     #[test]

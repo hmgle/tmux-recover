@@ -102,9 +102,9 @@ pub fn preflight(
         bail!("target server is not an empty bootstrap; use --replace after reviewing a dry-run");
     }
 
-    let fallback = options.cwd_fallback.map(validate_fallback).transpose()?;
     let mut pane_cwds = HashMap::new();
     let mut cwd_fallbacks = Vec::new();
+    let mut validated_fallback: Option<PathBuf> = None;
     for window in &snapshot.state.windows {
         for pane in &window.panes {
             match resolve_pane_cwd(pane) {
@@ -112,9 +112,17 @@ pub fn preflight(
                     pane_cwds.insert(pane.id.clone(), path);
                 }
                 Err(error) => {
-                    let Some(replacement) = fallback.clone() else {
+                    let Some(configured_fallback) = options.cwd_fallback else {
                         return Err(error)
                             .with_context(|| format!("pane {} cwd validation failed", pane.id));
+                    };
+                    let replacement = match validated_fallback.as_ref() {
+                        Some(path) => path.clone(),
+                        None => {
+                            let path = validate_fallback(configured_fallback)?;
+                            validated_fallback = Some(path.clone());
+                            path
+                        }
                     };
                     cwd_fallbacks.push(CwdFallbackRecord {
                         pane_id: pane.id.clone(),
@@ -1931,6 +1939,24 @@ mod tests {
         target.state.windows[0].panes[0].current_command = Some("real-shell".to_owned());
 
         assert!(target_is_auto_bootstrap(&target));
+    }
+
+    #[test]
+    fn cwd_fallback_is_validated_only_when_needed() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = snapshot(
+            directory.path(),
+            vec![pane("%9", 0, directory.path(), None)],
+            Some(1),
+        );
+        let target = bootstrap_target(directory.path());
+        let mut test_options = options(&[], None);
+        test_options.restore_processes = false;
+        test_options.cwd_fallback = Some(Path::new("/tmux-recover-missing-home"));
+
+        let plan = preflight(&snapshot, &target, &test_options).unwrap();
+
+        assert!(plan.cwd_fallbacks.is_empty());
     }
 
     #[test]

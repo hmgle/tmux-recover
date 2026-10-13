@@ -23,6 +23,10 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Option<Self> {
+        Self::start_with_config("")
+    }
+
+    fn start_with_config(config: &str) -> Option<Self> {
         let version = Command::new("tmux").arg("-V").output().ok()?;
         if !version.status.success()
             || tmux_recover::util::require_tmux_37(&String::from_utf8_lossy(&version.stdout))
@@ -32,12 +36,19 @@ impl TestServer {
         }
         let directory = tempfile::tempdir().ok()?;
         let socket = directory.path().join("tmux.sock");
+        let config_file = if config.is_empty() {
+            "/dev/null".to_owned()
+        } else {
+            let path = directory.path().join("tmux.conf");
+            std::fs::write(&path, config).ok()?;
+            path.to_string_lossy().into_owned()
+        };
         let status = Command::new("tmux")
             .args(["-S"])
             .arg(&socket)
             .args([
                 "-f",
-                "/dev/null",
+                &config_file,
                 "new-session",
                 "-d",
                 "-s",
@@ -149,6 +160,58 @@ impl Drop for AttachedClient {
         let _ = self.child.wait();
         self.drain.join();
     }
+}
+
+#[tokio::test]
+async fn captures_session_default_shell_with_nonzero_pane_indexes() {
+    let Some(server) = TestServer::start_with_config(
+        "set -g base-index 1\nset -g pane-base-index 1\nset -g default-shell /bin/sh\n",
+    ) else {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    };
+    let shell = server.directory.path().join("session-shell");
+    std::fs::write(&shell, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shell, permissions).unwrap();
+    assert!(
+        server
+            .tmux()
+            .args([
+                "set-option",
+                "-t",
+                "capture:雪:011:012:015",
+                "default-shell"
+            ])
+            .arg(&shell)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let session_id = command_output(server.tmux().args(["list-sessions", "-F", "#{session_id}"]))
+        .trim()
+        .to_owned();
+    let _client = AttachedClient::start(&server, &session_id);
+
+    let mut control = ControlClient::connect(&server.socket).await.unwrap();
+    let captured = capture_structure(&mut control, &server.socket)
+        .await
+        .unwrap();
+    assert_eq!(
+        captured.default_shell.as_deref(),
+        Some(shell.to_str().unwrap())
+    );
+
+    let mut runner = CommandRunner::new(&server.socket);
+    let unattached = capture_structure_unattached(&mut runner, &server.socket)
+        .await
+        .unwrap();
+    assert_eq!(
+        unattached.default_shell.as_deref(),
+        Some(shell.to_str().unwrap())
+    );
 }
 
 #[tokio::test]
