@@ -692,6 +692,7 @@ async fn assert_auto_restore_rechecks_after_lock(change: ChangeWhileRestoreWaits
         tmux_recover::daemon::run(&daemon_socket, &daemon_data, &daemon_config).await
     });
     wait_until(Duration::from_secs(10), || ready.exists()).await;
+    let mut manual_save_id = None;
 
     match change {
         ChangeWhileRestoreWaits::Window => {
@@ -748,6 +749,7 @@ async fn assert_auto_restore_rechecks_after_lock(change: ChangeWhileRestoreWaits
             )
             .unwrap();
             store.commit_always(&published, true).unwrap();
+            manual_save_id = Some(published.id);
         }
     }
     std::fs::write(&release, "").unwrap();
@@ -807,10 +809,8 @@ async fn assert_auto_restore_rechecks_after_lock(change: ChangeWhileRestoreWaits
             assert_eq!(store.current_snapshot_id().unwrap(), Some(source.id));
         }
         ChangeWhileRestoreWaits::CurrentSnapshot => {
-            assert_eq!(
-                store.load_current().unwrap().label.as_deref(),
-                Some("manual save")
-            );
+            let manual_save = store.load(&manual_save_id.unwrap()).unwrap();
+            assert_eq!(manual_save.label.as_deref(), Some("manual save"));
         }
     }
 }
