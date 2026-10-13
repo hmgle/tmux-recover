@@ -10,7 +10,7 @@ use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
 use tmux_recover::{
     config::{RestoreConfig, StorageConfig},
-    model::{RestoreStatus, Snapshot, SnapshotSource},
+    model::{EncodedPath, RestartSpec, RestoreStatus, Snapshot, SnapshotSource},
     restore::{apply, preflight, restore_config_options},
     storage::SnapshotStore,
     tmux::{capture::capture, control::ControlClient},
@@ -741,6 +741,122 @@ async fn ordinary_client_detach_during_restore_is_a_warning() {
             .args(["list-sessions", "-F", "#{session_name}"]),
     );
     assert_eq!(sessions.trim(), "saved");
+}
+
+#[tokio::test]
+async fn restored_processes_fall_back_to_the_global_default_shell() {
+    if !TestServer::available() {
+        eprintln!("tmux 3.7+ is unavailable; skipping integration test");
+        return;
+    }
+    let server = TestServer::new();
+    success(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "first", "sleep", "60"]),
+    );
+    success(
+        server
+            .tmux()
+            .args(["set-option", "-g", "default-shell", "/bin/sh"]),
+    );
+    success(
+        server
+            .tmux()
+            .args(["new-session", "-d", "-s", "second", "sleep", "60"]),
+    );
+    success(
+        server
+            .tmux()
+            .args(["set-option", "-t", "first", "default-shell", "/bin/false"]),
+    );
+
+    let mut source = {
+        let mut client = ControlClient::connect(&server.socket).await.unwrap();
+        capture(&mut client, &server.socket).await.unwrap()
+    };
+    assert_eq!(source.default_shell.as_deref(), Some("/bin/false"));
+    assert_eq!(source.global_default_shell.as_deref(), Some("/bin/sh"));
+    let second_window_id = source
+        .state
+        .sessions
+        .iter()
+        .find(|session| session.name == "second")
+        .and_then(|session| session.active_window_id.as_deref())
+        .unwrap()
+        .to_owned();
+    let second_pane_id = source
+        .state
+        .windows
+        .iter()
+        .find(|window| window.id == second_window_id)
+        .and_then(|window| window.active_pane_id.as_deref())
+        .unwrap()
+        .to_owned();
+    let second_pane = source
+        .state
+        .windows
+        .iter_mut()
+        .flat_map(|window| window.panes.iter_mut())
+        .find(|pane| pane.id == second_pane_id)
+        .unwrap();
+    second_pane.restart = Some(RestartSpec {
+        executable: EncodedPath::from_path(std::path::Path::new("/bin/sh")),
+        argv: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+        trusted: true,
+    });
+    let snapshot = Snapshot::new(
+        None,
+        SnapshotSource::Native {
+            reason: "test".to_owned(),
+        },
+        source.origin,
+        source.state,
+        source.diagnostics,
+    )
+    .unwrap();
+
+    server.stop();
+    success(server.tmux().args(["new-session", "-d", "-s", "bootstrap"]));
+    success(
+        server
+            .tmux()
+            .args(["set-option", "-g", "default-shell", "/bin/sh"]),
+    );
+    let mut client = ControlClient::connect(&server.socket).await.unwrap();
+    let target = capture(&mut client, &server.socket).await.unwrap();
+    let config = RestoreConfig {
+        process_allowlist: vec!["sh".to_owned()],
+        ..RestoreConfig::default()
+    };
+    let options = restore_config_options(&config, false, false, None, true, None);
+    let plan = preflight(&snapshot, &target, &options).unwrap();
+    assert_eq!(plan.process_restarts, 1);
+    let report = apply(&mut client, &snapshot, &target, &plan).await;
+    assert_eq!(report.status, RestoreStatus::Succeeded, "{report:#?}");
+    drop(client);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let panes = output(server.tmux().args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}|#{pane_current_command}|#{pane_dead}",
+        ]));
+        let second = panes
+            .lines()
+            .find(|line| line.starts_with("second|"))
+            .unwrap_or_else(|| panic!("second session was not restored: {panes}"));
+        if second.starts_with("second|sh|0") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restored pane did not enter the global shell: {second}"
+        );
+    }
 }
 
 #[tokio::test]

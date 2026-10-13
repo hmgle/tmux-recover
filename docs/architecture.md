@@ -170,10 +170,10 @@ tmux version changes, which is a real history boundary.
 Automatic restore proves a new generation from the stable server identity
 (socket key, PID, and start time), then requires the structural bootstrap
 shape. Capture-only origin changes such as the tool or tmux version do not make
-the live server recoverable. When automatic restore starts against a structural
-bootstrap from a new server generation, the daemon remembers the exact previous
-`current` id. If
-shell detection times out or restore fails before mutation, each later save
+the live server recoverable; incomplete identity is unknown and automatic
+restore skips it. When automatic restore starts against a structural bootstrap
+from a new server generation, the daemon remembers the exact previous `current`
+id. If shell detection times out or restore fails before mutation, each later save
 recaptures tmux under the mutation lock and preserves that pointer while both
 the id and bootstrap shape still match. It writes neither a bootstrap snapshot
 nor a process checkpoint in that state. A concurrent manual publication or a
@@ -238,7 +238,7 @@ pane's foreground process group, so a C-c killed the wrapper along with the
 program, the `exec` never ran, and the pane died -- taking the session and even
 the server with it when it was the last pane. The supervisor ignores SIGINT and
 SIGQUIT while the program's subshell resets both before exec'ing. It resets them
-again before entering the target tmux server's captured `default-shell`, since
+again before entering the target server's global `default-shell`, since
 an ignored disposition survives exec and would otherwise make later children
 of sh and bash immune to C-c. The outer tmux shell only executes `exec /bin/sh
 -c ...`, so fish or another configured `default-shell` does not have to parse

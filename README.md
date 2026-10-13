@@ -320,7 +320,8 @@ auto = true
 
 The watcher restores only an empty bootstrap server from a new server
 generation: one session, one window, and one live default-shell pane. A tool or
-tmux upgrade alone never marks the current server as new. The watcher briefly
+tmux upgrade alone never marks the current server as new, and incomplete
+server identity is treated as unknown rather than recoverable. The watcher briefly
 rechecks that structural shape while the shell and prompt helpers settle, but
 leaves a populated server untouched. If a saved cwd is missing, automatic
 restore uses `$HOME` and records the fallback in its report. If the check times

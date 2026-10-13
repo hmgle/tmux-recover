@@ -203,6 +203,7 @@ async fn captures_session_default_shell_with_nonzero_pane_indexes() {
         captured.default_shell.as_deref(),
         Some(shell.to_str().unwrap())
     );
+    assert_eq!(captured.global_default_shell.as_deref(), Some("/bin/sh"));
 
     let mut runner = CommandRunner::new(&server.socket);
     let unattached = capture_structure_unattached(&mut runner, &server.socket)
@@ -212,6 +213,7 @@ async fn captures_session_default_shell_with_nonzero_pane_indexes() {
         unattached.default_shell.as_deref(),
         Some(shell.to_str().unwrap())
     );
+    assert_eq!(unattached.global_default_shell.as_deref(), Some("/bin/sh"));
 }
 
 #[tokio::test]

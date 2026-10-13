@@ -215,7 +215,7 @@ pub fn preflight(
     } else {
         Some(
             target
-                .default_shell
+                .global_default_shell
                 .clone()
                 .context("target tmux server did not report a default-shell")?,
         )
@@ -1873,6 +1873,7 @@ mod tests {
             state: state(cwd, vec![pane("%9", 0, cwd, None)]),
             diagnostics: Vec::<Diagnostic>::new(),
             default_shell: Some("/bin/zsh".to_owned()),
+            global_default_shell: Some("/bin/zsh".to_owned()),
         }
     }
 
@@ -2012,13 +2013,28 @@ mod tests {
     }
 
     #[test]
+    fn process_fallback_uses_the_global_default_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let with_restart = pane("%0", 0, cwd, Some(restart("/usr/bin/vim", true)));
+        let snapshot = snapshot(cwd, vec![with_restart], Some(10));
+        let mut target = bootstrap_target(cwd);
+        target.default_shell = Some("/bin/false".to_owned());
+        target.global_default_shell = Some("/bin/sh".to_owned());
+
+        let plan = preflight(&snapshot, &target, &options(&["vim".to_owned()], None)).unwrap();
+
+        assert_eq!(plan.process_fallback_shell.as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
     fn process_restore_requires_the_target_servers_default_shell() {
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path();
         let with_restart = pane("%0", 0, cwd, Some(restart("/usr/bin/vim", true)));
         let snapshot = snapshot(cwd, vec![with_restart], Some(10));
         let mut target = bootstrap_target(cwd);
-        target.default_shell = None;
+        target.global_default_shell = None;
         let allowlist = vec!["vim".to_owned()];
 
         let error = preflight(&snapshot, &target, &options(&allowlist, None)).unwrap_err();

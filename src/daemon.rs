@@ -243,10 +243,14 @@ fn bootstrap_current_to_preserve(
         return Ok(None);
     };
     let current = store.load_current()?;
-    if origins_describe_same_server(&current.origin, &target.origin) {
-        return Ok(None);
+    match compare_origins_by_server_identity(&current.origin, &target.origin) {
+        ServerIdentityComparison::Same => Ok(None),
+        ServerIdentityComparison::Different => Ok(Some(current_id)),
+        ServerIdentityComparison::Unknown => {
+            tracing::warn!("preserving current snapshot because its server identity is incomplete");
+            Ok(Some(current_id))
+        }
     }
-    Ok(Some(current_id))
 }
 
 async fn auto_restore(
@@ -271,8 +275,15 @@ async fn auto_restore(
     // snapshot immediately before this daemon starts. It already describes
     // this server generation, so there is nothing to recover and no reason to
     // wait for an interactive shell to settle.
-    if origins_describe_same_server(&snapshot.origin, &initial_target.origin) {
-        return Ok(false);
+    match compare_origins_by_server_identity(&snapshot.origin, &initial_target.origin) {
+        ServerIdentityComparison::Same => return Ok(false),
+        ServerIdentityComparison::Unknown => {
+            tracing::warn!(
+                "automatic restore skipped because the snapshot server identity is incomplete"
+            );
+            return Ok(false);
+        }
+        ServerIdentityComparison::Different => {}
     }
     // An interactive shell can briefly report a prompt helper (git, direnv,
     // and similar programs) as pane_current_command while the tmux config is
@@ -361,34 +372,38 @@ async fn auto_restore(
     Ok(true)
 }
 
-fn origins_describe_same_server(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerIdentityComparison {
+    Same,
+    Different,
+    Unknown,
+}
+
+fn compare_origins_by_server_identity(
     snapshot: &crate::model::Origin,
     target: &crate::model::Origin,
-) -> bool {
-    let Some(snapshot_socket) = snapshot.socket.as_ref() else {
-        return snapshot == target;
-    };
-    let Some(target_socket) = target.socket.as_ref() else {
-        return snapshot == target;
-    };
-    let Some(snapshot_pid) = snapshot.server_pid else {
-        return snapshot == target;
-    };
-    let Some(target_pid) = target.server_pid else {
-        return snapshot == target;
-    };
-    let Some(snapshot_started) = snapshot.server_started_at else {
-        return snapshot == target;
-    };
-    let Some(target_started) = target.server_started_at else {
-        return snapshot == target;
-    };
-    snapshot.hostname == target.hostname
+) -> ServerIdentityComparison {
+    let complete = snapshot.socket.is_some()
+        && target.socket.is_some()
+        && snapshot.server_pid.is_some()
+        && target.server_pid.is_some()
+        && snapshot.server_started_at.is_some()
+        && target.server_started_at.is_some();
+    if !complete {
+        return ServerIdentityComparison::Unknown;
+    }
+    let same = snapshot.hostname == target.hostname
         && snapshot.uid == target.uid
         && snapshot.os == target.os
-        && snapshot_socket.key == target_socket.key
-        && snapshot_pid == target_pid
-        && snapshot_started == target_started
+        && snapshot.socket.as_ref().map(|socket| &socket.key)
+            == target.socket.as_ref().map(|socket| &socket.key)
+        && snapshot.server_pid == target.server_pid
+        && snapshot.server_started_at == target.server_started_at;
+    if same {
+        ServerIdentityComparison::Same
+    } else {
+        ServerIdentityComparison::Different
+    }
 }
 
 /// Distinguishes failures that left the server untouched from failures that
@@ -840,6 +855,7 @@ mod tests {
             state: snapshot.state,
             diagnostics: snapshot.diagnostics,
             default_shell: Some("/bin/sh".to_owned()),
+            global_default_shell: Some("/bin/sh".to_owned()),
         }
     }
 
@@ -884,13 +900,66 @@ mod tests {
         });
 
         let source = snapshot(directory.path(), None);
-        assert!(origins_describe_same_server(&source.origin, &target.origin));
+        assert_eq!(
+            compare_origins_by_server_identity(&source.origin, &target.origin),
+            ServerIdentityComparison::Same
+        );
 
         target.origin.server_pid = Some(100);
-        assert!(!origins_describe_same_server(
-            &source.origin,
-            &target.origin
-        ));
+        assert_eq!(
+            compare_origins_by_server_identity(&source.origin, &target.origin),
+            ServerIdentityComparison::Different
+        );
+    }
+
+    #[test]
+    fn incomplete_server_identity_preserves_current() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SnapshotStore::for_socket(directory.path(), SOCKET_KEY, &StorageConfig::default());
+        let mut current = snapshot(directory.path(), None);
+        current.origin.server_started_at = None;
+        store.commit(&current, true).unwrap();
+
+        let target = captured(directory.path(), None);
+        let mut config = Config::default();
+        config.restore.auto = true;
+
+        assert_eq!(
+            bootstrap_current_to_preserve(&store, &config, &target).unwrap(),
+            Some(current.id)
+        );
+    }
+
+    #[test]
+    fn incomplete_server_identity_is_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = snapshot(directory.path(), None).origin;
+
+        for missing in [
+            MissingServerIdentity::Socket,
+            MissingServerIdentity::Pid,
+            MissingServerIdentity::StartedAt,
+        ] {
+            let mut target = source.clone();
+            match missing {
+                MissingServerIdentity::Socket => target.socket = None,
+                MissingServerIdentity::Pid => target.server_pid = None,
+                MissingServerIdentity::StartedAt => target.server_started_at = None,
+            }
+            assert_eq!(
+                compare_origins_by_server_identity(&source, &target),
+                ServerIdentityComparison::Unknown,
+                "expected {missing:?} to make automatic restore undecidable"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    enum MissingServerIdentity {
+        Socket,
+        Pid,
+        StartedAt,
     }
 
     /// Structurally identical snapshots that differ only in what the pane is

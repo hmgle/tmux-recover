@@ -24,7 +24,11 @@ pub struct CaptureResult {
     pub origin: Origin,
     pub state: TmuxState,
     pub diagnostics: Vec<Diagnostic>,
+    /// Effective `default-shell` for the first captured session. Automatic
+    /// restore only consumes this when the target has one bootstrap session.
     pub default_shell: Option<String>,
+    /// Global `default-shell` used by sessions created during restore.
+    pub global_default_shell: Option<String>,
 }
 
 pub async fn capture(client: &mut ControlClient, requested_socket: &Path) -> Result<CaptureResult> {
@@ -65,13 +69,14 @@ fn select_capture_blocks(blocks: Vec<Vec<Vec<u8>>>) -> Result<Vec<Vec<u8>>> {
     let mut output = Vec::new();
 
     // One-shot argv commands and commands run by their after-* hooks have the
-    // same control block flags. Capture formats give the five requested blocks
+    // same control block flags. Capture formats give the six requested blocks
     // an unambiguous shape, so skip interleaved hook output by record type.
     for (record_name, prefix) in [
         ("session", b"S|".as_slice()),
         ("window", b"W|".as_slice()),
         ("pane", b"P|".as_slice()),
         ("metadata", b"M|".as_slice()),
+        ("global shell", b"G|".as_slice()),
     ] {
         let block = blocks
             .by_ref()
@@ -115,6 +120,7 @@ struct CaptureFormats {
     window: String,
     pane: String,
     metadata: String,
+    global_shell: String,
     client: String,
 }
 
@@ -179,6 +185,7 @@ fn capture_formats(syntax: FormatSyntax) -> CaptureFormats {
         s("socket_path"),
         s("default-shell")
     );
+    let global_shell = format!("G|{}", s("option_value"));
     let client = format!(
         "C|{}|{}|{}|{}",
         s("client_control_mode"),
@@ -191,6 +198,7 @@ fn capture_formats(syntax: FormatSyntax) -> CaptureFormats {
         window,
         pane,
         metadata,
+        global_shell,
         client,
     }
 }
@@ -231,6 +239,19 @@ fn capture_command() -> CaptureCommand {
                 "list-sessions".into(),
                 "-F".into(),
                 argument_formats.metadata.into(),
+            ],
+        ),
+        (
+            format!(
+                "show-options -g -F \"{}\" default-shell",
+                control_formats.global_shell
+            ),
+            vec![
+                "show-options".into(),
+                "-g".into(),
+                "-F".into(),
+                argument_formats.global_shell.into(),
+                "default-shell".into(),
             ],
         ),
         (
@@ -277,6 +298,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
     let mut pane_rows = Vec::new();
     let mut client_rows = Vec::new();
     let mut metadata = None;
+    let mut global_shell = None;
 
     for line in lines {
         let fields = parse_record(&line)?;
@@ -289,6 +311,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
                     metadata = Some(fields);
                 }
             }
+            Some(b"G") => global_shell = Some(fields),
             Some(b"C") => client_rows.push(fields),
             _ => bail!("unknown tmux capture record"),
         }
@@ -312,6 +335,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
     }
 
     let metadata = metadata.context("tmux capture did not return server metadata")?;
+    let global_shell = global_shell.context("tmux capture did not return the global shell")?;
     let tmux_version = field_string(&metadata, 1)?;
     let socket_bytes = field(&metadata, 4)?;
     let socket_path = encoded_path(socket_bytes);
@@ -348,6 +372,7 @@ fn parse_capture(lines: Vec<Vec<u8>>, requested_socket: &Path) -> Result<Capture
         state,
         diagnostics: Vec::new(),
         default_shell: field_optional_string(&metadata, 5)?,
+        global_default_shell: field_optional_string(&global_shell, 1)?,
     })
 }
 
@@ -645,6 +670,7 @@ mod tests {
         let command = capture_command();
 
         assert!(command.control.contains("list-sessions -F \"M|"));
+        assert!(command.control.contains("show-options -g -F \"G|"));
         assert!(command.arguments.windows(2).any(|arguments| {
             arguments[0] == std::ffi::OsStr::new("-F")
                 && arguments[1]
@@ -681,7 +707,8 @@ mod tests {
         symlink(&socket, &alias).unwrap();
 
         let metadata = format!("M|tmux 3.7b|123|456|{}|/bin/sh", alias.to_string_lossy());
-        let captured = parse_capture(vec![metadata.into_bytes()], &socket).unwrap();
+        let global_shell = b"G|/bin/sh".to_vec();
+        let captured = parse_capture(vec![metadata.into_bytes(), global_shell], &socket).unwrap();
         let identity = captured.origin.socket.unwrap();
 
         assert_eq!(identity.path.to_path_buf().unwrap(), alias);
@@ -689,5 +716,6 @@ mod tests {
             identity.key,
             crate::util::socket_identity(&socket).unwrap().key
         );
+        assert_eq!(captured.global_default_shell.as_deref(), Some("/bin/sh"));
     }
 }
