@@ -6,6 +6,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-13
+
+### Fixed
+
+- Make automatic recovery best-effort without rejecting an otherwise empty
+  bootstrap server by its age or an unusual tmux version string. Missing saved
+  working directories now fall back to `$HOME` during automatic restore.
+- Identify tmux server generations by their stable socket, PID, and start-time
+  identity instead of capture-only tool or tmux versions. Incomplete identity
+  metadata is treated as unknown and never makes a live server recoverable.
+- Preserve the deprecated `restore.auto_bootstrap_max_age_seconds` setting as
+  ignored configuration, capture session-scoped shells with nonzero pane
+  indexes, and validate `$HOME` only when a saved working directory needs it.
+- Use the target server's global `default-shell` as the fallback shell for
+  restored processes instead of an unrelated session-local override.
+- Reload `current`, recapture tmux, and recheck the bootstrap conditions after
+  automatic restore acquires the mutation lock, protecting work added while it
+  waits for another store mutation.
+
 ## [0.3.1] - 2026-08-14
 
 ### Fixed
@@ -116,7 +135,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - TPM and systemd integration, JSON output, zstd storage, and isolated tmux
   integration tests.
 
-[Unreleased]: https://github.com/hmgle/tmux-recover/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/hmgle/tmux-recover/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/hmgle/tmux-recover/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/hmgle/tmux-recover/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hmgle/tmux-recover/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hmgle/tmux-recover/compare/v0.1.0...v0.2.0
