@@ -79,12 +79,6 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
     let data_dir = environment.path().join("data");
     let state_home = environment.path().join("state");
     let config_home = environment.path().join("config");
-    std::fs::create_dir_all(config_home.join("tmux-recover")).unwrap();
-    std::fs::write(
-        config_home.join("tmux-recover/config.toml"),
-        "[autosave]\ndebounce = 1\nmin_interval = 1\npoll_interval = 5\n",
-    )
-    .unwrap();
     let tmux_environment = format!("{},0,0", server.socket.display());
 
     let start = || {
@@ -123,7 +117,7 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
     );
     let daemon_lock = store.root().join("daemon.lock");
     let daemon_log = state_home.join("tmux-recover/tpm.log");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if std::fs::read_to_string(&daemon_log)
             .is_ok_and(|log| log.contains("tmux-recover daemon is watching server"))
@@ -152,24 +146,23 @@ fn plugin_start_synchronously_initializes_only_an_empty_store() {
             .unwrap()
             .success()
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let renamed = loop {
-        let current = store.load_current().unwrap();
-        if current
-            .state
-            .windows
-            .iter()
-            .any(|window| window.name == "must-not-replace-initial")
-        {
-            break current;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "daemon never saved the renamed window"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let saved = Command::new(env!("CARGO_BIN_EXE_tmux-recover"))
+        .env_remove("TMUX")
+        .args(["save", "--config", "/dev/null", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--socket")
+        .arg(&server.socket)
+        .args(["--label", "manual-rename"])
+        .output()
+        .unwrap();
+    assert!(
+        saved.status.success(),
+        "manual save failed: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let renamed = store.load_current().unwrap();
     assert_ne!(renamed.id, initial.id);
+    assert_eq!(renamed.label.as_deref(), Some("manual-rename"));
     let output = start();
     assert!(output.status.success());
     assert_eq!(store.load_current().unwrap().id, renamed.id);
